@@ -17,6 +17,8 @@ so these patterns follow tweb's structure.
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import re
 from collections import Counter
@@ -24,6 +26,63 @@ from pathlib import Path
 from typing import Any
 
 from config import config
+
+
+# --- RSA helpers (stdlib only) ------------------------------------------
+def _tl_bytes(b: bytes) -> bytes:
+    """Telegram TL 'bytes' serialization (length-prefixed, padded to 4)."""
+    n = len(b)
+    if n < 254:
+        out = bytes([n]) + b
+    else:
+        out = bytes([254, n & 0xFF, (n >> 8) & 0xFF, (n >> 16) & 0xFF]) + b
+    while len(out) % 4:
+        out += b"\x00"
+    return out
+
+
+def _hex_to_bytes(h: str) -> bytes:
+    h = h.strip()
+    if len(h) % 2:
+        h = "0" + h
+    return bytes.fromhex(h)
+
+
+def rsa_fingerprint(mod_hex: str, exp_hex: str = "010001") -> str:
+    """MTProto key fingerprint = low 64 bits of SHA1(tl_bytes(n)+tl_bytes(e)).
+
+    Returned as the little-endian int hex the server sends in res_pq.
+    """
+    n = _hex_to_bytes(mod_hex)
+    e = _hex_to_bytes(exp_hex)
+    digest = hashlib.sha1(_tl_bytes(n) + _tl_bytes(e)).digest()
+    return digest[-8:].hex()  # last 8 bytes (server sends these as the fp)
+
+
+def _der_len(n: int) -> bytes:
+    if n < 0x80:
+        return bytes([n])
+    out = b""
+    while n:
+        out = bytes([n & 0xFF]) + out
+        n >>= 8
+    return bytes([0x80 | len(out)]) + out
+
+
+def _der_int(raw: bytes) -> bytes:
+    raw = raw.lstrip(b"\x00") or b"\x00"
+    if raw[0] & 0x80:  # keep it positive
+        raw = b"\x00" + raw
+    return b"\x02" + _der_len(len(raw)) + raw
+
+
+def rsa_pem(mod_hex: str, exp_hex: str = "010001") -> str:
+    """PKCS#1 RSAPublicKey PEM from hex modulus + exponent (stdlib DER)."""
+    n = _der_int(_hex_to_bytes(mod_hex))
+    e = _der_int(_hex_to_bytes(exp_hex))
+    seq = b"\x30" + _der_len(len(n) + len(e)) + n + e
+    body = base64.encodebytes(seq).decode().strip()
+    return "-----BEGIN RSA PUBLIC KEY-----\n" + body + "\n-----END RSA PUBLIC KEY-----"
 
 # --- regexes -------------------------------------------------------------
 RE_HOST = re.compile(r"\b([a-z0-9][a-z0-9\-]*\.eitaa\.com)\b", re.I)
@@ -43,8 +102,9 @@ RE_PEM = re.compile(r"-----BEGIN[ A-Z]*PUBLIC KEY-----[\s\S]+?-----END[ A-Z]*PUB
 RE_EXP = re.compile(r"['\"]010001['\"]")
 RE_HEXRUN = re.compile(r"[0-9a-fA-F]{200,}")
 
-# DC option-ish objects mentioning an eitaa host near an id/port.
-RE_DC_CTX = re.compile(r".{0,80}[a-z0-9\-]+\.eitaa\.com.{0,80}", re.I)
+# DC id <-> host mapping heuristics (both orders seen in minified tweb).
+RE_DC_ID_HOST = re.compile(r"""(\d{1,2})\s*[:=]\s*['"]([a-z0-9\-]+)\.eitaa\.com['"]""", re.I)
+RE_DC_HOST_ID = re.compile(r"""['"]([a-z0-9\-]+)\.eitaa\.com['"]\s*[,:]\s*(\d{1,2})\b""", re.I)
 
 
 def _js_files(assets_dir: Path) -> list[Path]:
@@ -56,6 +116,11 @@ def _js_files(assets_dir: Path) -> list[Path]:
 def extract_from_text(text: str, out: dict[str, Any]) -> None:
     for m in RE_HOST.finditer(text):
         out["_hosts"][m.group(1).lower()] += 1
+
+    for m in RE_DC_ID_HOST.finditer(text):
+        out["_dc_map"][f"{m.group(1)}:{m.group(2).lower()}"] += 1
+    for m in RE_DC_HOST_ID.finditer(text):
+        out["_dc_map"][f"{m.group(2)}:{m.group(1).lower()}"] += 1
 
     for m in RE_API.finditer(text):
         out["api_candidates"].append({"id": int(m.group(1)), "hash": m.group(2)})
@@ -91,6 +156,7 @@ def extract_run(run_id: str) -> Path:
     out: dict[str, Any] = {
         "run_id": run_id,
         "_hosts": Counter(),
+        "_dc_map": Counter(),
         "api_candidates": [],
         "_layers": Counter(),
         "rsa_pem": [],
@@ -111,7 +177,23 @@ def extract_run(run_id: str) -> Path:
     # Finalize / dedup.
     hosts = out.pop("_hosts")
     layers = out.pop("_layers")
+    dc_map = out.pop("_dc_map")
     out.pop("_hexset", None)
+
+    # Turn each hex modulus candidate into a ready-to-use RSA key: PEM + the
+    # MTProto fingerprint the server advertises in res_pq.
+    rsa_keys = []
+    for cand in out["rsa_hex_modulus_candidates"]:
+        h = cand["hex"]
+        try:
+            rsa_keys.append({
+                "bits": cand["len"] * 4,
+                "fingerprint": rsa_fingerprint(h),
+                "pem": rsa_pem(h),
+                "modulus_hex": h,
+            })
+        except Exception:  # noqa: BLE001
+            continue
 
     # Unique api candidates.
     seen = set()
@@ -127,11 +209,11 @@ def extract_run(run_id: str) -> Path:
         "run_id": run_id,
         "scanned_files": out["scanned_files"],
         "datacenter_hosts": dict(hosts.most_common()),
+        "dc_id_host_map": dict(dc_map.most_common()),
         "api_candidates": out["api_candidates"],
         "layer_candidates": dict(layers.most_common(10)),
-        "rsa_pem_count": len(out["rsa_pem"]),
-        "rsa_pem": out["rsa_pem"],
-        "rsa_hex_modulus_candidates": out["rsa_hex_modulus_candidates"][:12],
+        "rsa_keys": rsa_keys,
+        "rsa_pem_blocks_found": out["rsa_pem"],
         "exponent_010001_count": out["exponent_010001_count"],
     }
 
@@ -151,6 +233,12 @@ def summarize(params_path: Path) -> str:
     for host, n in data["datacenter_hosts"].items():
         L.append(f"- {host} (x{n})")
     L.append("")
+    dc_map = data.get("dc_id_host_map", {})
+    if dc_map:
+        L.append("## DC id -> host candidates")
+        for pair, n in dc_map.items():
+            L.append(f"- dc{pair} (x{n})")
+        L.append("")
     L.append("## api_id / api_hash candidates")
     if data["api_candidates"]:
         for c in data["api_candidates"]:
@@ -162,14 +250,14 @@ def summarize(params_path: Path) -> str:
     for lv, n in data["layer_candidates"].items():
         L.append(f"- layer {lv} (x{n})")
     L.append("")
-    L.append("## RSA public keys")
-    L.append(f"- PEM blocks: {data['rsa_pem_count']}")
-    L.append(f"- hex modulus candidates: {len(data['rsa_hex_modulus_candidates'])}")
+    L.append("## RSA public keys (ready for the auth handshake)")
+    keys = data.get("rsa_keys", [])
+    L.append(f"- keys derived: {len(keys)} | inline PEM blocks: {len(data.get('rsa_pem_blocks_found', []))}")
     L.append(f"- exponent '010001' occurrences: {data['exponent_010001_count']}")
-    if data["rsa_hex_modulus_candidates"]:
-        first = data["rsa_hex_modulus_candidates"][0]
-        L.append(f"- first modulus candidate: {first['len']} hex chars "
-                 f"({first['len'] * 4} bits) -> {first['hex'][:48]}...")
+    for i, key in enumerate(keys, 1):
+        L.append(f"- key #{i}: {key['bits']} bits, fingerprint={key['fingerprint']}")
+    L.append("")
+    L.append("_Full PEM keys + fingerprints + DC map are in params.json._")
     L.append("")
     L.append(f"Full details written to: {params_path}")
     return "\n".join(L)
