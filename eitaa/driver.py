@@ -153,28 +153,49 @@ class EitaaDriver:
     async def open_contacts_view(self, labels: list[str] | None = None) -> None:
         """Open the Contacts view via the sidebar menu.
 
-        Clicks the hamburger menu, then the menu item whose text matches one of
-        the contacts labels (Persian/English variants).
+        Opens the hamburger menu, then clicks the Contacts item by its icon
+        class (tgico-user), which is language-independent and reliable.
         """
         labels = labels or S.CONTACTS_LABELS
-        btn = await _first_visible(self.page, S.MENU_BUTTON, timeout=8000)
-        if btn is None:
-            raise DriverError("menu button not found (run: inspect --menu)")
-        await btn.click()
-        await self.page.wait_for_timeout(700)
 
-        for label in labels:
+        # Return to the chat-list root first (a subview may be open).
+        try:
+            await self.page.keyboard.press("Escape")
+            await self.page.wait_for_timeout(300)
+        except Exception:  # noqa: BLE001
+            pass
+
+        # Open the menu with whichever toggle makes the contacts item appear.
+        contacts_item = None
+        for btn_sel in S.MENU_BUTTON:
+            btn = self.page.locator(btn_sel).first
             try:
-                item = self.page.get_by_text(label, exact=False).first
-                if await item.is_visible():
-                    await item.click()
-                    await self.page.wait_for_timeout(1800)
-                    return
+                if await btn.count() == 0 or not await btn.is_visible():
+                    continue
+                await btn.click()
+                await self.page.wait_for_timeout(600)
             except Exception:  # noqa: BLE001
                 continue
-        raise DriverError(
-            "contacts menu item not found; labels tried: " + ", ".join(labels)
-        )
+            contacts_item = await _first_visible(self.page, S.CONTACTS_MENU_ITEM, timeout=1500)
+            if contacts_item is not None:
+                break
+
+        # Fallback: match by visible text.
+        if contacts_item is None:
+            for label in labels:
+                try:
+                    it = self.page.get_by_text(label, exact=True).first
+                    if await it.is_visible():
+                        contacts_item = it
+                        break
+                except Exception:  # noqa: BLE001
+                    continue
+
+        if contacts_item is None:
+            raise DriverError("contacts menu item not found (run: inspect --menu)")
+
+        await contacts_item.click()
+        await self.page.wait_for_timeout(1800)
 
     async def _snapshot_contacts(self, container_sel: str | None) -> list[dict]:
         """Snapshot contact rows, scoped to the contacts container if known."""
@@ -185,6 +206,8 @@ class EitaaDriver:
           const rows = scope.querySelectorAll('.chatlist-chat');
           const out = [];
           for (const n of rows) {
+            // Only currently-visible rows (avoids pulling the hidden chat list).
+            if (n.offsetParent === null) continue;
             const t = n.querySelector('.peer-title');
             const title = (t ? t.textContent : '').trim();
             if (!title) continue;

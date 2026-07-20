@@ -62,21 +62,29 @@ MESSAGE_TEXT = [
     ".message",
 ]
 
-# Hamburger / main menu button in the left sidebar header (opens Contacts, etc).
+# Hamburger / main menu toggle in the left sidebar header. We avoid the
+# "sidebar-close-button" (that is a back button, not the menu opener).
 MENU_BUTTON = [
     ".sidebar-header .btn-menu-toggle",
-    "#column-left .sidebar-header button.btn-icon",
-    ".sidebar-header button.btn-icon",
     "button.btn-menu-toggle",
+    "#column-left .sidebar-header .btn-icon:not(.sidebar-close-button)",
+    ".sidebar-header .btn-icon:not(.sidebar-close-button)",
     ".sidebar-tools-button",
 ]
 
-# Text labels that identify the "Contacts" menu item (fa + en variants).
+# The Contacts menu item, targeted by its language-independent icon class.
+# Confirmed on live Eitaa: `btn-menu-item tgico-user` with text "مخاطبین".
+CONTACTS_MENU_ITEM = [
+    ".btn-menu-item.tgico-user",
+    "button.btn-menu-item.tgico-user",
+    ".btn-menu .tgico-user",
+]
+
+# Text labels that identify the "Contacts" menu item (fa + en fallback).
 CONTACTS_LABELS = [
     "مخاطبین",
     "مخاطب‌ها",
     "مخاطب ها",
-    "مخاطبین من",
     "Contacts",
 ]
 
