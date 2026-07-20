@@ -33,7 +33,11 @@ from config import config
 from capture.analyzer import analyze
 from capture.browser import open_session
 from capture.recorder import RunRecorder
+from pathlib import Path
+
 from eitaa.driver import EitaaDriver, inspect_dom
+from jobs.campaign import create_campaign, run_campaign, request_stop
+from jobs.state import JobState
 
 
 async def cmd_login(account: str) -> int:
@@ -140,6 +144,68 @@ async def cmd_send(account: str, to: str, text: str, no_verify: bool) -> int:
         return 0 if result.ok else 1
 
 
+async def cmd_collect(account: str, out: str, users_only: bool) -> int:
+    config.ensure_dirs()
+    async with open_session(account) as session:
+        driver = EitaaDriver(session)
+        await driver.open()
+        if not await driver.is_logged_in():
+            print("[collect] not logged in. run: python cli.py login --account", account)
+            return 2
+        print("[collect] scrolling chat list (this can take a bit)...")
+        chats = await driver.collect_all_chats()
+        if users_only:
+            chats = [c for c in chats if c.get("kind") == "user"]
+        lines = [c["title"] for c in chats if c.get("title")]
+        out_path = Path(out)
+        out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        print(f"[collect] wrote {len(lines)} names to {out_path}")
+        print("[collect] EDIT this file to keep only the recipients you want, then run campaign.")
+    return 0
+
+
+def _read_recipients(path: str) -> list[str]:
+    lines = Path(path).read_text(encoding="utf-8").splitlines()
+    return [ln.strip() for ln in lines if ln.strip() and not ln.strip().startswith("#")]
+
+
+async def cmd_campaign(account: str, file: str | None, text: str | None, resume: str | None) -> int:
+    config.ensure_dirs()
+    if resume:
+        job = JobState.load(resume)
+        print(f"[campaign] resuming {job.job_id} (status was {job.status})")
+    else:
+        if not file or text is None:
+            print("[campaign] need --file and --text to start a new campaign")
+            return 2
+        names = _read_recipients(file)
+        if not names:
+            print("[campaign] recipient file is empty")
+            return 2
+        job = create_campaign(account, text, names)
+        print(f"[campaign] created job {job.job_id} with {len(job.recipients)} recipients")
+    await run_campaign(job)
+    return 0
+
+
+def cmd_campaign_status(job_id: str) -> int:
+    job = JobState.load(job_id)
+    c = job.counts()
+    print(f"job {job.job_id} status={job.status}")
+    print(f"  total={c['total']} sent={c['sent']} failed={c['failed']} "
+          f"pending={c['pending']} skipped={c['skipped']}")
+    failed = [r.name for r in job.recipients if r.status == 'failed']
+    if failed:
+        print(f"  failed ({len(failed)}): {', '.join(failed[:15])}")
+    return 0
+
+
+def cmd_campaign_stop(job_id: str) -> int:
+    request_stop(job_id)
+    print(f"[campaign] stop flag written for {job_id}. it will stop after the current recipient.")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Eitaa web capture tool")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -173,6 +239,23 @@ def build_parser() -> argparse.ArgumentParser:
     p_send.add_argument("--to", required=True, help="chat/contact name or username to open")
     p_send.add_argument("--text", required=True, help="message text to send")
     p_send.add_argument("--no-verify", action="store_true", help="skip DOM verification")
+
+    p_col = sub.add_parser("collect", help="scroll all chats and write names to a file")
+    p_col.add_argument("--account", required=True)
+    p_col.add_argument("--out", default="recipients_all.txt", help="output file path")
+    p_col.add_argument("--users-only", action="store_true", help="exclude groups/channels")
+
+    p_camp = sub.add_parser("campaign", help="broadcast a text to a recipient list")
+    p_camp.add_argument("--account", required=True)
+    p_camp.add_argument("--file", default=None, help="recipients file (one name per line)")
+    p_camp.add_argument("--text", default=None, help="message text to broadcast")
+    p_camp.add_argument("--resume", default=None, help="resume an existing job_id")
+
+    p_cs = sub.add_parser("campaign-status", help="show a campaign's progress")
+    p_cs.add_argument("--job", required=True)
+
+    p_cx = sub.add_parser("campaign-stop", help="request a campaign to stop cleanly")
+    p_cx.add_argument("--job", required=True)
     return parser
 
 
@@ -192,6 +275,14 @@ def main(argv: list[str] | None = None) -> int:
         return asyncio.run(cmd_chats(args.account))
     if args.command == "send":
         return asyncio.run(cmd_send(args.account, args.to, args.text, args.no_verify))
+    if args.command == "collect":
+        return asyncio.run(cmd_collect(args.account, args.out, args.users_only))
+    if args.command == "campaign":
+        return asyncio.run(cmd_campaign(args.account, args.file, args.text, args.resume))
+    if args.command == "campaign-status":
+        return cmd_campaign_status(args.job)
+    if args.command == "campaign-stop":
+        return cmd_campaign_stop(args.job)
     return 1
 
 

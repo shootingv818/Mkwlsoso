@@ -55,6 +55,15 @@ class Config:
     ACTION_TRAIL_SECONDS: int = _get_int("ACTION_TRAIL_SECONDS", 8)
     RAW_ENCRYPTION_KEY: str = os.environ.get("RAW_ENCRYPTION_KEY", "")
 
+    # Broadcaster (tabchi) rate limiting
+    SEND_MIN_DELAY: int = _get_int("SEND_MIN_DELAY", 8)
+    SEND_MAX_DELAY: int = _get_int("SEND_MAX_DELAY", 18)
+    SEND_BATCH_SIZE: int = _get_int("SEND_BATCH_SIZE", 20)
+    SEND_BATCH_COOLDOWN: int = _get_int("SEND_BATCH_COOLDOWN", 90)
+    MAX_CONSECUTIVE_FAILURES: int = _get_int("MAX_CONSECUTIVE_FAILURES", 5)
+
+    JOBS_DIR: Path = Path(os.environ.get("ARTIFACTS_DIR", "./artifacts")) / "jobs"
+
     @classmethod
     def profile_dir(cls, account: str) -> Path:
         return cls.PROFILES_DIR / account
@@ -63,6 +72,7 @@ class Config:
     def ensure_dirs(cls) -> None:
         cls.PROFILES_DIR.mkdir(parents=True, exist_ok=True)
         cls.ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
+        cls.JOBS_DIR.mkdir(parents=True, exist_ok=True)
 
 
 config = Config()

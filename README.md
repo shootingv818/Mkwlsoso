@@ -90,10 +90,61 @@ artifacts/<run_id>/
 - Use a dedicated **test account** and a **test chat** you control.
 - Enter the login code yourself in the browser; never paste it into chat or code.
 
+## Broadcaster (tabchi)
+
+Capture confirmed Eitaa Web sends over an encrypted MTProto-like binary
+transport (no WebSocket, no plain JSON), so the sender drives the real web UI
+(Browser-driver). The broadcaster is controlled and restart-safe.
+
+### 1. Send one message (test)
+
+```bash
+DISPLAY=:99 python cli.py send --account test1 --to "نام چت" --text "سلام"
+```
+
+### 2. Collect recipient names
+
+```bash
+DISPLAY=:99 python cli.py collect --account test1 --out recipients_all.txt --users-only
+```
+
+Scrolls the whole chat list and writes names to `recipients_all.txt`. `--users-only`
+excludes groups/channels. **Edit the file** to keep only the recipients you want.
+
+### 3. Run a campaign
+
+```bash
+DISPLAY=:99 python cli.py campaign --account test1 --file recipients_all.txt --text "متن پیام"
+```
+
+It sends to each recipient with a humane random delay, checkpoints after every
+one, and prints progress. Note the printed `job_id`.
+
+### 4. Status / stop / resume
+
+```bash
+python cli.py campaign-status --job <job_id>
+python cli.py campaign-stop   --job <job_id>     # stops after the current recipient
+DISPLAY=:99 python cli.py campaign --account test1 --resume <job_id>
+```
+
+### Rate limiting (in .env)
+
+```
+SEND_MIN_DELAY=8
+SEND_MAX_DELAY=18
+SEND_BATCH_SIZE=20
+SEND_BATCH_COOLDOWN=90
+MAX_CONSECUTIVE_FAILURES=5
+```
+
+The campaign is restart-safe: if the server reboots or the process is killed,
+`--resume <job_id>` continues from the first pending recipient and never
+re-sends to anyone already marked `sent`.
+
 ## Roadmap
 
-- **Phase 1 (this):** capture + analyze real operations.
-- **Phase 2:** `EitaaClient` (login/session/contacts/send) via Browser-driver or
-  Hybrid, chosen from the capture results.
-- **Phase 3:** multi-account management + a controlled, restart-safe send queue
-  (start/pause/resume/stop, rate limiting, de-dup, checkpoints).
+- **Phase 1:** capture + analyze real operations. (done)
+- **Phase 2:** Browser-driver `send_text` + inspect. (done)
+- **Phase 3:** controlled, restart-safe broadcaster (collect/campaign). (done)
+- **Next:** send contact cards / media, multi-account rotation, a control panel.

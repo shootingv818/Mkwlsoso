@@ -74,28 +74,81 @@ class EitaaDriver:
         loc = await _first_visible(self.page, S.SEARCH_INPUT, timeout=8000)
         return loc is not None
 
-    async def list_chat_titles(self, limit: int = 20) -> list[str]:
-        """Return the titles of currently visible chats (owner's own data).
+    async def _snapshot_chats(self) -> list[dict]:
+        """Read currently-rendered chat rows: clean title + peer type.
 
-        Printed on the owner's own machine so they can pick a name for --to.
+        Title is taken from `.peer-title` only (avoids the appended time). Type
+        is inferred from the row's data-peer-id: negative -> group/channel.
         """
         js = """
-        (limit) => {
-          const nodes = document.querySelectorAll('.chatlist-chat');
+        () => {
+          const rows = document.querySelectorAll('.chatlist-chat');
           const out = [];
-          for (const n of nodes) {
-            const t = n.querySelector('.peer-title, .user-title, .dialog-title');
-            const title = (t ? t.textContent : n.textContent || '').trim();
-            if (title) out.push(title.slice(0, 60));
-            if (out.length >= limit) break;
+          for (const n of rows) {
+            const t = n.querySelector('.peer-title');
+            const title = (t ? t.textContent : '').trim();
+            if (!title) continue;
+            const pid = n.dataset.peerId || n.getAttribute('data-peer-id') || '';
+            let kind = 'user';
+            if (pid.startsWith('-')) kind = 'group_or_channel';
+            out.push({ title: title.slice(0, 80), peer_id: pid, kind });
           }
           return out;
         }
         """
         try:
-            return await self.page.evaluate(js, limit)
+            return await self.page.evaluate(js)
         except Exception:  # noqa: BLE001
             return []
+
+    async def list_chat_titles(self, limit: int = 20) -> list[str]:
+        rows = await self._snapshot_chats()
+        return [r["title"] for r in rows[:limit]]
+
+    async def collect_all_chats(self, max_scrolls: int = 60) -> list[dict]:
+        """Scroll the chat list and collect all rendered chats (deduped).
+
+        tweb virtualizes the list, so we scroll the container repeatedly and
+        accumulate rows until no new ones appear.
+        """
+        seen: dict[str, dict] = {}
+        # Find a scrollable chat-list container.
+        container = None
+        for sel in [".chatlist-container", ".sidebar-content .scrollable", "#column-left .scrollable"]:
+            loc = self.page.locator(sel).first
+            try:
+                if await loc.count() > 0:
+                    container = loc
+                    break
+            except Exception:  # noqa: BLE001
+                continue
+
+        stagnant = 0
+        for _ in range(max_scrolls):
+            for r in await self._snapshot_chats():
+                key = r.get("peer_id") or r.get("title")
+                if key and key not in seen:
+                    seen[key] = r
+            before = len(seen)
+            try:
+                if container is not None:
+                    await container.evaluate("el => el.scrollBy(0, el.clientHeight)")
+                else:
+                    await self.page.mouse.wheel(0, 800)
+            except Exception:  # noqa: BLE001
+                await self.page.mouse.wheel(0, 800)
+            await self.page.wait_for_timeout(600)
+            for r in await self._snapshot_chats():
+                key = r.get("peer_id") or r.get("title")
+                if key and key not in seen:
+                    seen[key] = r
+            if len(seen) == before:
+                stagnant += 1
+                if stagnant >= 4:
+                    break
+            else:
+                stagnant = 0
+        return list(seen.values())
 
     async def open_chat(self, query: str) -> None:
         search = await _first_visible(self.page, S.SEARCH_INPUT, timeout=10000)
