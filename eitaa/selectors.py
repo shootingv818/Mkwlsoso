@@ -11,7 +11,10 @@ real page if any element is not found.
 from __future__ import annotations
 
 # Left-column search input used to find a chat/contact by name or username.
+# Confirmed on live Eitaa: input.input-search-input (placeholder "جستجو").
 SEARCH_INPUT = [
+    "input.input-search-input",
+    "input.input-field-input.input-search-input",
     "#column-left input.input-field-input",
     ".input-search input",
     "input.input-field-input",
@@ -19,12 +22,13 @@ SEARCH_INPUT = [
 ]
 
 # Search result rows / chat list items (clicking opens the chat).
+# Confirmed on live Eitaa: items use class .chatlist-chat (NOT <a>).
 CHAT_RESULT = [
-    "#column-left ul.chatlist a.chatlist-chat",
-    ".chatlist a.chatlist-chat",
-    "a.chatlist-chat",
+    ".search-super .chatlist-chat",
+    "#search-container .chatlist-chat",
+    ".search-group .chatlist-chat",
     ".chatlist-chat",
-    "ul.chatlist > a",
+    "a.chatlist-chat",
 ]
 
 # The message composer (contenteditable div in tweb).

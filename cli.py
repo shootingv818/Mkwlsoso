@@ -96,15 +96,33 @@ def cmd_list() -> int:
     return 0
 
 
-async def cmd_inspect(account: str) -> int:
+async def cmd_inspect(account: str, open_query: str | None) -> int:
     config.ensure_dirs()
     async with open_session(account) as session:
         driver = EitaaDriver(session)
         await driver.open()
         logged_in = await driver.is_logged_in()
         print(f"[inspect] logged_in guess: {logged_in}")
+        if open_query:
+            try:
+                await driver.open_chat(open_query)
+                print(f"[inspect] opened chat for query: {open_query!r}")
+            except Exception as exc:  # noqa: BLE001
+                print(f"[inspect] could not open chat: {exc}")
         snapshot = await inspect_dom(session.page)
         print(json.dumps(snapshot, ensure_ascii=False, indent=2))
+    return 0
+
+
+async def cmd_chats(account: str) -> int:
+    config.ensure_dirs()
+    async with open_session(account) as session:
+        driver = EitaaDriver(session)
+        await driver.open()
+        titles = await driver.list_chat_titles(limit=20)
+        print(f"[chats] {len(titles)} visible chats (use one of these names with --to):")
+        for i, t in enumerate(titles, 1):
+            print(f"  {i:2d}. {t}")
     return 0
 
 
@@ -145,6 +163,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_insp = sub.add_parser("inspect", help="print structural DOM snapshot")
     p_insp.add_argument("--account", required=True)
+    p_insp.add_argument("--open", default=None, help="optional chat name to open before inspecting")
+
+    p_chats = sub.add_parser("chats", help="list visible chat titles (choose one for --to)")
+    p_chats.add_argument("--account", required=True)
 
     p_send = sub.add_parser("send", help="send one text message via the browser driver")
     p_send.add_argument("--account", required=True)
@@ -165,7 +187,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "list":
         return cmd_list()
     if args.command == "inspect":
-        return asyncio.run(cmd_inspect(args.account))
+        return asyncio.run(cmd_inspect(args.account, args.open))
+    if args.command == "chats":
+        return asyncio.run(cmd_chats(args.account))
     if args.command == "send":
         return asyncio.run(cmd_send(args.account, args.to, args.text, args.no_verify))
     return 1

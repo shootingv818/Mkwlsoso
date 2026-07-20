@@ -74,20 +74,55 @@ class EitaaDriver:
         loc = await _first_visible(self.page, S.SEARCH_INPUT, timeout=8000)
         return loc is not None
 
+    async def list_chat_titles(self, limit: int = 20) -> list[str]:
+        """Return the titles of currently visible chats (owner's own data).
+
+        Printed on the owner's own machine so they can pick a name for --to.
+        """
+        js = """
+        (limit) => {
+          const nodes = document.querySelectorAll('.chatlist-chat');
+          const out = [];
+          for (const n of nodes) {
+            const t = n.querySelector('.peer-title, .user-title, .dialog-title');
+            const title = (t ? t.textContent : n.textContent || '').trim();
+            if (title) out.push(title.slice(0, 60));
+            if (out.length >= limit) break;
+          }
+          return out;
+        }
+        """
+        try:
+            return await self.page.evaluate(js, limit)
+        except Exception:  # noqa: BLE001
+            return []
+
     async def open_chat(self, query: str) -> None:
         search = await _first_visible(self.page, S.SEARCH_INPUT, timeout=10000)
         if search is None:
             raise DriverError("search input not found (are you logged in?)")
         await search.click()
         await search.fill("")
-        await search.type(query, delay=30)
-        await self.page.wait_for_timeout(1800)  # let results load
+        await search.type(query, delay=40)
+        # Search results load asynchronously; give them time.
+        await self.page.wait_for_timeout(2500)
 
-        result = await _first_visible(self.page, S.CHAT_RESULT, timeout=8000)
+        result = await _first_visible(self.page, S.CHAT_RESULT, timeout=10000)
         if result is None:
+            # Fallback: keyboard-select the top result.
+            try:
+                await search.press("ArrowDown")
+                await search.press("Enter")
+                await self.page.wait_for_timeout(1500)
+                # If a composer appeared, treat as opened.
+                box = await _first_visible(self.page, S.MESSAGE_INPUT, timeout=3000)
+                if box is not None:
+                    return
+            except Exception:  # noqa: BLE001
+                pass
             raise DriverError(f"no chat result for query: {query!r}")
         await result.click()
-        await self.page.wait_for_timeout(1500)  # let the chat open
+        await self.page.wait_for_timeout(1800)  # let the chat open
 
     async def send_text(self, query: str, text: str, verify: bool = True) -> SendResult:
         try:
