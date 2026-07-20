@@ -12,6 +12,12 @@ Commands
 
   list     List existing capture runs.
 
+  inspect  Print a safe, structural snapshot of the Eitaa Web DOM (to confirm
+           or fix UI selectors). No message text or personal data is printed.
+
+  send     Send ONE text message to a chat via the browser driver (a real
+           end-to-end test of the send path).
+
 This tool automates the OWNER'S OWN accounts only. It does not bypass login,
 OTP, CAPTCHA, or rate limits.
 """
@@ -20,12 +26,14 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import sys
 
 from config import config
 from capture.analyzer import analyze
 from capture.browser import open_session
 from capture.recorder import RunRecorder
+from eitaa.driver import EitaaDriver, inspect_dom
 
 
 async def cmd_login(account: str) -> int:
@@ -88,6 +96,32 @@ def cmd_list() -> int:
     return 0
 
 
+async def cmd_inspect(account: str) -> int:
+    config.ensure_dirs()
+    async with open_session(account) as session:
+        driver = EitaaDriver(session)
+        await driver.open()
+        logged_in = await driver.is_logged_in()
+        print(f"[inspect] logged_in guess: {logged_in}")
+        snapshot = await inspect_dom(session.page)
+        print(json.dumps(snapshot, ensure_ascii=False, indent=2))
+    return 0
+
+
+async def cmd_send(account: str, to: str, text: str, no_verify: bool) -> int:
+    config.ensure_dirs()
+    async with open_session(account) as session:
+        driver = EitaaDriver(session)
+        await driver.open()
+        if not await driver.is_logged_in():
+            print("[send] not logged in. run: python cli.py login --account", account)
+            return 2
+        print(f"[send] sending to {to!r} ...")
+        result = await driver.send_text(to, text, verify=not no_verify)
+        print(f"[send] ok={result.ok} detail={result.detail}")
+        return 0 if result.ok else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Eitaa web capture tool")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -108,6 +142,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_an.add_argument("--run", required=True)
 
     sub.add_parser("list", help="list capture runs")
+
+    p_insp = sub.add_parser("inspect", help="print structural DOM snapshot")
+    p_insp.add_argument("--account", required=True)
+
+    p_send = sub.add_parser("send", help="send one text message via the browser driver")
+    p_send.add_argument("--account", required=True)
+    p_send.add_argument("--to", required=True, help="chat/contact name or username to open")
+    p_send.add_argument("--text", required=True, help="message text to send")
+    p_send.add_argument("--no-verify", action="store_true", help="skip DOM verification")
     return parser
 
 
@@ -121,6 +164,10 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_analyze(args.run)
     if args.command == "list":
         return cmd_list()
+    if args.command == "inspect":
+        return asyncio.run(cmd_inspect(args.account))
+    if args.command == "send":
+        return asyncio.run(cmd_send(args.account, args.to, args.text, args.no_verify))
     return 1
 
 
