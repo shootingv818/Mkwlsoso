@@ -41,6 +41,7 @@ from jobs.state import JobState
 from capture import deep
 from capture.deep import HOOKS_JS
 from capture.dossier import build_dossier
+from capture.extract_params import extract_run, summarize
 
 
 async def cmd_login(account: str) -> int:
@@ -137,6 +138,13 @@ async def cmd_probe(account: str, op: str, manual: bool) -> int:
     out = build_dossier(rec.run_id)
     print(f"[probe] dossier written: {out}")
     print(out.read_text(encoding="utf-8"))
+    return 0
+
+
+def cmd_extract(run_id: str) -> int:
+    out = extract_run(run_id)
+    print(f"[extract] params written: {out}")
+    print(summarize(out))
     return 0
 
 
@@ -280,6 +288,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_probe.add_argument("--op", required=True, help="label, e.g. login, contacts, send_text, send_file")
     p_probe.add_argument("--auto", action="store_true", help="no manual action (baseline+trail only)")
 
+    p_ext = sub.add_parser("extract", help="mine MTProto params (DCs/api/layer/RSA) from a run's assets")
+    p_ext.add_argument("--run", required=True)
+
     sub.add_parser("list", help="list capture runs")
 
     p_insp = sub.add_parser("inspect", help="print structural DOM snapshot")
@@ -324,6 +335,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_analyze(args.run)
     if args.command == "probe":
         return asyncio.run(cmd_probe(args.account, args.op, manual=not args.auto))
+    if args.command == "extract":
+        return cmd_extract(args.run)
     if args.command == "list":
         return cmd_list()
     if args.command == "inspect":
