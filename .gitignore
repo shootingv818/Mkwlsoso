@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Secrets and runtime config
+.env
+
+# Browser profiles hold live sessions/cookies - NEVER commit
+profiles/
+
+# Capture output holds raw traffic/screenshots - NEVER commit
+artifacts/
+
+# Logs
+*.log
+
+# OS
+.DS_Store
