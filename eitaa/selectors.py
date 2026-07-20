@@ -104,3 +104,52 @@ CONTACT_ROW = [
     ".contacts-container .chatlist-chat",
     ".chatlist-chat",
 ]
+
+# --- Add-contact flow ---------------------------------------------------
+# Floating "add contact" button, usually a round corner button in the
+# contacts view, or a header add icon.
+ADD_CONTACT_BUTTON = [
+    ".tabs-tab.active .btn-circle.btn-corner",
+    "#column-left .btn-circle.btn-corner",
+    ".btn-circle.btn-corner",
+    ".sidebar-header .btn-icon.tgico-add",
+    "button.btn-circle",
+]
+
+# The "new contact" popup/dialog container.
+NEW_CONTACT_POPUP = [
+    ".popup.active",
+    ".popup-new-contact",
+    ".popup.popup-create-contact",
+    ".popup-container.active",
+]
+
+# Text inputs inside the new-contact popup (first/last name).
+NEW_CONTACT_TEXT_INPUTS = [
+    ".popup.active .input-field-input",
+    ".popup.active input.input-field-input",
+    ".popup.active input[type='text']",
+]
+
+# The phone input inside the new-contact popup.
+NEW_CONTACT_PHONE_INPUT = [
+    ".popup.active input[type='tel']",
+    ".popup.active .input-field-phone input",
+    ".popup.active input.input-field-input",
+]
+
+# The confirm/add button inside the popup.
+NEW_CONTACT_CONFIRM = [
+    ".popup.active .popup-button",
+    ".popup.active .btn-primary",
+    ".popup.active button.btn-color-primary",
+]
+
+# Confirm-button label variants (fa + en) as a text fallback.
+ADD_CONTACT_LABELS = [
+    "افزودن مخاطب",
+    "افزودن",
+    "ذخیره",
+    "Add Contact",
+    "Add",
+]

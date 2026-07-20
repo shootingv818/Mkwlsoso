@@ -266,6 +266,117 @@ class EitaaDriver:
                 stagnant = 0
         return list(seen.values())
 
+    async def get_stats(self) -> dict:
+        """Return {contacts: N, pvs: M}.
+
+        contacts = total entries in the Contacts view.
+        pvs       = private chats (user peers, positive id) in the chat list.
+        Groups/channels are intentionally not counted.
+        """
+        # PV count from the chat list (scroll all, keep only user peers).
+        chats = await self.collect_all_chats()
+        pvs = sum(1 for c in chats if c.get("kind") == "user")
+
+        # Contacts count from the Contacts view (scroll all).
+        try:
+            contacts = await self.collect_all_contacts()
+            contacts_count = len(contacts)
+        except DriverError:
+            contacts_count = -1  # could not open contacts view
+
+        return {"contacts": contacts_count, "pvs": pvs}
+
+    async def _open_add_contact_popup(self) -> bool:
+        """Open the Contacts view and click the add-contact button."""
+        await self.open_contacts_view()
+        btn = await _first_visible(self.page, S.ADD_CONTACT_BUTTON, timeout=6000)
+        if btn is None:
+            return False
+        await btn.click()
+        popup = await _first_visible(self.page, S.NEW_CONTACT_POPUP, timeout=6000)
+        return popup is not None
+
+    async def add_contact(self, phone: str, first: str, last: str = "") -> dict:
+        """Add one contact via the new-contact popup. Returns a result dict.
+
+        status: added | not_on_eitaa | error
+        """
+        result = {"phone": phone, "first": first, "last": last, "status": "error", "detail": ""}
+        try:
+            if not await self._open_add_contact_popup():
+                result["detail"] = "add-contact popup did not open (run: inspect --add-contact)"
+                return result
+
+            # Fill name fields (first text input = first name, second = last name).
+            text_inputs = self.page.locator(S.NEW_CONTACT_TEXT_INPUTS[0])
+            n_text = await text_inputs.count()
+            if n_text >= 1:
+                await text_inputs.nth(0).fill(first)
+            if n_text >= 2 and last:
+                await text_inputs.nth(1).fill(last)
+
+            # Fill phone.
+            phone_box = await _first_visible(self.page, S.NEW_CONTACT_PHONE_INPUT, timeout=3000)
+            if phone_box is None:
+                result["detail"] = "phone input not found in popup"
+                return result
+            await phone_box.click()
+            await phone_box.fill(phone)
+            await self.page.wait_for_timeout(400)
+
+            # Confirm.
+            confirm = await _first_visible(self.page, S.NEW_CONTACT_CONFIRM, timeout=3000)
+            if confirm is None:
+                for label in S.ADD_CONTACT_LABELS:
+                    try:
+                        c = self.page.get_by_text(label, exact=False).first
+                        if await c.is_visible():
+                            confirm = c
+                            break
+                    except Exception:  # noqa: BLE001
+                        continue
+            if confirm is None:
+                result["detail"] = "confirm button not found"
+                return result
+            await confirm.click()
+            await self.page.wait_for_timeout(2200)
+
+            # Detect outcome.
+            status = await self._detect_add_result()
+            result["status"] = status
+            # Close popup if still open.
+            try:
+                await self.page.keyboard.press("Escape")
+            except Exception:  # noqa: BLE001
+                pass
+            return result
+        except Exception as exc:  # noqa: BLE001
+            result["detail"] = f"exception: {exc}"
+            try:
+                await self.page.keyboard.press("Escape")
+            except Exception:  # noqa: BLE001
+                pass
+            return result
+
+    async def _detect_add_result(self) -> str:
+        """Heuristic: was the number on Eitaa (added) or not?"""
+        # Look for a toast/error indicating the number is not registered.
+        try:
+            body_text = await self.page.evaluate(
+                "() => (document.querySelector('.toast, .error, .popup-description') || {}).textContent || ''"
+            )
+        except Exception:  # noqa: BLE001
+            body_text = ""
+        low = (body_text or "").lower()
+        markers = ["not on", "isn't on", "not registered", "یافت نشد", "عضو نیست", "ثبت نشده", "وجود ندارد"]
+        if any(m in low for m in markers):
+            return "not_on_eitaa"
+        # If the popup closed, treat as added.
+        popup = await _first_visible(self.page, S.NEW_CONTACT_POPUP, timeout=1500)
+        if popup is None:
+            return "added"
+        return "error"
+
     async def open_chat(self, query: str) -> None:
         search = await _first_visible(self.page, S.SEARCH_INPUT, timeout=10000)
         if search is None:
@@ -417,6 +528,56 @@ async def inspect_menu(page: Page) -> dict:
     """
     try:
         out["menu_items"] = await page.evaluate(js_items)
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
+async def inspect_add_contact(driver: "EitaaDriver") -> dict:
+    """Open Contacts -> add-contact popup and dump the popup's inputs/buttons.
+
+    Reveals the exact selectors for the new-contact form. Only structural info
+    (classes/placeholders/button text) is returned, not personal data.
+    """
+    from eitaa import selectors as S
+
+    page = driver.page
+    out: dict = {"add_button_found": False, "popup_found": False, "inputs": [], "buttons": []}
+
+    await driver.open_contacts_view()
+    btn = await _first_visible(page, S.ADD_CONTACT_BUTTON, timeout=6000)
+    out["add_button_found"] = btn is not None
+    # Also dump round/corner button candidates so we can find the right one.
+    try:
+        out["corner_buttons"] = await page.evaluate(
+            "() => Array.from(document.querySelectorAll('.btn-circle, .btn-corner, .sidebar-header .btn-icon'))"
+            ".slice(0,12).map(b => b.className || null)"
+        )
+    except Exception:  # noqa: BLE001
+        out["corner_buttons"] = []
+
+    if btn is not None:
+        try:
+            await btn.click()
+            await page.wait_for_timeout(1200)
+        except Exception:  # noqa: BLE001
+            pass
+
+    popup = await _first_visible(page, S.NEW_CONTACT_POPUP, timeout=4000)
+    out["popup_found"] = popup is not None
+    try:
+        out["inputs"] = await page.evaluate(
+            "() => Array.from(document.querySelectorAll('.popup.active input, .popup-container.active input'))"
+            ".slice(0,10).map(i => ({type:i.type||null, cls:i.className||null, ph:i.placeholder||null}))"
+        )
+        out["buttons"] = await page.evaluate(
+            "() => Array.from(document.querySelectorAll('.popup.active button, .popup-container.active button'))"
+            ".slice(0,10).map(b => ({cls:b.className||null, text:(b.textContent||'').trim().slice(0,30)}))"
+        )
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        await page.keyboard.press("Escape")
     except Exception:  # noqa: BLE001
         pass
     return out

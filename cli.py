@@ -35,7 +35,10 @@ from capture.browser import open_session
 from capture.recorder import RunRecorder
 from pathlib import Path
 
-from eitaa.driver import EitaaDriver, inspect_dom, inspect_menu
+import csv
+import re
+
+from eitaa.driver import EitaaDriver, inspect_dom, inspect_menu, inspect_add_contact
 from jobs.campaign import create_campaign, run_campaign, request_stop
 from jobs.state import JobState
 from capture import deep
@@ -158,7 +161,7 @@ def cmd_list() -> int:
     return 0
 
 
-async def cmd_inspect(account: str, open_query: str | None, menu: bool) -> int:
+async def cmd_inspect(account: str, open_query: str | None, menu: bool, add_contact: bool) -> int:
     config.ensure_dirs()
     async with open_session(account) as session:
         driver = EitaaDriver(session)
@@ -169,6 +172,10 @@ async def cmd_inspect(account: str, open_query: str | None, menu: bool) -> int:
             info = await inspect_menu(session.page)
             print(json.dumps(info, ensure_ascii=False, indent=2))
             return 0
+        if add_contact:
+            info = await inspect_add_contact(driver)
+            print(json.dumps(info, ensure_ascii=False, indent=2))
+            return 0
         if open_query:
             try:
                 await driver.open_chat(open_query)
@@ -177,6 +184,93 @@ async def cmd_inspect(account: str, open_query: str | None, menu: bool) -> int:
                 print(f"[inspect] could not open chat: {exc}")
         snapshot = await inspect_dom(session.page)
         print(json.dumps(snapshot, ensure_ascii=False, indent=2))
+    return 0
+
+
+def _normalize_ir_phone(raw: str) -> str | None:
+    """Normalize an Iranian mobile number to +98XXXXXXXXXX. None if invalid."""
+    digits = re.sub(r"\D", "", raw or "")
+    if digits.startswith("0098"):
+        digits = digits[4:]
+    elif digits.startswith("98"):
+        digits = digits[2:]
+    elif digits.startswith("0"):
+        digits = digits[1:]
+    # Iranian mobile numbers are 10 digits starting with 9.
+    if len(digits) == 10 and digits.startswith("9"):
+        return "+98" + digits
+    return None
+
+
+def _read_contacts_csv(path: str) -> list[dict]:
+    rows: list[dict] = []
+    with open(path, encoding="utf-8") as fh:
+        reader = csv.reader(fh)
+        for i, row in enumerate(reader):
+            if not row or not row[0].strip():
+                continue
+            # Skip a header line if present.
+            if i == 0 and row[0].strip().lower() in {"phone", "شماره", "number"}:
+                continue
+            phone = row[0].strip()
+            first = row[1].strip() if len(row) > 1 else ""
+            last = row[2].strip() if len(row) > 2 else ""
+            rows.append({"phone": phone, "first": first, "last": last})
+    return rows
+
+
+async def cmd_add_contacts(account: str, file: str, limit: int | None) -> int:
+    config.ensure_dirs()
+    entries = _read_contacts_csv(file)
+    if limit and limit > 0:
+        entries = entries[:limit]
+    if not entries:
+        print("[add-contacts] no rows in", file)
+        return 2
+
+    async with open_session(account) as session:
+        driver = EitaaDriver(session)
+        await driver.open()
+        if not await driver.is_logged_in():
+            print("[add-contacts] not logged in. run: python cli.py login --account", account)
+            return 2
+
+        results = []
+        for e in entries:
+            norm = _normalize_ir_phone(e["phone"])
+            if norm is None:
+                results.append({**e, "status": "invalid_number"})
+                print(f"[add-contacts] {e['phone']} -> invalid_number")
+                continue
+            r = await driver.add_contact(norm, e["first"], e["last"])
+            results.append({**e, "normalized": norm, "status": r["status"], "detail": r.get("detail", "")})
+            print(f"[add-contacts] {norm} ({e['first']} {e['last']}) -> {r['status']} {r.get('detail','')}")
+            await session.page.wait_for_timeout(1500)
+
+        added = sum(1 for r in results if r["status"] == "added")
+        not_on = sum(1 for r in results if r["status"] == "not_on_eitaa")
+        invalid = sum(1 for r in results if r["status"] == "invalid_number")
+        errors = sum(1 for r in results if r["status"] == "error")
+        print(f"[add-contacts] summary: added={added} not_on_eitaa={not_on} "
+              f"invalid={invalid} error={errors} total={len(results)}")
+    return 0
+
+
+async def cmd_stats(account: str) -> int:
+    config.ensure_dirs()
+    async with open_session(account) as session:
+        driver = EitaaDriver(session)
+        await driver.open()
+        if not await driver.is_logged_in():
+            print("[stats] not logged in. run: python cli.py login --account", account)
+            return 2
+        print("[stats] counting (this scrolls chats + contacts, takes a bit)...")
+        stats = await driver.get_stats()
+        c = stats["contacts"]
+        c_str = "unknown (contacts view failed)" if c < 0 else str(c)
+        print(f"[stats] account={account}")
+        print(f"        contacts (مخاطبین): {c_str}")
+        print(f"        private chats (پی‌وی): {stats['pvs']}")
     return 0
 
 
@@ -331,6 +425,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_insp.add_argument("--account", required=True)
     p_insp.add_argument("--open", default=None, help="optional chat name to open before inspecting")
     p_insp.add_argument("--menu", action="store_true", help="open the sidebar menu and dump its items")
+    p_insp.add_argument("--add-contact", dest="add_contact", action="store_true",
+                        help="open the add-contact popup and dump its form")
 
     p_chats = sub.add_parser("chats", help="list visible chat titles (choose one for --to)")
     p_chats.add_argument("--account", required=True)
@@ -338,6 +434,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_contacts = sub.add_parser("contacts", help="collect ALL contacts from the Contacts view")
     p_contacts.add_argument("--account", required=True)
     p_contacts.add_argument("--out", default="contacts.txt", help="output file path")
+
+    p_stats = sub.add_parser("stats", help="show account stats (contacts count + PV count)")
+    p_stats.add_argument("--account", required=True)
+
+    p_addc = sub.add_parser("add-contacts", help="create contacts from a CSV (phone,first_name,last_name)")
+    p_addc.add_argument("--account", required=True)
+    p_addc.add_argument("--file", required=True, help="CSV file: phone,first_name,last_name")
+    p_addc.add_argument("--limit", type=int, default=None, help="only process the first N rows (safe test)")
 
     p_send = sub.add_parser("send", help="send one text message via the browser driver")
     p_send.add_argument("--account", required=True)
@@ -380,11 +484,15 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "list":
         return cmd_list()
     if args.command == "inspect":
-        return asyncio.run(cmd_inspect(args.account, args.open, args.menu))
+        return asyncio.run(cmd_inspect(args.account, args.open, args.menu, args.add_contact))
     if args.command == "chats":
         return asyncio.run(cmd_chats(args.account))
     if args.command == "contacts":
         return asyncio.run(cmd_contacts(args.account, args.out))
+    if args.command == "stats":
+        return asyncio.run(cmd_stats(args.account))
+    if args.command == "add-contacts":
+        return asyncio.run(cmd_add_contacts(args.account, args.file, args.limit))
     if args.command == "send":
         return asyncio.run(cmd_send(args.account, args.to, args.text, args.no_verify))
     if args.command == "collect":
