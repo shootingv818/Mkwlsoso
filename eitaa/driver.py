@@ -307,21 +307,54 @@ class EitaaDriver:
                 result["detail"] = "add-contact popup did not open (run: inspect --add-contact)"
                 return result
 
-            # Fill name fields (first text input = first name, second = last name).
-            text_inputs = self.page.locator(S.NEW_CONTACT_TEXT_INPUTS[0])
-            n_text = await text_inputs.count()
-            if n_text >= 1:
-                await text_inputs.nth(0).fill(first)
-            if n_text >= 2 and last:
-                await text_inputs.nth(1).fill(last)
-
-            # Fill phone.
-            phone_box = await _first_visible(self.page, S.NEW_CONTACT_PHONE_INPUT, timeout=3000)
-            if phone_box is None:
-                result["detail"] = "phone input not found in popup"
+            # The popup fields are .input-field-input (often contenteditable).
+            # Match each field to first/last/phone by its label text, so we do
+            # not depend on the order.
+            fields = self.page.locator(".popup.active .input-field-input")
+            count = await fields.count()
+            if count == 0:
+                result["detail"] = "no .input-field-input in popup (run: inspect --add-contact)"
                 return result
-            await phone_box.click()
-            await phone_box.fill(phone)
+
+            labels = await self.page.evaluate(
+                """
+                () => Array.from(document.querySelectorAll('.popup.active .input-field-input'))
+                  .map(n => {
+                    const f = n.closest('.input-field');
+                    return ((f && f.querySelector('label') ? f.querySelector('label').textContent : '') || '').trim();
+                  })
+                """
+            )
+
+            def _match(idx_keywords):
+                for i, lab in enumerate(labels or []):
+                    low = lab.lower()
+                    if any(k in low for k in idx_keywords):
+                        return i
+                return None
+
+            first_idx = _match(["نام", "first"]) 
+            last_idx = _match(["خانوادگ", "last", "family"])
+            phone_idx = _match(["تلفن", "شماره", "phone", "موبایل", "mobile"])
+
+            # Positional fallback if labels are missing: 0=first, 1=last, 2=phone.
+            if first_idx is None:
+                first_idx = 0 if count >= 1 else None
+            if last_idx is None and count >= 3:
+                last_idx = 1
+            if phone_idx is None:
+                phone_idx = count - 1  # phone is usually the last field
+
+            # Avoid collisions (first==phone when only 2 fields, etc.).
+            if phone_idx == first_idx and count >= 2:
+                phone_idx = count - 1
+
+            if first_idx is not None:
+                await fields.nth(first_idx).fill(first)
+            if last and last_idx is not None and last_idx != first_idx:
+                await fields.nth(last_idx).fill(last)
+            await fields.nth(phone_idx).click()
+            await fields.nth(phone_idx).fill(phone)
             await self.page.wait_for_timeout(400)
 
             # Confirm.
@@ -566,9 +599,24 @@ async def inspect_add_contact(driver: "EitaaDriver") -> dict:
     popup = await _first_visible(page, S.NEW_CONTACT_POPUP, timeout=4000)
     out["popup_found"] = popup is not None
     try:
-        out["inputs"] = await page.evaluate(
-            "() => Array.from(document.querySelectorAll('.popup.active input, .popup-container.active input'))"
-            ".slice(0,10).map(i => ({type:i.type||null, cls:i.className||null, ph:i.placeholder||null}))"
+        # tweb popups use .input-field-input (often contenteditable divs), each
+        # inside an .input-field with a <label>. Dump tag/class/label/order.
+        out["fields"] = await page.evaluate(
+            """
+            () => Array.from(document.querySelectorAll('.popup.active .input-field-input, .popup.active [contenteditable]'))
+              .slice(0, 12)
+              .map((n, idx) => {
+                const field = n.closest('.input-field');
+                const label = field ? (field.querySelector('label') || {}).textContent : '';
+                return {
+                  idx: idx,
+                  tag: n.tagName,
+                  cls: n.className || null,
+                  editable: n.getAttribute('contenteditable'),
+                  label: (label || '').trim().slice(0, 30),
+                };
+              })
+            """
         )
         out["buttons"] = await page.evaluate(
             "() => Array.from(document.querySelectorAll('.popup.active button, .popup-container.active button'))"
