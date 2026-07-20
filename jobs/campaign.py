@@ -24,7 +24,9 @@ from jobs import state as st
 from jobs.state import JobState
 
 
-def create_campaign(account: str, text: str, names: list[str]) -> JobState:
+def create_campaign(account: str, text: str, names: list[str], limit: int | None = None) -> JobState:
+    if limit is not None and limit > 0:
+        names = names[:limit]
     job = JobState.create(account, text, names)
     job.save()
     return job

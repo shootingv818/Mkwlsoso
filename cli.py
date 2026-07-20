@@ -258,7 +258,7 @@ def _read_recipients(path: str) -> list[str]:
     return [ln.strip() for ln in lines if ln.strip() and not ln.strip().startswith("#")]
 
 
-async def cmd_campaign(account: str, file: str | None, text: str | None, resume: str | None) -> int:
+async def cmd_campaign(account: str, file: str | None, text: str | None, resume: str | None, limit: int | None) -> int:
     config.ensure_dirs()
     if resume:
         job = JobState.load(resume)
@@ -271,7 +271,10 @@ async def cmd_campaign(account: str, file: str | None, text: str | None, resume:
         if not names:
             print("[campaign] recipient file is empty")
             return 2
-        job = create_campaign(account, text, names)
+        total = len(names)
+        job = create_campaign(account, text, names, limit=limit)
+        if limit and limit > 0:
+            print(f"[campaign] TEST MODE: using first {len(job.recipients)} of {total} recipients")
         print(f"[campaign] created job {job.job_id} with {len(job.recipients)} recipients")
     await run_campaign(job)
     return 0
@@ -352,6 +355,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_camp.add_argument("--file", default=None, help="recipients file (one name per line)")
     p_camp.add_argument("--text", default=None, help="message text to broadcast")
     p_camp.add_argument("--resume", default=None, help="resume an existing job_id")
+    p_camp.add_argument("--limit", type=int, default=None, help="only send to the first N recipients (safe test)")
 
     p_cs = sub.add_parser("campaign-status", help="show a campaign's progress")
     p_cs.add_argument("--job", required=True)
@@ -386,7 +390,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "collect":
         return asyncio.run(cmd_collect(args.account, args.out, args.users_only))
     if args.command == "campaign":
-        return asyncio.run(cmd_campaign(args.account, args.file, args.text, args.resume))
+        return asyncio.run(cmd_campaign(args.account, args.file, args.text, args.resume, args.limit))
     if args.command == "campaign-status":
         return cmd_campaign_status(args.job)
     if args.command == "campaign-stop":
