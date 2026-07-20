@@ -61,3 +61,38 @@ MESSAGE_TEXT = [
     ".bubble.is-out .translatable-message",
     ".message",
 ]
+
+# Hamburger / main menu button in the left sidebar header (opens Contacts, etc).
+MENU_BUTTON = [
+    ".sidebar-header .btn-menu-toggle",
+    "#column-left .sidebar-header button.btn-icon",
+    ".sidebar-header button.btn-icon",
+    "button.btn-menu-toggle",
+    ".sidebar-tools-button",
+]
+
+# Text labels that identify the "Contacts" menu item (fa + en variants).
+CONTACTS_LABELS = [
+    "مخاطبین",
+    "مخاطب‌ها",
+    "مخاطب ها",
+    "مخاطبین من",
+    "Contacts",
+]
+
+# Scrollable container that holds the contacts list once the Contacts view is
+# open. The active tab is what we scope collection to.
+CONTACTS_CONTAINER = [
+    "#column-left .tabs-tab.active .scrollable",
+    "#column-left .tabs-tab.active .chatlist",
+    ".contacts-container .scrollable",
+    "#column-left .sidebar-slider .tabs-tab.active",
+    "#column-left .scrollable-y",
+]
+
+# Rows inside the contacts view (tweb reuses .chatlist-chat).
+CONTACT_ROW = [
+    ".tabs-tab.active .chatlist-chat",
+    ".contacts-container .chatlist-chat",
+    ".chatlist-chat",
+]

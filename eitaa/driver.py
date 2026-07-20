@@ -150,6 +150,99 @@ class EitaaDriver:
                 stagnant = 0
         return list(seen.values())
 
+    async def open_contacts_view(self, labels: list[str] | None = None) -> None:
+        """Open the Contacts view via the sidebar menu.
+
+        Clicks the hamburger menu, then the menu item whose text matches one of
+        the contacts labels (Persian/English variants).
+        """
+        labels = labels or S.CONTACTS_LABELS
+        btn = await _first_visible(self.page, S.MENU_BUTTON, timeout=8000)
+        if btn is None:
+            raise DriverError("menu button not found (run: inspect --menu)")
+        await btn.click()
+        await self.page.wait_for_timeout(700)
+
+        for label in labels:
+            try:
+                item = self.page.get_by_text(label, exact=False).first
+                if await item.is_visible():
+                    await item.click()
+                    await self.page.wait_for_timeout(1800)
+                    return
+            except Exception:  # noqa: BLE001
+                continue
+        raise DriverError(
+            "contacts menu item not found; labels tried: " + ", ".join(labels)
+        )
+
+    async def _snapshot_contacts(self, container_sel: str | None) -> list[dict]:
+        """Snapshot contact rows, scoped to the contacts container if known."""
+        js = """
+        (containerSel) => {
+          const root = containerSel ? document.querySelector(containerSel) : document;
+          const scope = root || document;
+          const rows = scope.querySelectorAll('.chatlist-chat');
+          const out = [];
+          for (const n of rows) {
+            const t = n.querySelector('.peer-title');
+            const title = (t ? t.textContent : '').trim();
+            if (!title) continue;
+            const pid = n.dataset.peerId || n.getAttribute('data-peer-id') || '';
+            out.push({ title: title.slice(0, 80), peer_id: pid });
+          }
+          return out;
+        }
+        """
+        try:
+            return await self.page.evaluate(js, container_sel)
+        except Exception:  # noqa: BLE001
+            return []
+
+    async def collect_all_contacts(self, max_scrolls: int = 120) -> list[dict]:
+        """Open the Contacts view and scroll-collect ALL contacts (deduped)."""
+        await self.open_contacts_view()
+
+        # Find the contacts scroll container.
+        container_sel = None
+        for sel in S.CONTACTS_CONTAINER:
+            try:
+                if await self.page.locator(sel).first.count() > 0:
+                    container_sel = sel
+                    break
+            except Exception:  # noqa: BLE001
+                continue
+
+        seen: dict[str, dict] = {}
+        stagnant = 0
+        for _ in range(max_scrolls):
+            for r in await self._snapshot_contacts(container_sel):
+                key = r.get("peer_id") or r.get("title")
+                if key and key not in seen:
+                    seen[key] = r
+            before = len(seen)
+            try:
+                if container_sel is not None:
+                    await self.page.locator(container_sel).first.evaluate(
+                        "el => el.scrollBy(0, el.clientHeight)"
+                    )
+                else:
+                    await self.page.mouse.wheel(0, 800)
+            except Exception:  # noqa: BLE001
+                await self.page.mouse.wheel(0, 800)
+            await self.page.wait_for_timeout(500)
+            for r in await self._snapshot_contacts(container_sel):
+                key = r.get("peer_id") or r.get("title")
+                if key and key not in seen:
+                    seen[key] = r
+            if len(seen) == before:
+                stagnant += 1
+                if stagnant >= 5:
+                    break
+            else:
+                stagnant = 0
+        return list(seen.values())
+
     async def open_chat(self, query: str) -> None:
         search = await _first_visible(self.page, S.SEARCH_INPUT, timeout=10000)
         if search is None:
@@ -266,3 +359,41 @@ async def inspect_dom(page: Page) -> dict:
     }
     """
     return await page.evaluate(js)
+
+
+async def inspect_menu(page: Page) -> dict:
+    """Open the sidebar menu and dump its item labels + button classes.
+
+    Helps pin down the exact selector/label for the Contacts entry. Menu item
+    TEXT is the owner's own UI chrome (not personal data), safe to print.
+    """
+    from eitaa import selectors as S
+
+    out: dict = {"menu_buttons": [], "menu_items": []}
+    js_buttons = """
+    () => Array.from(document.querySelectorAll('.sidebar-header button, button.btn-menu-toggle'))
+      .slice(0, 12).map(b => b.className || null)
+    """
+    try:
+        out["menu_buttons"] = await page.evaluate(js_buttons)
+    except Exception:  # noqa: BLE001
+        pass
+
+    # Try clicking the first menu button candidate, then read menu items.
+    btn = await _first_visible(page, S.MENU_BUTTON, timeout=6000)
+    if btn is not None:
+        try:
+            await btn.click()
+            await page.wait_for_timeout(700)
+        except Exception:  # noqa: BLE001
+            pass
+    js_items = """
+    () => Array.from(document.querySelectorAll('.btn-menu-item, .btn-menu .menu-item, [class*="menu-item"]'))
+      .slice(0, 30)
+      .map(n => ({ cls: n.className || null, text: (n.textContent || '').trim().slice(0, 40) }))
+    """
+    try:
+        out["menu_items"] = await page.evaluate(js_items)
+    except Exception:  # noqa: BLE001
+        pass
+    return out

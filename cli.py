@@ -35,7 +35,7 @@ from capture.browser import open_session
 from capture.recorder import RunRecorder
 from pathlib import Path
 
-from eitaa.driver import EitaaDriver, inspect_dom
+from eitaa.driver import EitaaDriver, inspect_dom, inspect_menu
 from jobs.campaign import create_campaign, run_campaign, request_stop
 from jobs.state import JobState
 from capture import deep
@@ -158,13 +158,17 @@ def cmd_list() -> int:
     return 0
 
 
-async def cmd_inspect(account: str, open_query: str | None) -> int:
+async def cmd_inspect(account: str, open_query: str | None, menu: bool) -> int:
     config.ensure_dirs()
     async with open_session(account) as session:
         driver = EitaaDriver(session)
         await driver.open()
         logged_in = await driver.is_logged_in()
         print(f"[inspect] logged_in guess: {logged_in}")
+        if menu:
+            info = await inspect_menu(session.page)
+            print(json.dumps(info, ensure_ascii=False, indent=2))
+            return 0
         if open_query:
             try:
                 await driver.open_chat(open_query)
@@ -173,6 +177,33 @@ async def cmd_inspect(account: str, open_query: str | None) -> int:
                 print(f"[inspect] could not open chat: {exc}")
         snapshot = await inspect_dom(session.page)
         print(json.dumps(snapshot, ensure_ascii=False, indent=2))
+    return 0
+
+
+async def cmd_contacts(account: str, out: str) -> int:
+    config.ensure_dirs()
+    async with open_session(account) as session:
+        driver = EitaaDriver(session)
+        await driver.open()
+        if not await driver.is_logged_in():
+            print("[contacts] not logged in. run: python cli.py login --account", account)
+            return 2
+        print("[contacts] opening Contacts view and scrolling the full list...")
+        try:
+            contacts = await driver.collect_all_contacts()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[contacts] failed to open contacts view: {exc}")
+            print("[contacts] run this to reveal the menu, then send me the output:")
+            print(f"           DISPLAY=:99 python cli.py inspect --account {account} --menu")
+            return 1
+        out_path = Path(out)
+        lines = [c["title"] for c in contacts if c.get("title")]
+        out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        print(f"[contacts] collected {len(lines)} contacts -> {out_path}")
+        # Also save structured data (title + peer_id) alongside.
+        json_path = out_path.with_suffix(".json")
+        json_path.write_text(json.dumps(contacts, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"[contacts] structured data -> {json_path}")
     return 0
 
 
@@ -296,9 +327,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_insp = sub.add_parser("inspect", help="print structural DOM snapshot")
     p_insp.add_argument("--account", required=True)
     p_insp.add_argument("--open", default=None, help="optional chat name to open before inspecting")
+    p_insp.add_argument("--menu", action="store_true", help="open the sidebar menu and dump its items")
 
     p_chats = sub.add_parser("chats", help="list visible chat titles (choose one for --to)")
     p_chats.add_argument("--account", required=True)
+
+    p_contacts = sub.add_parser("contacts", help="collect ALL contacts from the Contacts view")
+    p_contacts.add_argument("--account", required=True)
+    p_contacts.add_argument("--out", default="contacts.txt", help="output file path")
 
     p_send = sub.add_parser("send", help="send one text message via the browser driver")
     p_send.add_argument("--account", required=True)
@@ -340,9 +376,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "list":
         return cmd_list()
     if args.command == "inspect":
-        return asyncio.run(cmd_inspect(args.account, args.open))
+        return asyncio.run(cmd_inspect(args.account, args.open, args.menu))
     if args.command == "chats":
         return asyncio.run(cmd_chats(args.account))
+    if args.command == "contacts":
+        return asyncio.run(cmd_contacts(args.account, args.out))
     if args.command == "send":
         return asyncio.run(cmd_send(args.account, args.to, args.text, args.no_verify))
     if args.command == "collect":
