@@ -38,6 +38,9 @@ from pathlib import Path
 from eitaa.driver import EitaaDriver, inspect_dom
 from jobs.campaign import create_campaign, run_campaign, request_stop
 from jobs.state import JobState
+from capture import deep
+from capture.deep import HOOKS_JS
+from capture.dossier import build_dossier
 
 
 async def cmd_login(account: str) -> int:
@@ -86,6 +89,53 @@ async def cmd_capture(account: str, op: str, manual: bool) -> int:
 def cmd_analyze(run_id: str) -> int:
     out = analyze(run_id)
     print(f"[analyze] report written: {out}")
+    print(out.read_text(encoding="utf-8"))
+    return 0
+
+
+async def cmd_probe(account: str, op: str, manual: bool) -> int:
+    """Deep protocol capture: hooks + raw frames + assets + storage + dossier."""
+    config.ensure_dirs()
+    async with open_session(account, init_script_path=HOOKS_JS) as session:
+        await session.goto()
+        rec = RunRecorder(session, f"probe_{op}")
+        await rec.start()
+        print(f"[probe] run_id={rec.run_id}")
+        print(f"[probe] marker: {rec.marker}")
+        print(f"[probe] instrumentation injected (fetch/xhr/worker/wasm/crypto).")
+        print(f"[probe] idle baseline ({config.BASELINE_SECONDS}s), do nothing...")
+        await rec.baseline()
+        await deep.pull_hooks(session.page, rec.emit_event)
+
+        async def do_action() -> None:
+            await _wait_enter(
+                "[probe] PERFORM THE ACTION NOW in the browser "
+                f"(login / open contacts / send, using marker {rec.marker} where text is needed), "
+                "then press ENTER..."
+            )
+
+        await rec.action(do_action if manual else None)
+
+        # Drain the in-page hook buffer (raw frames + crypto/worker/wasm records).
+        n = await deep.pull_hooks(session.page, rec.emit_event)
+        print(f"[probe] pulled {n} hook records")
+
+        # Download JS/WASM assets and dump storage structure.
+        urls = await deep.collect_asset_urls(session.page)
+        assets_info = await deep.download_assets(session.context, urls, rec.run_dir / "assets")
+        print(f"[probe] downloaded {assets_info['count']} assets -> {assets_info['dir']}")
+
+        storage = await deep.dump_storage(session.page)
+        (rec.run_dir / "storage.json").write_text(
+            json.dumps(storage, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        print(f"[probe] storage keys: localStorage={len(storage.get('localStorage_keys', []))} "
+              f"indexeddb={len(storage.get('indexeddb', []))}")
+
+        await rec.finish(extra_meta={"deep": True, "assets": assets_info})
+
+    out = build_dossier(rec.run_id)
+    print(f"[probe] dossier written: {out}")
     print(out.read_text(encoding="utf-8"))
     return 0
 
@@ -225,6 +275,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_an = sub.add_parser("analyze", help="build report.md for a run")
     p_an.add_argument("--run", required=True)
 
+    p_probe = sub.add_parser("probe", help="deep protocol capture (hooks + assets + dossier)")
+    p_probe.add_argument("--account", required=True)
+    p_probe.add_argument("--op", required=True, help="label, e.g. login, contacts, send_text, send_file")
+    p_probe.add_argument("--auto", action="store_true", help="no manual action (baseline+trail only)")
+
     sub.add_parser("list", help="list capture runs")
 
     p_insp = sub.add_parser("inspect", help="print structural DOM snapshot")
@@ -267,6 +322,8 @@ def main(argv: list[str] | None = None) -> int:
         return asyncio.run(cmd_capture(args.account, args.op, manual=not args.auto))
     if args.command == "analyze":
         return cmd_analyze(args.run)
+    if args.command == "probe":
+        return asyncio.run(cmd_probe(args.account, args.op, manual=not args.auto))
     if args.command == "list":
         return cmd_list()
     if args.command == "inspect":

@@ -62,6 +62,10 @@ class RunRecorder:
             self._files[name] = open(self.run_dir / f"{name}.jsonl", "a", encoding="utf-8")
         return self._files[name]
 
+    def emit_event(self, event: dict[str, Any]) -> None:
+        """Public entry so deep-capture helpers can stream events into the run."""
+        self._emit(event)
+
     def _emit(self, event: dict[str, Any]) -> None:
         event["phase"] = self._phase
         source = event.get("source", "misc")

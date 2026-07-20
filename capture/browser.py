@@ -31,10 +31,16 @@ _LAUNCH_ARGS = [
 class BrowserSession:
     """Wraps a persistent context + page + CDP session for one account."""
 
-    def __init__(self, account: str, headed: bool | None = None) -> None:
+    def __init__(
+        self,
+        account: str,
+        headed: bool | None = None,
+        init_script_path: str | Path | None = None,
+    ) -> None:
         self.account = account
         self.headed = config.HEADED if headed is None else headed
         self.profile_dir: Path = config.profile_dir(account)
+        self.init_script_path = Path(init_script_path) if init_script_path else None
         self._pw = None
         self.context: BrowserContext | None = None
         self.page: Page | None = None
@@ -50,6 +56,11 @@ class BrowserSession:
             viewport={"width": 1280, "height": 850},
             locale="fa-IR",
         )
+        # Inject instrumentation BEFORE any page script runs (deep capture).
+        if self.init_script_path and self.init_script_path.is_file():
+            await self.context.add_init_script(
+                script=self.init_script_path.read_text(encoding="utf-8")
+            )
         # Reuse an existing page if the profile restored one, else open a page.
         pages = self.context.pages
         self.page = pages[0] if pages else await self.context.new_page()
@@ -70,8 +81,12 @@ class BrowserSession:
 
 
 @asynccontextmanager
-async def open_session(account: str, headed: bool | None = None) -> AsyncIterator[BrowserSession]:
-    session = BrowserSession(account, headed=headed)
+async def open_session(
+    account: str,
+    headed: bool | None = None,
+    init_script_path: str | Path | None = None,
+) -> AsyncIterator[BrowserSession]:
+    session = BrowserSession(account, headed=headed, init_script_path=init_script_path)
     await session.start()
     try:
         yield session
