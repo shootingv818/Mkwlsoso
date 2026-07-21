@@ -38,7 +38,7 @@ from pathlib import Path
 import csv
 import re
 
-from eitaa.driver import EitaaDriver, inspect_dom, inspect_menu, inspect_add_contact
+from eitaa.driver import EitaaDriver, inspect_dom, inspect_menu, inspect_add_contact, inspect_attach
 from jobs.campaign import create_campaign, run_campaign, request_stop
 from jobs.state import JobState
 from capture import deep
@@ -161,7 +161,14 @@ def cmd_list() -> int:
     return 0
 
 
-async def cmd_inspect(account: str, open_query: str | None, menu: bool, add_contact: bool) -> int:
+async def cmd_inspect(
+    account: str,
+    open_query: str | None,
+    menu: bool,
+    add_contact: bool,
+    attach: bool = False,
+    attach_file: str | None = None,
+) -> int:
     config.ensure_dirs()
     async with open_session(account) as session:
         driver = EitaaDriver(session)
@@ -174,6 +181,11 @@ async def cmd_inspect(account: str, open_query: str | None, menu: bool, add_cont
             return 0
         if add_contact:
             info = await inspect_add_contact(driver)
+            print(json.dumps(info, ensure_ascii=False, indent=2))
+            return 0
+        if attach:
+            print("[inspect] opening Saved Messages (safe) and revealing the upload UI...")
+            info = await inspect_attach(driver, file_path=attach_file)
             print(json.dumps(info, ensure_ascii=False, indent=2))
             return 0
         if open_query:
@@ -600,6 +612,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_insp.add_argument("--menu", action="store_true", help="open the sidebar menu and dump its items")
     p_insp.add_argument("--add-contact", dest="add_contact", action="store_true",
                         help="open the add-contact popup and dump its form")
+    p_insp.add_argument("--attach", action="store_true",
+                        help="open Saved Messages and reveal the file-upload UI (safe)")
+    p_insp.add_argument("--attach-file", dest="attach_file", default=None,
+                        help="optional file to attach so the caption box + send button are revealed (not sent)")
 
     p_chats = sub.add_parser("chats", help="list visible chat titles (choose one for --to)")
     p_chats.add_argument("--account", required=True)
@@ -664,7 +680,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "list":
         return cmd_list()
     if args.command == "inspect":
-        return asyncio.run(cmd_inspect(args.account, args.open, args.menu, args.add_contact))
+        return asyncio.run(cmd_inspect(
+            args.account, args.open, args.menu, args.add_contact,
+            args.attach, args.attach_file,
+        ))
     if args.command == "chats":
         return asyncio.run(cmd_chats(args.account))
     if args.command == "contacts":

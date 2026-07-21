@@ -638,6 +638,34 @@ class EitaaDriver:
             )
         return "error", detail
 
+    async def open_saved_messages(self) -> None:
+        """Open the 'Saved Messages' chat via the sidebar menu.
+
+        Saved Messages is the owner's own storage, so it is a completely safe
+        target for testing file upload without bothering any real contact.
+        """
+        try:
+            await self.page.keyboard.press("Escape")
+            await self.page.wait_for_timeout(300)
+        except Exception:  # noqa: BLE001
+            pass
+
+        for btn_sel in S.MENU_BUTTON:
+            btn = self.page.locator(btn_sel).first
+            try:
+                if await btn.count() == 0 or not await btn.is_visible():
+                    continue
+                await btn.click()
+                await self.page.wait_for_timeout(600)
+            except Exception:  # noqa: BLE001
+                continue
+            item = await _first_visible(self.page, [".btn-menu-item.tgico-saved"], timeout=1500)
+            if item is not None:
+                await item.click()
+                await self.page.wait_for_timeout(1600)
+                return
+        raise DriverError("could not open Saved Messages (menu item tgico-saved not found)")
+
     async def open_chat(self, query: str) -> None:
         search = await _first_visible(self.page, S.SEARCH_INPUT, timeout=10000)
         if search is None:
@@ -856,4 +884,124 @@ async def inspect_add_contact(driver: "EitaaDriver") -> dict:
         await page.keyboard.press("Escape")
     except Exception:  # noqa: BLE001
         pass
+    return out
+
+
+async def inspect_attach(driver: "EitaaDriver", file_path: str | None = None) -> dict:
+    """Open Saved Messages and reveal the file-upload UI.
+
+    Dumps the composer buttons (the paperclip lives here), any hidden file
+    <input>s, and the attach dropdown menu items. If a file_path is given, it
+    also attaches that file to reveal the media-preview popup (caption box +
+    send button) and then cancels WITHOUT sending. Only structural info
+    (classes/aria/labels) is returned -- never message content.
+    """
+    from eitaa import selectors as S
+
+    page = driver.page
+    out: dict = {
+        "chat_opened": False,
+        "composer_buttons": [],
+        "file_inputs": [],
+        "attach_button_found": False,
+        "attach_menu": [],
+        "media_popup": None,
+    }
+
+    try:
+        await driver.open_saved_messages()
+        out["chat_opened"] = True
+    except DriverError as exc:
+        out["error"] = str(exc)
+        return out
+
+    # Buttons in the composer row (the paperclip/attach button is here).
+    try:
+        out["composer_buttons"] = await page.evaluate(
+            "() => Array.from(document.querySelectorAll("
+            "'.chat-input .btn-icon, .input-message-container .btn-icon, "
+            ".rows-wrapper .btn-icon, .new-message-wrapper .btn-icon'))"
+            ".slice(0,24).map(b => ({cls:b.className||null, aria:b.getAttribute('aria-label')||null}))"
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+    # Hidden file inputs (tweb keeps them in the DOM ready to receive files).
+    try:
+        out["file_inputs"] = await page.evaluate(
+            "() => Array.from(document.querySelectorAll('input[type=file]'))"
+            ".slice(0,10).map(i => ({cls:i.className||null, accept:i.accept||null, multiple:i.multiple}))"
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+    # Open the attach dropdown to reveal Photo/Video vs Document options.
+    attach = await _first_visible(
+        page,
+        [
+            ".chat-input .btn-icon.tgico-attach",
+            ".btn-icon.tgico-attach",
+            ".attach-file",
+            ".chat-input .btn-menu-toggle",
+        ],
+        timeout=2500,
+    )
+    out["attach_button_found"] = attach is not None
+    if attach is not None:
+        try:
+            await attach.click()
+            await page.wait_for_timeout(800)
+            out["attach_menu"] = await page.evaluate(
+                "() => Array.from(document.querySelectorAll('.btn-menu.active .btn-menu-item, .btn-menu-item'))"
+                ".slice(0,12).map(b => ({cls:b.className||null, text:(b.textContent||'').trim().slice(0,30)}))"
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        # Close the dropdown before touching the file input.
+        try:
+            await page.keyboard.press("Escape")
+            await page.wait_for_timeout(300)
+        except Exception:  # noqa: BLE001
+            pass
+
+    # Optionally attach a file to reveal the media-preview popup, then cancel.
+    if file_path:
+        try:
+            finput = page.locator("input[type=file]").first
+            await finput.set_input_files(file_path)
+            await page.wait_for_timeout(1800)
+            out["media_popup"] = await page.evaluate(
+                """
+                () => {
+                  const root = document.querySelector('.popup.active') || document.body;
+                  const editables = Array.from(root.querySelectorAll(
+                    '[contenteditable="true"], .input-message-input'
+                  )).slice(0,6).map(n => ({
+                    cls: n.className || null,
+                    placeholder: n.getAttribute('data-placeholder') || null
+                  }));
+                  const buttons = Array.from(root.querySelectorAll(
+                    'button, .btn-primary, .btn-send'
+                  )).slice(0,14).map(b => ({
+                    cls: b.className || null,
+                    aria: b.getAttribute('aria-label') || null,
+                    text: (b.textContent || '').trim().slice(0,20)
+                  }));
+                  return {
+                    has_active_popup: !!document.querySelector('.popup.active'),
+                    editables, buttons
+                  };
+                }
+                """
+            )
+        except Exception as exc:  # noqa: BLE001
+            out["media_popup_error"] = str(exc)
+
+    # Clean up without sending anything.
+    for _ in range(2):
+        try:
+            await page.keyboard.press("Escape")
+            await page.wait_for_timeout(300)
+        except Exception:  # noqa: BLE001
+            pass
     return out
