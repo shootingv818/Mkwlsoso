@@ -695,28 +695,38 @@ class EitaaDriver:
                     pass
             await self.page.wait_for_timeout(500)
 
-    async def _open_chat_title(self) -> str:
-        """Read the currently-open chat header title (normalized). '' if none.
+    async def _open_chat_title_matches(self, want: str) -> bool:
+        """True if any VISIBLE chat-header title equals `want` (exact match on
+        collapsed whitespace).
 
-        Used to CONFIRM that a direct peer_id navigation opened the intended
-        chat before we send anything.
+        Used to CONFIRM a direct peer_id navigation opened the intended chat
+        before sending. We scan every candidate header (not just the first)
+        because tweb can briefly keep the previous chat's header in the DOM
+        during a switch. Exact match only -- never fuzzy -- so we can never
+        confirm the wrong peer.
         """
+        want_norm = " ".join((want or "").split())
+        if not want_norm:
+            return False
         js = """
         (sels) => {
+          const out = [];
           for (const s of sels) {
-            const n = document.querySelector(s);
-            if (n && n.offsetParent !== null) {
-              const t = (n.textContent || '').replace(/\\s+/g, ' ').trim();
-              if (t) return t;
+            for (const n of document.querySelectorAll(s)) {
+              if (n && n.offsetParent !== null) {
+                const t = (n.textContent || '').replace(/\\s+/g, ' ').trim();
+                if (t) out.push(t);
+              }
             }
           }
-          return '';
+          return out;
         }
         """
         try:
-            return await self.page.evaluate(js, S.OPEN_CHAT_TITLE)
+            titles = await self.page.evaluate(js, S.OPEN_CHAT_TITLE)
         except Exception:  # noqa: BLE001
-            return ""
+            return False
+        return any(" ".join(str(t).split()) == want_norm for t in (titles or []))
 
     async def open_chat_by_peer_id(self, peer_id: str, expect_title: str = "") -> bool:
         """Open a chat DIRECTLY by its tweb peer id via hash routing, skipping
@@ -749,14 +759,17 @@ class EitaaDriver:
         if box is None:
             return False
 
-        # Confirm the header title matches the intended contact. Give the
-        # header a brief moment to update after routing.
-        for _ in range(8):
-            got = " ".join((await self._open_chat_title()).split())
-            if got and got == want:
+        # Confirm the intended contact's header is on screen. During a chat
+        # switch tweb can briefly keep the previous chat's header in the DOM,
+        # so we accept the nav if ANY visible chat-header title equals the
+        # expected one (exact match only -- never a fuzzy match, so we can
+        # never confirm the wrong peer). Short bounded poll to keep the
+        # fallback fast when the nav was ignored.
+        for _ in range(5):
+            if await self._open_chat_title_matches(want):
                 print(f"[fast] peer_id nav OK id={pid} ({time.monotonic()-_t0:.2f}s)", flush=True)
                 return True
-            await self.page.wait_for_timeout(150)
+            await self.page.wait_for_timeout(120)
         print(f"[fast] peer_id nav unconfirmed id={pid} -> search fallback", flush=True)
         return False
 
@@ -830,35 +843,44 @@ class EitaaDriver:
         if box is None:
             return SendResult(ok=False, to=query, detail="message input not found")
 
-        # Focus the composer. A real pointer click can hang for the full
-        # timeout if something is intercepting pointer events over the input;
-        # use a short bounded click and, on failure, focus it programmatically.
-        # Keyboard input still reaches a focused element even when a pointer
-        # overlay is present, so typing continues to work either way.
+        # Focus the composer and type. A direct pointer click on the
+        # contenteditable is often reported as "intercepted" by its own
+        # wrapper (.new-message-wrapper), which wastes the whole click
+        # timeout. Focus programmatically first (fast + reliable for a
+        # contenteditable), type, then CONFIRM the text actually landed. Only
+        # if it did not do we fall back to a real click and retype -- so we
+        # never "send" an empty message.
         try:
-            await box.click(timeout=6000)
+            await box.evaluate("el => el.focus()")
         except Exception:  # noqa: BLE001
-            # Report EXACTLY what element sits over the composer center so the
-            # interceptor is identified from evidence (not guessed) next run.
-            try:
-                top = await box.evaluate(
-                    """
-                    (el) => {
-                      const r = el.getBoundingClientRect();
-                      const t = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
-                      return t ? (t.tagName + '.' + (t.className || '')).slice(0, 140) : 'none';
-                    }
-                    """
-                )
-            except Exception:  # noqa: BLE001
-                top = "unknown"
-            print(f"[send] composer click intercepted by <{top}>; using focus() fallback", flush=True)
-            try:
-                await box.evaluate("el => el.focus()")
-            except Exception:  # noqa: BLE001
-                pass
+            pass
         await box.type(text, delay=5)
-        await self.page.wait_for_timeout(150)
+        await self.page.wait_for_timeout(120)
+
+        try:
+            entered = await box.evaluate("el => (el.textContent || '').trim().length > 0")
+        except Exception:  # noqa: BLE001
+            entered = True
+        if not entered:
+            # Programmatic focus did not take; do a real click on the composer
+            # wrapper (a trusted gesture that focuses the inner input) and type
+            # again. Short bounded timeouts so we never hang.
+            clicked = False
+            for sel in [".new-message-wrapper .input-message-input",
+                        ".new-message-wrapper", ".input-message-input"]:
+                try:
+                    await self.page.locator(sel).first.click(timeout=2500)
+                    clicked = True
+                    break
+                except Exception:  # noqa: BLE001
+                    continue
+            if not clicked:
+                try:
+                    await box.click(timeout=2500)
+                except Exception:  # noqa: BLE001
+                    pass
+            await box.type(text, delay=5)
+            await self.page.wait_for_timeout(120)
 
         sent = await self._click_send_or_enter(box)
         if not sent:
@@ -984,7 +1006,7 @@ class EitaaDriver:
         btn = await _first_visible(self.page, S.SEND_BUTTON, timeout=2500)
         if btn is not None:
             try:
-                await btn.click(timeout=6000)
+                await btn.click(timeout=2500)
                 return True
             except Exception:  # noqa: BLE001
                 pass
