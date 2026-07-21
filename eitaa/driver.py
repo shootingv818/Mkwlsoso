@@ -1057,103 +1057,133 @@ async def inspect_attach(driver: "EitaaDriver", file_path: str | None = None) ->
     except Exception:  # noqa: BLE001
         pass
 
-    # Open the attach dropdown to reveal Photo/Video vs Document options.
+    # Locate the paperclip and dump its exact DOM neighborhood so we can see
+    # whether it carries a child <input type=file>, a sibling menu, etc.
     attach = await _first_visible(
         page,
         [
             ".chat-input .btn-icon.tgico-attach",
             ".btn-icon.tgico-attach",
             ".attach-file",
-            ".chat-input .btn-menu-toggle",
         ],
-        timeout=2500,
+        timeout=4000,
     )
     out["attach_button_found"] = attach is not None
+    try:
+        out["attach_dom"] = await page.evaluate(
+            """
+            () => {
+              const el = document.querySelector('.attach-file, .btn-icon.tgico-attach');
+              if (!el) return null;
+              const cs = (n) => n ? (n.className || n.tagName) : null;
+              const parent = el.parentElement;
+              return {
+                self: el.className || null,
+                parent: cs(parent),
+                next_sibling: cs(el.nextElementSibling),
+                children: Array.from(el.children).slice(0,8).map(c => c.tagName + '.' + (c.className||'')),
+                parent_children: parent ? Array.from(parent.children).slice(0,12).map(c => c.tagName + '.' + (c.className||'')) : [],
+                child_file_input: !!el.querySelector('input[type=file]'),
+                parent_file_input: parent ? !!parent.querySelector('input[type=file]') : false,
+              };
+            }
+            """
+        )
+    except Exception:  # noqa: BLE001
+        out["attach_dom"] = None
+
+    # Watch for a native file chooser firing when we click the paperclip.
+    fc_state = {"fired": False}
+
+    def _on_fc(_fc):  # noqa: ANN001
+        fc_state["fired"] = True
+
+    page.on("filechooser", _on_fc)
     if attach is not None:
         try:
             await attach.click()
-            await page.wait_for_timeout(800)
-            # Enumerate every .btn-menu and mark which is actually visible, with
-            # each item's icon class. This separates the attach dropdown (photo/
-            # document) from the always-present-but-hidden sidebar menu.
-            out["menus"] = await page.evaluate(
-                """
-                () => Array.from(document.querySelectorAll('.btn-menu')).slice(0, 10).map(m => ({
-                  cls: m.className || null,
-                  visible: !!m.offsetParent || m.classList.contains('active'),
-                  items: Array.from(m.querySelectorAll('.btn-menu-item')).slice(0, 15).map(b => ({
-                    cls: b.className || null,
-                    text: (b.textContent || '').trim().slice(0, 30)
-                  }))
-                }))
-                """
-            )
+            await page.wait_for_timeout(1200)
         except Exception:  # noqa: BLE001
             pass
+    out["filechooser_fired_on_paperclip_click"] = fc_state["fired"]
+
+    # Report every popup and every TRULY-visible menu that exists now.
+    try:
+        out["popups_after_click"] = await page.evaluate(
+            """
+            () => {
+              const vis = (el) => {
+                const s = getComputedStyle(el);
+                return s.display !== 'none' && s.visibility !== 'hidden'
+                  && el.getClientRects().length > 0;
+              };
+              return Array.from(document.querySelectorAll('.popup')).slice(0,10).map(p => ({
+                cls: p.className || null, visible: vis(p)
+              }));
+            }
+            """
+        )
+        out["visible_menus_after_click"] = await page.evaluate(
+            """
+            () => {
+              const vis = (el) => {
+                const s = getComputedStyle(el);
+                return s.display !== 'none' && s.visibility !== 'hidden'
+                  && el.getClientRects().length > 0;
+              };
+              return Array.from(document.querySelectorAll('.btn-menu'))
+                .filter(vis).slice(0,6).map(m => ({
+                  cls: m.className || null,
+                  items: Array.from(m.querySelectorAll('.btn-menu-item')).slice(0,15).map(b => ({
+                    cls: b.className || null, text: (b.textContent||'').trim().slice(0,30)
+                  }))
+                }));
+            }
+            """
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+    # Strategy A test: set the file directly on the persistent hidden input and
+    # see whether a media-preview popup opens. This is the simplest reliable
+    # path if it works.
+    if file_path:
         try:
             await page.keyboard.press("Escape")
-            await page.wait_for_timeout(300)
-        except Exception:  # noqa: BLE001
-            pass
-
-    # Optionally attach a file to reveal the media-preview popup, then cancel.
-    # The real file <input> is created on demand when an attach menu item is
-    # clicked, so we intercept the file chooser instead of setting a static
-    # input. This is the reliable path for Telegram-Web-K-style apps.
-    if file_path and attach is not None:
-        try:
-            await attach.click()
-            await page.wait_for_timeout(600)
-            async with page.expect_file_chooser(timeout=6000) as fc_info:
-                out["upload_clicked_item"] = await page.evaluate(
+            await page.wait_for_timeout(400)
+            finput = page.locator("input[type=file]").first
+            if await finput.count() > 0:
+                await finput.set_input_files(file_path)
+                await page.wait_for_timeout(2200)
+                out["after_set_input_files"] = await page.evaluate(
                     """
                     () => {
-                      const menus = Array.from(document.querySelectorAll('.btn-menu'));
-                      for (const m of menus) {
-                        if (!m.offsetParent && !m.classList.contains('active')) continue;
-                        const items = Array.from(m.querySelectorAll('.btn-menu-item'));
-                        if (!items.length) continue;
-                        // Skip the sidebar menu.
-                        if (items.some(i => /tgico-(saved|settings|darkmode|admin|services)/.test(i.className))) continue;
-                        // Prefer a media/document upload item.
-                        let target = items.find(i =>
-                          /tgico-(image|images|photo|media|document|attach)/.test(i.className)
-                          || /عکس|تصویر|فایل|سند|ویدیو/.test(i.textContent || '')
-                        ) || items[0];
-                        target.click();
-                        return (target.textContent || '').trim().slice(0, 30);
+                      const vis = (el) => {
+                        const s = getComputedStyle(el);
+                        return s.display !== 'none' && s.visibility !== 'hidden'
+                          && el.getClientRects().length > 0;
+                      };
+                      const popups = Array.from(document.querySelectorAll('.popup'))
+                        .filter(vis).map(p => p.className || null);
+                      const media = document.querySelector('.popup-new-media, .popup.active');
+                      let detail = null;
+                      if (media) {
+                        detail = {
+                          cls: media.className || null,
+                          editables: Array.from(media.querySelectorAll('.input-message-input, [contenteditable="true"]'))
+                            .slice(0,6).map(n => ({cls:n.className||null, placeholder:n.getAttribute('data-placeholder')||null})),
+                          buttons: Array.from(media.querySelectorAll('button, .btn-send, .btn-primary'))
+                            .slice(0,14).map(b => ({cls:b.className||null, text:(b.textContent||'').trim().slice(0,20)}))
+                        };
                       }
-                      return null;
+                      return { visible_popups: popups, media_popup: detail };
                     }
                     """
                 )
-            chooser = await fc_info.value
-            await chooser.set_files(file_path)
-            await page.wait_for_timeout(2200)
-            out["media_popup"] = await page.evaluate(
-                """
-                () => {
-                  const p = document.querySelector('.popup-new-media, .popup.active');
-                  if (!p) return { found: false, has_active_popup: false };
-                  const editables = Array.from(p.querySelectorAll(
-                    '.input-message-input, [contenteditable="true"]'
-                  )).slice(0, 6).map(n => ({
-                    cls: n.className || null,
-                    placeholder: n.getAttribute('data-placeholder') || null
-                  }));
-                  const buttons = Array.from(p.querySelectorAll(
-                    'button, .btn-send, .btn-primary'
-                  )).slice(0, 14).map(b => ({
-                    cls: b.className || null,
-                    aria: b.getAttribute('aria-label') || null,
-                    text: (b.textContent || '').trim().slice(0, 20)
-                  }));
-                  return { found: true, popup_cls: p.className || null, editables, buttons };
-                }
-                """
-            )
         except Exception as exc:  # noqa: BLE001
-            out["media_popup_error"] = f"{type(exc).__name__}: {exc}"
+            out["after_set_input_files_error"] = f"{type(exc).__name__}: {exc}"
+
+    page.remove_listener("filechooser", _on_fc)
 
     # Clean up without sending anything.
     for _ in range(3):
