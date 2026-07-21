@@ -404,7 +404,7 @@ async def _conversation(event):
         dest_dir = config.DATA_DIR / "content"
         dest_dir.mkdir(parents=True, exist_ok=True)
         name = event.message.file.name or f"file_{event.message.id}"
-        dest = dest_dir / name
+        dest = (dest_dir / name).resolve()
         await event.message.download_media(file=str(dest))
         caption = text or ""
         store.set_file_content(str(dest), name, caption)

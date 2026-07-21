@@ -208,3 +208,17 @@ def restriction_card(account: str, reason: str, sent_before: int) -> str:
             ("Time       ", now_hms()),
         ],
     )
+
+
+def paused_card(account: str, reason: str, sent_before: int) -> str:
+    """Job auto-paused by the safety brake (not necessarily a real limit)."""
+    return card(
+        "⏸ SEND PAUSED",
+        [
+            ("Account    ", account),
+            ("Reason     ", sanitize(reason, 200)),
+            ("Sent before", sent_before),
+            ("Action     ", "auto-paused; see error cards above"),
+            ("Time       ", now_hms()),
+        ],
+    )

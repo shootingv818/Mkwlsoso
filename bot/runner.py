@@ -167,9 +167,12 @@ class JobManager:
                 await report(cards.send_started(account, kind, total, delay))
 
                 consecutive_failures = 0
+                error_cards = 0
+                where = "send_file" if content.get("kind") == "file" else "send_text"
                 for i, name in enumerate(recipients, start=1):
                     if job.stop:
                         break
+                    limited = False
                     try:
                         if content.get("kind") == "file":
                             res = await driver.send_file(
@@ -185,20 +188,30 @@ class JobManager:
                         else:
                             failed += 1
                             consecutive_failures += 1
+                            # Surface EXACTLY why the send failed (capped to
+                            # avoid spam; the brake stops us after a few anyway).
+                            if error_cards < 12:
+                                await report(cards.error_card(
+                                    where, account, target=name, code="send_failed",
+                                    detail=res.detail, trace_id=job.job_id))
+                                error_cards += 1
                             if _is_limit(res.detail):
                                 await report(cards.restriction_card(account, res.detail, sent))
-                                break
+                                limited = True
                     except Exception as exc:  # noqa: BLE001
                         failed += 1
                         consecutive_failures += 1
-                        await report(cards.error_card(
-                            "send_text/send_file", account, target=name,
-                            code=type(exc).__name__, detail=str(exc),
-                            trace_id=job.job_id,
-                        ))
+                        if error_cards < 12:
+                            await report(cards.error_card(
+                                where, account, target=name,
+                                code=type(exc).__name__, detail=str(exc),
+                                trace_id=job.job_id))
+                            error_cards += 1
+                    if limited:
+                        break
 
                     if consecutive_failures >= config.MAX_CONSECUTIVE_FAILURES:
-                        await report(cards.restriction_card(
+                        await report(cards.paused_card(
                             account, f"{consecutive_failures} consecutive failures", sent))
                         break
 
