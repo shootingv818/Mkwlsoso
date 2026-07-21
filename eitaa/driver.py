@@ -830,7 +830,33 @@ class EitaaDriver:
         if box is None:
             return SendResult(ok=False, to=query, detail="message input not found")
 
-        await box.click()
+        # Focus the composer. A real pointer click can hang for the full
+        # timeout if something is intercepting pointer events over the input;
+        # use a short bounded click and, on failure, focus it programmatically.
+        # Keyboard input still reaches a focused element even when a pointer
+        # overlay is present, so typing continues to work either way.
+        try:
+            await box.click(timeout=6000)
+        except Exception:  # noqa: BLE001
+            # Report EXACTLY what element sits over the composer center so the
+            # interceptor is identified from evidence (not guessed) next run.
+            try:
+                top = await box.evaluate(
+                    """
+                    (el) => {
+                      const r = el.getBoundingClientRect();
+                      const t = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+                      return t ? (t.tagName + '.' + (t.className || '')).slice(0, 140) : 'none';
+                    }
+                    """
+                )
+            except Exception:  # noqa: BLE001
+                top = "unknown"
+            print(f"[send] composer click intercepted by <{top}>; using focus() fallback", flush=True)
+            try:
+                await box.evaluate("el => el.focus()")
+            except Exception:  # noqa: BLE001
+                pass
         await box.type(text, delay=5)
         await self.page.wait_for_timeout(150)
 
@@ -958,7 +984,7 @@ class EitaaDriver:
         btn = await _first_visible(self.page, S.SEND_BUTTON, timeout=2500)
         if btn is not None:
             try:
-                await btn.click()
+                await btn.click(timeout=6000)
                 return True
             except Exception:  # noqa: BLE001
                 pass
