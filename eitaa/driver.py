@@ -344,10 +344,19 @@ class EitaaDriver:
             return False
 
     async def _reset_to_contacts_view(self) -> bool:
-        """Close any open popup/subview and ensure the '+' add button is back.
+        """Close any open popup and guarantee we are back on the Contacts view
+        with the correct add-contact '+' button available.
 
-        Returns True when the add-contact button is available afterwards.
+        After a successful add, Eitaa navigates into the new contact's private
+        chat and the left column can revert to the main chat list, whose corner
+        button is the "new message" composer -- NOT the add-contact button. To
+        never click the wrong button, we ALWAYS re-open the Contacts view
+        explicitly and then require the add button scoped to the active
+        contacts tab.
+
+        Returns True when the scoped add-contact button is available.
         """
+        # 1) Close any lingering popup first.
         for _ in range(5):
             if not await self._new_contact_popup_open():
                 break
@@ -374,15 +383,16 @@ class EitaaDriver:
                     pass
             await self.page.wait_for_timeout(500)
 
-        btn = await _first_visible(self.page, S.ADD_CONTACT_BUTTON, timeout=1500)
-        if btn is None:
-            # The view changed (e.g. a successful add opened the new chat). Go
-            # back to the Contacts view so the '+' button reappears.
-            try:
-                await self.open_contacts_view()
-            except DriverError:
-                return False
-            btn = await _first_visible(self.page, S.ADD_CONTACT_BUTTON, timeout=1500)
+        # 2) Always re-open the Contacts view. This guarantees the active tab
+        #    is the contacts list (never the chat list), so its corner button
+        #    is the add-contact button rather than the message composer.
+        try:
+            await self.open_contacts_view()
+        except DriverError:
+            return False
+
+        # 3) Require the add button scoped strictly to the active contacts tab.
+        btn = await _first_visible(self.page, S.CONTACTS_ADD_BUTTON, timeout=2000)
         return btn is not None
 
     async def _add_one(
@@ -395,9 +405,11 @@ class EitaaDriver:
     ) -> dict:
         result = {"phone": phone, "first": first, "last": last, "status": "error", "detail": ""}
         try:
-            btn = await _first_visible(self.page, S.ADD_CONTACT_BUTTON, timeout=6000)
+            # Scoped to the active contacts tab so we never click the chat-list
+            # "new message" composer by mistake.
+            btn = await _first_visible(self.page, S.CONTACTS_ADD_BUTTON, timeout=6000)
             if btn is None:
-                result["detail"] = "add-contact (+) button not found"
+                result["detail"] = "add-contact (+) button not found in contacts tab"
                 return result
             await btn.click()
             popup = await _first_visible(self.page, S.NEW_CONTACT_POPUP, timeout=6000)

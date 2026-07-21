@@ -116,6 +116,17 @@ ADD_CONTACT_BUTTON = [
     "button.btn-circle",
 ]
 
+# The add-contact '+' button STRICTLY scoped to the active contacts tab.
+# After a successful add, Eitaa opens the new contact's private chat and the
+# left column can revert to the main chat list, whose corner button is the
+# "new message" composer -- NOT the add-contact button. These selectors stay
+# inside the active tab so we can never resolve the composer by mistake.
+CONTACTS_ADD_BUTTON = [
+    "#column-left .tabs-tab.active .btn-circle.btn-corner",
+    ".tabs-tab.active .btn-circle.btn-corner.tgico-add",
+    ".tabs-tab.active .btn-circle.btn-corner",
+]
+
 # The "new contact" popup/dialog container.
 NEW_CONTACT_POPUP = [
     ".popup.active",
