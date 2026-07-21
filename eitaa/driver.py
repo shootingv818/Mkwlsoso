@@ -666,8 +666,41 @@ class EitaaDriver:
                 return
         raise DriverError("could not open Saved Messages (menu item tgico-saved not found)")
 
+    async def _return_to_chat_list(self) -> None:
+        """Close any open left-column subview (e.g. the Contacts view) so the
+        main chat list + its search input are on screen again."""
+        for _ in range(4):
+            if await _first_visible(self.page, S.SEARCH_INPUT, timeout=800) is not None:
+                return
+            # Prefer the subview's back/close button, else press Escape.
+            closed = False
+            for sel in [
+                "#column-left .sidebar-close-button",
+                "#column-left .btn-icon.tgico-left",
+                ".sidebar-slider .sidebar-close-button",
+            ]:
+                loc = self.page.locator(sel).first
+                try:
+                    if await loc.count() > 0 and await loc.is_visible():
+                        await loc.click()
+                        closed = True
+                        break
+                except Exception:  # noqa: BLE001
+                    continue
+            if not closed:
+                try:
+                    await self.page.keyboard.press("Escape")
+                except Exception:  # noqa: BLE001
+                    pass
+            await self.page.wait_for_timeout(500)
+
     async def open_chat(self, query: str) -> None:
-        search = await _first_visible(self.page, S.SEARCH_INPUT, timeout=10000)
+        search = await _first_visible(self.page, S.SEARCH_INPUT, timeout=6000)
+        if search is None:
+            # We may be inside a subview (e.g. the Contacts view after a
+            # collect). Return to the main chat list and retry.
+            await self._return_to_chat_list()
+            search = await _first_visible(self.page, S.SEARCH_INPUT, timeout=6000)
         if search is None:
             raise DriverError("search input not found (are you logged in?)")
         await search.click()

@@ -163,6 +163,9 @@ class JobManager:
                 if recipients is None:
                     contacts = await driver.collect_all_contacts()
                     recipients = [c.get("title", "") for c in contacts if c.get("title")]
+                    # collect_all_contacts leaves the Contacts subview open;
+                    # return to the main chat list before we start opening chats.
+                    await driver._return_to_chat_list()
                 total = len(recipients)
                 await report(cards.send_started(account, kind, total, delay))
 
