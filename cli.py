@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import sys
 
 from config import config
@@ -441,6 +442,56 @@ async def cmd_diagnose_add_contact(account: str, file: str) -> int:
         return 0 if result.get("status") == "added" and meta.get("diagnostic_complete") else 1
 
 
+async def cmd_send_file(
+    account: str,
+    to: str | None,
+    saved: bool,
+    file: str | None,
+    caption: str,
+) -> int:
+    config.ensure_dirs()
+    if not saved and not to:
+        print("[send-file] specify --to <chat> or --saved")
+        return 2
+
+    # If no file is given, auto-create a small test file so the user can test
+    # with zero setup.
+    created_temp = False
+    if not file:
+        import tempfile
+        fd, file = tempfile.mkstemp(suffix=".txt", prefix="mkwl_test_")
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write("Mkwlsoso test file\n")
+        created_temp = True
+        if not caption:
+            caption = "تست فایل از Mkwlsoso"
+        print(f"[send-file] no --file given; created a test file: {file}")
+
+    if not os.path.isfile(file):
+        print(f"[send-file] file not found: {file}")
+        return 2
+
+    try:
+        async with open_session(account) as session:
+            driver = EitaaDriver(session)
+            await driver.open()
+            if not await driver.is_logged_in():
+                print("[send-file] not logged in. run: python cli.py login --account", account)
+                return 2
+            target = "Saved Messages" if saved else to
+            print(f"[send-file] sending {file!r} to {target!r}"
+                  + (f" with caption {caption!r}" if caption else ""))
+            res = await driver.send_file(file, caption=caption, query=to, to_saved=saved)
+            print(f"[send-file] ok={res.ok} to={res.to!r} detail={res.detail}")
+            return 0 if res.ok else 1
+    finally:
+        if created_temp:
+            try:
+                os.remove(file)
+            except OSError:
+                pass
+
+
 async def cmd_stats(account: str) -> int:
     config.ensure_dirs()
     async with open_session(account) as session:
@@ -645,6 +696,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_send.add_argument("--text", required=True, help="message text to send")
     p_send.add_argument("--no-verify", action="store_true", help="skip DOM verification")
 
+    p_sfile = sub.add_parser("send-file", help="upload and send a file (optionally with a caption)")
+    p_sfile.add_argument("--account", required=True)
+    p_sfile.add_argument("--to", default=None, help="chat/contact name to send to")
+    p_sfile.add_argument("--saved", action="store_true", help="send to your own Saved Messages (safe test)")
+    p_sfile.add_argument("--file", default=None, help="file to send; if omitted a small test .txt is created")
+    p_sfile.add_argument("--caption", default="", help="optional caption text")
+
     p_col = sub.add_parser("collect", help="scroll all chats and write names to a file")
     p_col.add_argument("--account", required=True)
     p_col.add_argument("--out", default="recipients_all.txt", help="output file path")
@@ -696,6 +754,8 @@ def main(argv: list[str] | None = None) -> int:
         return asyncio.run(cmd_diagnose_add_contact(args.account, args.file))
     if args.command == "send":
         return asyncio.run(cmd_send(args.account, args.to, args.text, args.no_verify))
+    if args.command == "send-file":
+        return asyncio.run(cmd_send_file(args.account, args.to, args.saved, args.file, args.caption))
     if args.command == "collect":
         return asyncio.run(cmd_collect(args.account, args.out, args.users_only))
     if args.command == "campaign":
