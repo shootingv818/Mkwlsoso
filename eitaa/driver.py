@@ -695,6 +695,71 @@ class EitaaDriver:
                     pass
             await self.page.wait_for_timeout(500)
 
+    async def _open_chat_title(self) -> str:
+        """Read the currently-open chat header title (normalized). '' if none.
+
+        Used to CONFIRM that a direct peer_id navigation opened the intended
+        chat before we send anything.
+        """
+        js = """
+        (sels) => {
+          for (const s of sels) {
+            const n = document.querySelector(s);
+            if (n && n.offsetParent !== null) {
+              const t = (n.textContent || '').replace(/\\s+/g, ' ').trim();
+              if (t) return t;
+            }
+          }
+          return '';
+        }
+        """
+        try:
+            return await self.page.evaluate(js, S.OPEN_CHAT_TITLE)
+        except Exception:  # noqa: BLE001
+            return ""
+
+    async def open_chat_by_peer_id(self, peer_id: str, expect_title: str = "") -> bool:
+        """Open a chat DIRECTLY by its tweb peer id via hash routing, skipping
+        the per-message search entirely (the big per-message cost).
+
+        Returns True ONLY when the intended chat is confirmed open: the
+        composer is present AND the open-chat header title matches
+        `expect_title`. On any doubt it returns False so the caller falls back
+        to the proven search flow -- we must never send to the wrong peer. A
+        known expected title is required to confirm against.
+        """
+        pid = str(peer_id or "").strip()
+        want = " ".join((expect_title or "").split())
+        if not pid or not want:
+            return False
+        _t0 = time.monotonic()
+        try:
+            # tweb (Telegram Web K) uses hash-based peer routing. Set the hash
+            # to the peer id and nudge the router with a hashchange event.
+            await self.page.evaluate(
+                "(pid) => { if (location.hash !== '#' + pid) { location.hash = '#' + pid; } "
+                "window.dispatchEvent(new HashChangeEvent('hashchange')); }",
+                pid,
+            )
+        except Exception:  # noqa: BLE001
+            return False
+
+        # The chat must actually open (composer present).
+        box = await _first_visible(self.page, S.MESSAGE_INPUT, timeout=3000)
+        if box is None:
+            return False
+
+        # Confirm the header title matches the intended contact. Give the
+        # header a brief moment to update after routing.
+        for _ in range(8):
+            got = " ".join((await self._open_chat_title()).split())
+            if got and got == want:
+                print(f"[fast] peer_id nav OK id={pid} ({time.monotonic()-_t0:.2f}s)", flush=True)
+                return True
+            await self.page.wait_for_timeout(150)
+        print(f"[fast] peer_id nav unconfirmed id={pid} -> search fallback", flush=True)
+        return False
+
     async def open_chat(self, query: str) -> None:
         _t0 = time.monotonic()
         search = await _first_visible(self.page, S.SEARCH_INPUT, timeout=6000)
@@ -742,11 +807,22 @@ class EitaaDriver:
               f"results={time.monotonic()-_t1:.1f}s fallback={'Y' if used_fallback else 'N'} "
               f"total={time.monotonic()-_t0:.1f}s", flush=True)
 
-    async def send_text(self, query: str, text: str, verify: bool = True) -> SendResult:
-        try:
-            await self.open_chat(query)
-        except DriverError as exc:
-            return SendResult(ok=False, to=query, detail=str(exc))
+    async def send_text(self, query: str, text: str, verify: bool = True,
+                        peer_id: str | None = None) -> SendResult:
+        # Fast path: open the chat directly by peer_id (no search). Only used
+        # when it can be CONFIRMED the right chat opened; otherwise we fall
+        # back to the proven search flow below.
+        opened = False
+        if peer_id:
+            try:
+                opened = await self.open_chat_by_peer_id(peer_id, expect_title=query)
+            except Exception:  # noqa: BLE001
+                opened = False
+        if not opened:
+            try:
+                await self.open_chat(query)
+            except DriverError as exc:
+                return SendResult(ok=False, to=query, detail=str(exc))
 
         _ts = time.monotonic()
         box = await _first_visible(self.page, S.MESSAGE_INPUT, timeout=8000)
@@ -781,6 +857,7 @@ class EitaaDriver:
         query: str | None = None,
         to_saved: bool = False,
         as_photo: bool = False,
+        peer_id: str | None = None,
     ) -> SendResult:
         """Upload and send a file (optionally with a caption).
 
@@ -797,7 +874,16 @@ class EitaaDriver:
             if to_saved:
                 await self.open_saved_messages()
             else:
-                await self.open_chat(query or "")
+                # Fast path first (direct peer_id), else proven search flow.
+                opened = False
+                if peer_id:
+                    try:
+                        opened = await self.open_chat_by_peer_id(
+                            peer_id, expect_title=query or "")
+                    except Exception:  # noqa: BLE001
+                        opened = False
+                if not opened:
+                    await self.open_chat(query or "")
         except DriverError as exc:
             return SendResult(ok=False, to=target, detail=str(exc))
 
