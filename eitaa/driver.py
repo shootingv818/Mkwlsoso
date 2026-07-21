@@ -13,6 +13,7 @@ Design notes:
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from typing import Awaitable, Callable, Optional
 
@@ -695,23 +696,32 @@ class EitaaDriver:
             await self.page.wait_for_timeout(500)
 
     async def open_chat(self, query: str) -> None:
+        _t0 = time.monotonic()
         search = await _first_visible(self.page, S.SEARCH_INPUT, timeout=6000)
+        healed = False
         if search is None:
             # We may be inside a subview (e.g. the Contacts view after a
             # collect). Return to the main chat list and retry.
+            healed = True
             await self._return_to_chat_list()
             search = await _first_visible(self.page, S.SEARCH_INPUT, timeout=6000)
         if search is None:
             raise DriverError("search input not found (are you logged in?)")
+        t_find = time.monotonic() - _t0
+        if healed:
+            print(f"[timing] open_chat: search-input needed self-heal ({t_find:.1f}s)", flush=True)
         await search.click()
         await search.fill("")
         await search.type(query, delay=8)
         # Results load asynchronously; poll for them instead of a fixed wait.
         await self.page.wait_for_timeout(500)
 
+        _t1 = time.monotonic()
         result = await _first_visible(self.page, S.CHAT_RESULT, timeout=6000)
+        used_fallback = False
         if result is None:
             # Fallback: keyboard-select the top result.
+            used_fallback = True
             try:
                 await search.press("ArrowDown")
                 await search.press("Enter")
@@ -719,12 +729,18 @@ class EitaaDriver:
                 # If a composer appeared, treat as opened.
                 box = await _first_visible(self.page, S.MESSAGE_INPUT, timeout=2500)
                 if box is not None:
+                    print(f"[timing] open_chat({query!r}): find={t_find:.1f}s "
+                          f"results={time.monotonic()-_t1:.1f}s fallback=Y total={time.monotonic()-_t0:.1f}s",
+                          flush=True)
                     return
             except Exception:  # noqa: BLE001
                 pass
             raise DriverError(f"no chat result for query: {query!r}")
         await result.click()
         await self.page.wait_for_timeout(700)  # let the chat open
+        print(f"[timing] open_chat({query!r}): find={t_find:.1f}s "
+              f"results={time.monotonic()-_t1:.1f}s fallback={'Y' if used_fallback else 'N'} "
+              f"total={time.monotonic()-_t0:.1f}s", flush=True)
 
     async def send_text(self, query: str, text: str, verify: bool = True) -> SendResult:
         try:
@@ -732,7 +748,9 @@ class EitaaDriver:
         except DriverError as exc:
             return SendResult(ok=False, to=query, detail=str(exc))
 
+        _ts = time.monotonic()
         box = await _first_visible(self.page, S.MESSAGE_INPUT, timeout=8000)
+        t_box = time.monotonic() - _ts
         if box is None:
             return SendResult(ok=False, to=query, detail="message input not found")
 
@@ -745,6 +763,7 @@ class EitaaDriver:
             return SendResult(ok=False, to=query, detail="could not trigger send")
 
         await self.page.wait_for_timeout(500)
+        print(f"[timing] send_text: box={t_box:.1f}s send_total={time.monotonic()-_ts:.1f}s", flush=True)
 
         if verify:
             ok = await self._verify_sent(text)
