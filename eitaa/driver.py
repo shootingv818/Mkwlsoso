@@ -951,13 +951,23 @@ async def inspect_attach(driver: "EitaaDriver", file_path: str | None = None) ->
         try:
             await attach.click()
             await page.wait_for_timeout(800)
-            out["attach_menu"] = await page.evaluate(
-                "() => Array.from(document.querySelectorAll('.btn-menu.active .btn-menu-item, .btn-menu-item'))"
-                ".slice(0,12).map(b => ({cls:b.className||null, text:(b.textContent||'').trim().slice(0,30)}))"
+            # Enumerate every .btn-menu and mark which is actually visible, with
+            # each item's icon class. This separates the attach dropdown (photo/
+            # document) from the always-present-but-hidden sidebar menu.
+            out["menus"] = await page.evaluate(
+                """
+                () => Array.from(document.querySelectorAll('.btn-menu')).slice(0, 10).map(m => ({
+                  cls: m.className || null,
+                  visible: !!m.offsetParent || m.classList.contains('active'),
+                  items: Array.from(m.querySelectorAll('.btn-menu-item')).slice(0, 15).map(b => ({
+                    cls: b.className || null,
+                    text: (b.textContent || '').trim().slice(0, 30)
+                  }))
+                }))
+                """
             )
         except Exception:  # noqa: BLE001
             pass
-        # Close the dropdown before touching the file input.
         try:
             await page.keyboard.press("Escape")
             await page.wait_for_timeout(300)
@@ -965,40 +975,66 @@ async def inspect_attach(driver: "EitaaDriver", file_path: str | None = None) ->
             pass
 
     # Optionally attach a file to reveal the media-preview popup, then cancel.
-    if file_path:
+    # The real file <input> is created on demand when an attach menu item is
+    # clicked, so we intercept the file chooser instead of setting a static
+    # input. This is the reliable path for Telegram-Web-K-style apps.
+    if file_path and attach is not None:
         try:
-            finput = page.locator("input[type=file]").first
-            await finput.set_input_files(file_path)
-            await page.wait_for_timeout(1800)
+            await attach.click()
+            await page.wait_for_timeout(600)
+            async with page.expect_file_chooser(timeout=6000) as fc_info:
+                out["upload_clicked_item"] = await page.evaluate(
+                    """
+                    () => {
+                      const menus = Array.from(document.querySelectorAll('.btn-menu'));
+                      for (const m of menus) {
+                        if (!m.offsetParent && !m.classList.contains('active')) continue;
+                        const items = Array.from(m.querySelectorAll('.btn-menu-item'));
+                        if (!items.length) continue;
+                        // Skip the sidebar menu.
+                        if (items.some(i => /tgico-(saved|settings|darkmode|admin|services)/.test(i.className))) continue;
+                        // Prefer a media/document upload item.
+                        let target = items.find(i =>
+                          /tgico-(image|images|photo|media|document|attach)/.test(i.className)
+                          || /عکس|تصویر|فایل|سند|ویدیو/.test(i.textContent || '')
+                        ) || items[0];
+                        target.click();
+                        return (target.textContent || '').trim().slice(0, 30);
+                      }
+                      return null;
+                    }
+                    """
+                )
+            chooser = await fc_info.value
+            await chooser.set_files(file_path)
+            await page.wait_for_timeout(2200)
             out["media_popup"] = await page.evaluate(
                 """
                 () => {
-                  const root = document.querySelector('.popup.active') || document.body;
-                  const editables = Array.from(root.querySelectorAll(
-                    '[contenteditable="true"], .input-message-input'
-                  )).slice(0,6).map(n => ({
+                  const p = document.querySelector('.popup-new-media, .popup.active');
+                  if (!p) return { found: false, has_active_popup: false };
+                  const editables = Array.from(p.querySelectorAll(
+                    '.input-message-input, [contenteditable="true"]'
+                  )).slice(0, 6).map(n => ({
                     cls: n.className || null,
                     placeholder: n.getAttribute('data-placeholder') || null
                   }));
-                  const buttons = Array.from(root.querySelectorAll(
-                    'button, .btn-primary, .btn-send'
-                  )).slice(0,14).map(b => ({
+                  const buttons = Array.from(p.querySelectorAll(
+                    'button, .btn-send, .btn-primary'
+                  )).slice(0, 14).map(b => ({
                     cls: b.className || null,
                     aria: b.getAttribute('aria-label') || null,
-                    text: (b.textContent || '').trim().slice(0,20)
+                    text: (b.textContent || '').trim().slice(0, 20)
                   }));
-                  return {
-                    has_active_popup: !!document.querySelector('.popup.active'),
-                    editables, buttons
-                  };
+                  return { found: true, popup_cls: p.className || null, editables, buttons };
                 }
                 """
             )
         except Exception as exc:  # noqa: BLE001
-            out["media_popup_error"] = str(exc)
+            out["media_popup_error"] = f"{type(exc).__name__}: {exc}"
 
     # Clean up without sending anything.
-    for _ in range(2):
+    for _ in range(3):
         try:
             await page.keyboard.press("Escape")
             await page.wait_for_timeout(300)
