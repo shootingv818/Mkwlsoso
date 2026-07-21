@@ -64,6 +64,29 @@ class Config:
 
     JOBS_DIR: Path = Path(os.environ.get("ARTIFACTS_DIR", "./artifacts")) / "jobs"
 
+    # ---- Telegram control bot ----
+    # Telethon needs API_ID/API_HASH (from my.telegram.org) plus a BOT_TOKEN
+    # (from @BotFather). OWNER_ID is the only Telegram user allowed to use the
+    # panel. REPORT_TO is where log cards are posted (defaults to the owner).
+    API_ID: int = _get_int("API_ID", 0)
+    API_HASH: str = os.environ.get("API_HASH", "")
+    BOT_TOKEN: str = os.environ.get("BOT_TOKEN", "")
+    OWNER_ID: int = _get_int("OWNER_ID", 0)
+    REPORT_TO: int = _get_int("REPORT_TO", 0)  # 0 -> fall back to OWNER_ID
+    BOT_VERSION: str = os.environ.get("BOT_VERSION", "1.0")
+
+    # Runtime-tunable defaults (the Settings panel overrides these live and
+    # persists them under DATA_DIR/settings.json).
+    TEXT_SEND_DELAY: float = float(os.environ.get("TEXT_SEND_DELAY", "8"))
+    CONTACT_CREATE_DELAY: float = float(os.environ.get("CONTACT_CREATE_DELAY", "3"))
+    SEND_LOG_EVERY: int = _get_int("SEND_LOG_EVERY", 50)
+
+    DATA_DIR: Path = Path(os.environ.get("DATA_DIR", "./data"))
+
+    @classmethod
+    def report_to(cls) -> int:
+        return cls.REPORT_TO or cls.OWNER_ID
+
     @classmethod
     def profile_dir(cls, account: str) -> Path:
         return cls.PROFILES_DIR / account
@@ -73,6 +96,7 @@ class Config:
         cls.PROFILES_DIR.mkdir(parents=True, exist_ok=True)
         cls.ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
         cls.JOBS_DIR.mkdir(parents=True, exist_ok=True)
+        cls.DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 
 config = Config()
