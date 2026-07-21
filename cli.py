@@ -235,17 +235,21 @@ async def cmd_add_contacts(account: str, file: str, limit: int | None) -> int:
             print("[add-contacts] not logged in. run: python cli.py login --account", account)
             return 2
 
+        # Normalize first; keep invalid ones out of the browser batch.
+        valid_entries = []
         results = []
         for e in entries:
             norm = _normalize_ir_phone(e["phone"])
             if norm is None:
-                results.append({**e, "status": "invalid_number"})
+                results.append({**e, "status": "invalid_number", "detail": "bad phone format"})
                 print(f"[add-contacts] {e['phone']} -> invalid_number")
-                continue
-            r = await driver.add_contact(norm, e["first"], e["last"])
-            results.append({**e, "normalized": norm, "status": r["status"], "detail": r.get("detail", "")})
-            print(f"[add-contacts] {norm} ({e['first']} {e['last']}) -> {r['status']} {r.get('detail','')}")
-            await session.page.wait_for_timeout(1500)
+            else:
+                valid_entries.append({"phone": norm, "first": e["first"], "last": e["last"]})
+
+        batch_results = await driver.add_contacts_batch(valid_entries)
+        for r in batch_results:
+            results.append(r)
+            print(f"[add-contacts] {r['phone']} ({r['first']} {r['last']}) -> {r['status']} {r.get('detail','')}")
 
         added = sum(1 for r in results if r["status"] == "added")
         not_on = sum(1 for r in results if r["status"] == "not_on_eitaa")

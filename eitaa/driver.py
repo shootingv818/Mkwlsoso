@@ -286,34 +286,49 @@ class EitaaDriver:
 
         return {"contacts": contacts_count, "pvs": pvs}
 
-    async def _open_add_contact_popup(self) -> bool:
-        """Open the Contacts view and click the add-contact button."""
-        await self.open_contacts_view()
-        btn = await _first_visible(self.page, S.ADD_CONTACT_BUTTON, timeout=6000)
-        if btn is None:
-            return False
-        await btn.click()
-        popup = await _first_visible(self.page, S.NEW_CONTACT_POPUP, timeout=6000)
-        return popup is not None
+    async def add_contacts_batch(self, entries: list[dict]) -> list[dict]:
+        """Add many contacts. Opens the Contacts view ONCE, then uses the '+'
+        button for each contact (avoids re-navigating the menu every time).
 
-    async def add_contact(self, phone: str, first: str, last: str = "") -> dict:
-        """Add one contact via the new-contact popup. Returns a result dict.
-
-        status: added | not_on_eitaa | error
+        entries: [{"phone": "+98...", "first": "...", "last": "..."}]
+        Each result gets status: added | not_on_eitaa | invalid_number | error
         """
+        results: list[dict] = []
+        try:
+            await self.open_contacts_view()
+        except DriverError as exc:
+            for e in entries:
+                results.append({**e, "status": "error", "detail": str(exc)})
+            return results
+
+        for e in entries:
+            r = await self._add_one(e["phone"], e.get("first", ""), e.get("last", ""))
+            results.append(r)
+            # Return to the contacts view for the next '+' click.
+            try:
+                await self.page.keyboard.press("Escape")
+            except Exception:  # noqa: BLE001
+                pass
+            await self.page.wait_for_timeout(1000)
+        return results
+
+    async def _add_one(self, phone: str, first: str, last: str = "") -> dict:
         result = {"phone": phone, "first": first, "last": last, "status": "error", "detail": ""}
         try:
-            if not await self._open_add_contact_popup():
-                result["detail"] = "add-contact popup did not open (run: inspect --add-contact)"
+            btn = await _first_visible(self.page, S.ADD_CONTACT_BUTTON, timeout=6000)
+            if btn is None:
+                result["detail"] = "add-contact (+) button not found"
+                return result
+            await btn.click()
+            popup = await _first_visible(self.page, S.NEW_CONTACT_POPUP, timeout=6000)
+            if popup is None:
+                result["detail"] = "new-contact popup did not open"
                 return result
 
-            # The popup fields are .input-field-input (often contenteditable).
-            # Match each field to first/last/phone by its label text, so we do
-            # not depend on the order.
             fields = self.page.locator(".popup.active .input-field-input")
             count = await fields.count()
             if count == 0:
-                result["detail"] = "no .input-field-input in popup (run: inspect --add-contact)"
+                result["detail"] = "no fields in popup"
                 return result
 
             labels = await self.page.evaluate(
@@ -326,38 +341,29 @@ class EitaaDriver:
                 """
             )
 
-            def _match(idx_keywords):
+            def _match(keywords, avoid=None):
                 for i, lab in enumerate(labels or []):
+                    if avoid is not None and i == avoid:
+                        continue
                     low = lab.lower()
-                    if any(k in low for k in idx_keywords):
+                    if any(k in low for k in keywords):
                         return i
                 return None
 
-            first_idx = _match(["نام", "first"]) 
+            first_idx = _match(["نام (", "نام(", "first", "نام"])
             last_idx = _match(["خانوادگ", "last", "family"])
             phone_idx = _match(["تلفن", "شماره", "phone", "موبایل", "mobile"])
-
-            # Positional fallback if labels are missing: 0=first, 1=last, 2=phone.
             if first_idx is None:
-                first_idx = 0 if count >= 1 else None
-            if last_idx is None and count >= 3:
-                last_idx = 1
+                first_idx = 0
             if phone_idx is None:
-                phone_idx = count - 1  # phone is usually the last field
-
-            # Avoid collisions (first==phone when only 2 fields, etc.).
-            if phone_idx == first_idx and count >= 2:
                 phone_idx = count - 1
 
-            if first_idx is not None:
-                await fields.nth(first_idx).fill(first)
+            await self._type_into(fields.nth(first_idx), first)
             if last and last_idx is not None and last_idx != first_idx:
-                await fields.nth(last_idx).fill(last)
-            await fields.nth(phone_idx).click()
-            await fields.nth(phone_idx).fill(phone)
-            await self.page.wait_for_timeout(400)
+                await self._type_into(fields.nth(last_idx), last)
+            await self._type_into(fields.nth(phone_idx), phone)
+            await self.page.wait_for_timeout(500)
 
-            # Confirm.
             confirm = await _first_visible(self.page, S.NEW_CONTACT_CONFIRM, timeout=3000)
             if confirm is None:
                 for label in S.ADD_CONTACT_LABELS:
@@ -372,43 +378,47 @@ class EitaaDriver:
                 result["detail"] = "confirm button not found"
                 return result
             await confirm.click()
-            await self.page.wait_for_timeout(2200)
 
-            # Detect outcome.
-            status = await self._detect_add_result()
-            result["status"] = status
-            # Close popup if still open.
-            try:
-                await self.page.keyboard.press("Escape")
-            except Exception:  # noqa: BLE001
-                pass
+            result["status"], result["detail"] = await self._detect_add_result()
             return result
         except Exception as exc:  # noqa: BLE001
             result["detail"] = f"exception: {exc}"
-            try:
-                await self.page.keyboard.press("Escape")
-            except Exception:  # noqa: BLE001
-                pass
             return result
 
-    async def _detect_add_result(self) -> str:
-        """Heuristic: was the number on Eitaa (added) or not?"""
-        # Look for a toast/error indicating the number is not registered.
+    async def _type_into(self, loc: Locator, value: str) -> None:
+        """Reliable typing for contenteditable fields (clear then type)."""
+        await loc.click()
         try:
-            body_text = await self.page.evaluate(
-                "() => (document.querySelector('.toast, .error, .popup-description') || {}).textContent || ''"
+            await self.page.keyboard.press("Control+A")
+            await self.page.keyboard.press("Delete")
+        except Exception:  # noqa: BLE001
+            pass
+        await loc.type(value, delay=25)
+
+    async def _detect_add_result(self) -> tuple[str, str]:
+        """Wait for the popup to close (=added) or read the inline error."""
+        # Poll up to ~5s for the popup to disappear.
+        for _ in range(10):
+            await self.page.wait_for_timeout(500)
+            popup = await _first_visible(self.page, S.NEW_CONTACT_POPUP, timeout=300)
+            if popup is None:
+                return "added", "popup closed"
+        # Still open -> read any error / description text.
+        try:
+            txt = await self.page.evaluate(
+                "() => (document.querySelector('.popup.active .error, .popup.active .input-field-input-error, "
+                ".toast, .popup-description') || {}).textContent || ''"
             )
         except Exception:  # noqa: BLE001
-            body_text = ""
-        low = (body_text or "").lower()
-        markers = ["not on", "isn't on", "not registered", "یافت نشد", "عضو نیست", "ثبت نشده", "وجود ندارد"]
-        if any(m in low for m in markers):
-            return "not_on_eitaa"
-        # If the popup closed, treat as added.
-        popup = await _first_visible(self.page, S.NEW_CONTACT_POPUP, timeout=1500)
-        if popup is None:
-            return "added"
-        return "error"
+            txt = ""
+        low = (txt or "").lower()
+        not_on = ["not on", "isn't on", "not registered", "یافت نشد", "عضو نیست", "ثبت نشده", "وجود ندارد", "پیدا نشد"]
+        invalid = ["invalid", "نامعتبر", "معتبر نیست", "اشتباه", "صحیح نیست"]
+        if any(m in low for m in not_on):
+            return "not_on_eitaa", txt.strip()[:80]
+        if any(m in low for m in invalid):
+            return "invalid_number", txt.strip()[:80]
+        return "error", (txt.strip()[:80] or "popup stayed open")
 
     async def open_chat(self, query: str) -> None:
         search = await _first_visible(self.page, S.SEARCH_INPUT, timeout=10000)
