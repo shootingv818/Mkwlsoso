@@ -260,6 +260,83 @@ async def cmd_add_contacts(account: str, file: str, limit: int | None) -> int:
     return 0
 
 
+def _summarize_diagnostic_run(run_dir) -> None:
+    """Read the run's events.jsonl and print a self-contained diagnosis.
+
+    The user runs on a headless server and cannot open the artifact files, so
+    the key evidence (did the click reach the Add button? did a request fire?)
+    is summarized straight to stdout.
+    """
+    import urllib.parse as _url
+    from pathlib import Path as _P
+
+    events_path = _P(run_dir) / "events.jsonl"
+    if not events_path.exists():
+        print("[diagnose-add-contact] no events.jsonl to analyze")
+        return
+
+    ui, http_req, console = [], [], []
+    for line in events_path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            ev = json.loads(line)
+        except Exception:  # noqa: BLE001
+            continue
+        src = ev.get("source")
+        if src == "ui":
+            ui.append(ev)
+        elif src == "http" and ev.get("kind") == "request":
+            http_req.append(ev)
+        elif src == "console":
+            console.append(ev)
+
+    def _is_add_button(ev: dict) -> bool:
+        tgt = ev.get("target") or {}
+        action = tgt.get("action") or {}
+        cls = f"{tgt.get('cls', '')} {action.get('cls', '')}".lower()
+        return "btn-primary" in cls or "btn-color-primary" in cls
+
+    clicks = [e for e in ui if e.get("kind") == "click" and e.get("phase") in ("action", "trail")]
+    add_clicks = [e for e in clicks if _is_add_button(e)]
+    trusted_add = [e for e in add_clicks if e.get("trusted")]
+
+    submit_http = [e for e in http_req if e.get("phase") in ("action", "trail")]
+    hosts: dict[str, int] = {}
+    for e in submit_http:
+        try:
+            host = _url.urlparse(e.get("url", "")).netloc or "?"
+        except Exception:  # noqa: BLE001
+            host = "?"
+        hosts[host] = hosts.get(host, 0) + 1
+
+    print("[diagnose-add-contact] --- evidence summary ---")
+    print(f"  clicks (submit window): {len(clicks)} | on Add button: {len(add_clicks)} | trusted+on-Add: {len(trusted_add)}")
+    if add_clicks:
+        tgt = add_clicks[0].get("target", {}) or {}
+        act = tgt.get("action") or tgt
+        print(f"  add-button target: tag={act.get('tag')} cls={str(act.get('cls',''))[:70]} text={str(act.get('text',''))[:24]}")
+    print(f"  HTTP requests after click: {len(submit_http)}")
+    if hosts:
+        top = ", ".join(f"{h}({n})" for h, n in sorted(hosts.items(), key=lambda x: -x[1])[:6])
+        print(f"  request hosts: {top}")
+    print(f"  console warnings/errors: {len(console)}")
+    for e in console[:5]:
+        msg = e.get("text") or e.get("error") or ""
+        print(f"    - {e.get('kind')}: {str(msg)[:160]}")
+
+    if trusted_add and not submit_http:
+        print("  >> INTERPRETATION: a real click reached the Add button, but NO network request fired.")
+        print("     Likely cause: the contenteditable phone value never reaches Eitaa's internal model")
+        print("     (input/change events not registered) -> fix by dispatching proper input events on fill.")
+    elif trusted_add and submit_http:
+        print("  >> INTERPRETATION: click fired AND request(s) went out; popup staying open likely means")
+        print("     the server rejected it (e.g. number not registered on Eitaa) without a visible toast.")
+    elif not trusted_add:
+        print("  >> INTERPRETATION: no trusted click landed on the Add button; the click did not physically reach it.")
+
+
 async def cmd_diagnose_add_contact(account: str, file: str) -> int:
     """Submit exactly one contact and capture UI/network evidence safely."""
     config.ensure_dirs()
@@ -348,6 +425,7 @@ async def cmd_diagnose_add_contact(account: str, file: str) -> int:
             print("[diagnose-add-contact] evidence complete: pre/post submit PNG+DOM, click events, console, HTTP/WS metadata, trace")
         else:
             print(f"[diagnose-add-contact] evidence incomplete; missing={missing} ui_events={meta.get('event_counts', {}).get('ui', 0)}")
+        _summarize_diagnostic_run(run_dir)
         return 0 if result.get("status") == "added" and meta.get("diagnostic_complete") else 1
 
 
