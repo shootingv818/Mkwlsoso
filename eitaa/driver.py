@@ -396,29 +396,58 @@ class EitaaDriver:
         await loc.type(value, delay=25)
 
     async def _detect_add_result(self) -> tuple[str, str]:
-        """Wait for the popup to close (=added) or read the inline error."""
+        """Wait for the popup to close (=added) or gather rich diagnostics."""
         # Poll up to ~5s for the popup to disappear.
         for _ in range(10):
             await self.page.wait_for_timeout(500)
             popup = await _first_visible(self.page, S.NEW_CONTACT_POPUP, timeout=300)
             if popup is None:
                 return "added", "popup closed"
-        # Still open -> read any error / description text.
+
+        # Still open -> dump exactly what the popup shows so we can diagnose:
+        # the full popup text, the current field values, and whether the
+        # confirm button is disabled (=> fields not accepted).
         try:
-            txt = await self.page.evaluate(
-                "() => (document.querySelector('.popup.active .error, .popup.active .input-field-input-error, "
-                ".toast, .popup-description') || {}).textContent || ''"
+            diag = await self.page.evaluate(
+                """
+                () => {
+                  const p = document.querySelector('.popup.active');
+                  if (!p) return null;
+                  const fields = Array.from(p.querySelectorAll('.input-field-input'))
+                    .map(n => ((n.textContent || n.value || '')).trim());
+                  const btn = p.querySelector('.btn-primary, .popup-button, button');
+                  const disabled = btn ? (btn.disabled === true
+                    || (btn.className || '').includes('disable')
+                    || btn.getAttribute('disabled') !== null) : null;
+                  const err = p.querySelector('.error, .input-field-input-error, .popup-description');
+                  return {
+                    text: (p.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 220),
+                    error_text: err ? (err.textContent || '').trim().slice(0, 120) : '',
+                    confirm_disabled: disabled,
+                    field_values: fields,
+                  };
+                }
+                """
             )
-        except Exception:  # noqa: BLE001
-            txt = ""
-        low = (txt or "").lower()
+        except Exception as exc:  # noqa: BLE001
+            return "error", f"diagnostic-failed: {exc}"
+
+        if not diag:
+            return "error", "popup vanished during diagnostics"
+
+        low = ((diag.get("error_text") or "") + " " + (diag.get("text") or "")).lower()
         not_on = ["not on", "isn't on", "not registered", "یافت نشد", "عضو نیست", "ثبت نشده", "وجود ندارد", "پیدا نشد"]
-        invalid = ["invalid", "نامعتبر", "معتبر نیست", "اشتباه", "صحیح نیست"]
+        invalid = ["invalid", "نامعتبر", "معتبر نیست", "اشتباه", "صحیح نیست", "correct"]
+        detail = (
+            f"disabled={diag.get('confirm_disabled')} "
+            f"fields={diag.get('field_values')} "
+            f"err='{diag.get('error_text')}' text='{diag.get('text')}'"
+        )
         if any(m in low for m in not_on):
-            return "not_on_eitaa", txt.strip()[:80]
+            return "not_on_eitaa", detail
         if any(m in low for m in invalid):
-            return "invalid_number", txt.strip()[:80]
-        return "error", (txt.strip()[:80] or "popup stayed open")
+            return "invalid_number", detail
+        return "error", detail
 
     async def open_chat(self, query: str) -> None:
         search = await _first_visible(self.page, S.SEARCH_INPUT, timeout=10000)
