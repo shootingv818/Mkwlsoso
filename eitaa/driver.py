@@ -1165,3 +1165,106 @@ async def inspect_attach(driver: "EitaaDriver", file_path: str | None = None) ->
         except Exception:  # noqa: BLE001
             pass
     return out
+
+
+
+async def inspect_login(driver: "EitaaDriver") -> dict:
+    """Dump the Eitaa Web auth-page structure so we can build auto-login.
+
+    Run this against a FRESH (not-logged-in) profile so the phone/code form is
+    on screen. Returns only structural info (input types/classes/placeholders,
+    button classes/text, visible labels) -- never any typed value.
+    """
+    page = driver.page
+    out: dict = {
+        "logged_in": await driver.is_logged_in(),
+        "url": None,
+        "inputs": [],
+        "buttons": [],
+        "labels": [],
+        "selects": [],
+    }
+    try:
+        out["url"] = page.url
+    except Exception:  # noqa: BLE001
+        pass
+
+    try:
+        out["inputs"] = await page.evaluate(
+            """
+            () => {
+              const vis = (el) => {
+                const s = getComputedStyle(el);
+                return s.display !== 'none' && s.visibility !== 'hidden'
+                  && el.getClientRects().length > 0;
+              };
+              return Array.from(document.querySelectorAll('input, [contenteditable="true"]'))
+                .filter(vis).slice(0, 20).map(i => ({
+                  tag: i.tagName,
+                  type: i.getAttribute('type'),
+                  cls: i.className || null,
+                  id: i.id || null,
+                  name: i.getAttribute('name'),
+                  inputmode: i.getAttribute('inputmode'),
+                  placeholder: i.getAttribute('placeholder')
+                    || i.getAttribute('data-placeholder') || null,
+                  autocomplete: i.getAttribute('autocomplete'),
+                }));
+            }
+            """
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+    try:
+        out["buttons"] = await page.evaluate(
+            """
+            () => {
+              const vis = (el) => {
+                const s = getComputedStyle(el);
+                return s.display !== 'none' && s.visibility !== 'hidden'
+                  && el.getClientRects().length > 0;
+              };
+              return Array.from(document.querySelectorAll('button, .btn, [role="button"]'))
+                .filter(vis).slice(0, 20).map(b => ({
+                  cls: b.className || null,
+                  text: (b.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 40),
+                  aria: b.getAttribute('aria-label') || null,
+                }));
+            }
+            """
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+    try:
+        out["selects"] = await page.evaluate(
+            "() => Array.from(document.querySelectorAll("
+            "'.input-field, .selector, [class*=country], select'))"
+            ".slice(0,12).map(n => ({cls:n.className||null, "
+            "text:(n.textContent||'').replace(/\\s+/g,' ').trim().slice(0,40)}))"
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+    try:
+        out["labels"] = await page.evaluate(
+            """
+            () => {
+              const vis = (el) => {
+                const s = getComputedStyle(el);
+                return s.display !== 'none' && s.visibility !== 'hidden'
+                  && el.getClientRects().length > 0;
+              };
+              return Array.from(document.querySelectorAll(
+                'label, h1, h2, h3, h4, .subtitle, .auth-title, [class*=title]'
+              )).filter(vis).slice(0, 15).map(n =>
+                (n.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 60)
+              ).filter(Boolean);
+            }
+            """
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+    return out

@@ -39,7 +39,9 @@ from pathlib import Path
 import csv
 import re
 
-from eitaa.driver import EitaaDriver, inspect_dom, inspect_menu, inspect_add_contact, inspect_attach
+from eitaa.driver import (
+    EitaaDriver, inspect_dom, inspect_menu, inspect_add_contact, inspect_attach, inspect_login,
+)
 from jobs.campaign import create_campaign, run_campaign, request_stop
 from jobs.state import JobState
 from capture import deep
@@ -169,6 +171,7 @@ async def cmd_inspect(
     add_contact: bool,
     attach: bool = False,
     attach_file: str | None = None,
+    login: bool = False,
 ) -> int:
     config.ensure_dirs()
     async with open_session(account) as session:
@@ -187,6 +190,11 @@ async def cmd_inspect(
         if attach:
             print("[inspect] opening Saved Messages (safe) and revealing the upload UI...")
             info = await inspect_attach(driver, file_path=attach_file)
+            print(json.dumps(info, ensure_ascii=False, indent=2))
+            return 0
+        if login:
+            print("[inspect] dumping the auth/login page structure...")
+            info = await inspect_login(driver)
             print(json.dumps(info, ensure_ascii=False, indent=2))
             return 0
         if open_query:
@@ -670,6 +678,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="open Saved Messages and reveal the file-upload UI (safe)")
     p_insp.add_argument("--attach-file", dest="attach_file", default=None,
                         help="optional file to attach so the caption box + send button are revealed (not sent)")
+    p_insp.add_argument("--login", action="store_true",
+                        help="dump the auth/login page structure (run on a FRESH, not-logged-in profile)")
 
     p_chats = sub.add_parser("chats", help="list visible chat titles (choose one for --to)")
     p_chats.add_argument("--account", required=True)
@@ -745,7 +755,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "inspect":
         return asyncio.run(cmd_inspect(
             args.account, args.open, args.menu, args.add_contact,
-            args.attach, args.attach_file,
+            args.attach, args.attach_file, args.login,
         ))
     if args.command == "chats":
         return asyncio.run(cmd_chats(args.account))
