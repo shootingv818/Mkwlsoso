@@ -620,6 +620,22 @@ class EitaaDriver:
             return "not_on_eitaa", detail
         if any(m in low for m in invalid):
             return "invalid_number", detail
+
+        # No visible error and no toast, the Add button was enabled, and the
+        # phone field was populated. The diagnostic run proved that in this
+        # state the click reaches the button and a request goes to the server,
+        # yet the contact is not created. In practice this is Eitaa silently
+        # declining an unregistered number (same as Telegram: you cannot add a
+        # number that is not registered). Classify it honestly instead of a
+        # generic error.
+        field_shapes = diag.get("field_shapes") or []
+        phone_filled = any((f.get("chars") or 0) >= 8 for f in field_shapes)
+        if not diag.get("confirm_disabled") and phone_filled:
+            return (
+                "not_on_eitaa",
+                "silently rejected: no error/toast, button enabled, number entered -> "
+                "number is not registered on Eitaa | " + detail,
+            )
         return "error", detail
 
     async def open_chat(self, query: str) -> None:
