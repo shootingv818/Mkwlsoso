@@ -35,6 +35,10 @@ def is_owner(event) -> bool:
 # conversation state: owner_id -> {"step": str, ...}
 pending: dict = {}
 
+# The session file lives under DATA_DIR; make sure it exists BEFORE Telethon
+# opens its SQLite session (the client is created at import time).
+config.DATA_DIR.mkdir(parents=True, exist_ok=True)
+
 bot = TelegramClient(
     str(config.DATA_DIR / "panel_bot"), config.API_ID, config.API_HASH
 )
