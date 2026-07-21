@@ -156,12 +156,24 @@ async def show_home(event, edit=False):
         await event.respond(home_text(), buttons=kb_home())
 
 
-@bot.on(events.NewMessage(pattern=r"^/start$"))
+@bot.on(events.NewMessage(pattern=r"^/start"))
 async def _start(event):
+    print(f"[bot] /start received: sender_id={event.sender_id} owner={config.OWNER_ID}", flush=True)
     if not is_owner(event):
+        print("[bot] /start ignored: sender is not the configured OWNER_ID", flush=True)
+        try:
+            await event.respond("This panel is private.")
+        except Exception:  # noqa: BLE001
+            pass
         return
     pending.pop(event.sender_id, None)
-    await show_home(event)
+    try:
+        await show_home(event)
+        print("[bot] home panel sent", flush=True)
+    except Exception as exc:  # noqa: BLE001
+        import traceback
+        traceback.print_exc()
+        print(f"[bot] failed to send home panel: {exc}", flush=True)
 
 
 @bot.on(events.CallbackQuery)
@@ -380,6 +392,7 @@ async def _start_contacts(event_sender_id, prefix: str, count: int):
 
 @bot.on(events.NewMessage)
 async def _conversation(event):
+    print(f"[bot] message: sender_id={event.sender_id} text={ (event.raw_text or '')[:40]!r} file={bool(event.message.file)}", flush=True)
     if not is_owner(event):
         return
     text = (event.raw_text or "").strip()
@@ -478,9 +491,15 @@ def main() -> None:
             "Missing required bot config: " + ", ".join(missing)
             + ". Set them in .env (see .env.example)."
         )
-    print("[bot] starting Telegram panel...")
+    print("[bot] starting Telegram panel...", flush=True)
     bot.start(bot_token=config.BOT_TOKEN)
-    print("[bot] online. Send /start to the bot as the owner.")
+    try:
+        me = bot.loop.run_until_complete(bot.get_me())
+        print(f"[bot] logged in as @{me.username} (id={me.id})", flush=True)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[bot] warning: could not fetch bot identity: {exc}", flush=True)
+    print(f"[bot] online. OWNER_ID={config.OWNER_ID} REPORT_TO={config.report_to()}", flush=True)
+    print("[bot] Send /start to the bot as the owner. Watching for messages...", flush=True)
     bot.run_until_disconnected()
 
 
