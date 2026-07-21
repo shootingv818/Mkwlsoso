@@ -11,6 +11,7 @@ reconnects and duplicate frames can be told apart during analysis.
 
 from __future__ import annotations
 
+import hashlib
 import itertools
 import time
 from typing import Any, Callable
@@ -21,9 +22,15 @@ from capture import redactor
 
 
 class WebSocketRecorder:
-    def __init__(self, emit: Callable[[dict[str, Any]], None], seq: Callable[[], int]) -> None:
+    def __init__(
+        self,
+        emit: Callable[[dict[str, Any]], None],
+        seq: Callable[[], int],
+        metadata_only: bool = False,
+    ) -> None:
         self._emit = emit
         self._seq = seq
+        self._metadata_only = metadata_only
         self._page: Page | None = None
         self._conn_ids = itertools.count(1)
 
@@ -46,6 +53,18 @@ class WebSocketRecorder:
             "ts": time.time(),
         }
 
+    def _body_summary(self, payload: bytes | str, content_type: str) -> dict[str, Any]:
+        if not self._metadata_only:
+            return redactor.summarize_body(payload, content_type)
+        data = payload if isinstance(payload, bytes) else payload.encode("utf-8", "replace")
+        return {
+            "present": True,
+            "kind": "metadata-only",
+            "size": len(data),
+            "sha256_16": hashlib.sha256(data).hexdigest()[:16],
+            "content_type": content_type,
+        }
+
     def _on_ws(self, ws: WebSocket) -> None:
         conn_id = next(self._conn_ids)
         frame_seq = itertools.count(1)
@@ -62,7 +81,7 @@ class WebSocketRecorder:
                     "direction": direction,
                     "frame_seq": next(frame_seq),
                     "opcode": "binary" if is_bytes else "text",
-                    "body": redactor.summarize_body(
+                    "body": self._body_summary(
                         bytes(payload) if is_bytes else payload,
                         "application/octet-stream" if is_bytes else "text/plain",
                     ),

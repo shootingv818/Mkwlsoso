@@ -260,6 +260,97 @@ async def cmd_add_contacts(account: str, file: str, limit: int | None) -> int:
     return 0
 
 
+async def cmd_diagnose_add_contact(account: str, file: str) -> int:
+    """Submit exactly one contact and capture UI/network evidence safely."""
+    config.ensure_dirs()
+    entries = _read_contacts_csv(file)
+    if not entries:
+        print("[diagnose-add-contact] no rows in", file)
+        return 2
+
+    entry = entries[0]
+    phone = _normalize_ir_phone(entry["phone"])
+    if phone is None:
+        print("[diagnose-add-contact] first row has an invalid Iranian mobile number")
+        return 2
+
+    async with open_session(account) as session:
+        driver = EitaaDriver(session)
+        await driver.open()
+        if not await driver.is_logged_in():
+            print("[diagnose-add-contact] not logged in. run: python cli.py login --account", account)
+            return 2
+
+        try:
+            await driver.open_contacts_view()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[diagnose-add-contact] could not open Contacts: {exc}")
+            return 1
+
+        rec = RunRecorder(
+            session,
+            "diagnose_add_contact",
+            ui_diagnostics=True,
+            sensitive_literals=[
+                entry.get("phone", ""), phone,
+                entry.get("first", ""), entry.get("last", ""),
+            ],
+        )
+        try:
+            await rec.start()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[diagnose-add-contact] instrumentation failed before submit: {type(exc).__name__}")
+            return 1
+        print(f"[diagnose-add-contact] run_id={rec.run_id}")
+        print("[diagnose-add-contact] submitting only the first CSV row; sensitive values are not logged")
+        await rec.baseline(seconds=1)
+
+        holder: dict[str, dict] = {}
+
+        async def submit_one() -> None:
+            holder["result"] = await driver._add_one(
+                phone,
+                entry.get("first", ""),
+                entry.get("last", ""),
+                before_submit=lambda: rec.checkpoint("pre_submit"),
+                after_submit=lambda: rec.checkpoint("post_submit"),
+            )
+
+        try:
+            await rec.action(submit_one)
+        except Exception as exc:  # noqa: BLE001
+            holder["result"] = {
+                "status": "error",
+                "detail": f"diagnostic action failed: {type(exc).__name__}: {exc}",
+            }
+        finally:
+            result = holder.get(
+                "result",
+                {"status": "error", "detail": "submission ended before a result was returned"},
+            )
+            run_dir = await rec.finish(
+                extra_meta={
+                    "ui_diagnostics": True,
+                    "result_status": result.get("status", "error"),
+                }
+            )
+
+        detail = rec.scrub_sensitive(str(result.get("detail", "")))
+        meta = json.loads((run_dir / "meta.json").read_text(encoding="utf-8"))
+        artifacts = meta.get("diagnostic_artifacts", {})
+        missing = [name for name, present in artifacts.items() if not present]
+        print(
+            f"[diagnose-add-contact] result={result.get('status')} "
+            f"detail={detail}"
+        )
+        print(f"[diagnose-add-contact] artifacts: {run_dir}")
+        if meta.get("diagnostic_complete"):
+            print("[diagnose-add-contact] evidence complete: pre/post submit PNG+DOM, click events, console, HTTP/WS metadata, trace")
+        else:
+            print(f"[diagnose-add-contact] evidence incomplete; missing={missing} ui_events={meta.get('event_counts', {}).get('ui', 0)}")
+        return 0 if result.get("status") == "added" and meta.get("diagnostic_complete") else 1
+
+
 async def cmd_stats(account: str) -> int:
     config.ensure_dirs()
     async with open_session(account) as session:
@@ -447,6 +538,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_addc.add_argument("--file", required=True, help="CSV file: phone,first_name,last_name")
     p_addc.add_argument("--limit", type=int, default=None, help="only process the first N rows (safe test)")
 
+    p_diag_add = sub.add_parser(
+        "diagnose-add-contact",
+        help="submit the first CSV row and capture exact UI/network diagnostics",
+    )
+    p_diag_add.add_argument("--account", required=True)
+    p_diag_add.add_argument("--file", required=True, help="CSV file; only the first row is used")
+
     p_send = sub.add_parser("send", help="send one text message via the browser driver")
     p_send.add_argument("--account", required=True)
     p_send.add_argument("--to", required=True, help="chat/contact name or username to open")
@@ -497,6 +595,8 @@ def main(argv: list[str] | None = None) -> int:
         return asyncio.run(cmd_stats(args.account))
     if args.command == "add-contacts":
         return asyncio.run(cmd_add_contacts(args.account, args.file, args.limit))
+    if args.command == "diagnose-add-contact":
+        return asyncio.run(cmd_diagnose_add_contact(args.account, args.file))
     if args.command == "send":
         return asyncio.run(cmd_send(args.account, args.to, args.text, args.no_verify))
     if args.command == "collect":

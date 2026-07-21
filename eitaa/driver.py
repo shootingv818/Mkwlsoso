@@ -14,7 +14,7 @@ Design notes:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Awaitable, Callable, Optional
 
 from playwright.async_api import Locator, Page, TimeoutError as PWTimeout
 
@@ -312,7 +312,14 @@ class EitaaDriver:
             await self.page.wait_for_timeout(1000)
         return results
 
-    async def _add_one(self, phone: str, first: str, last: str = "") -> dict:
+    async def _add_one(
+        self,
+        phone: str,
+        first: str,
+        last: str = "",
+        before_submit: Callable[[], Awaitable[None]] | None = None,
+        after_submit: Callable[[], Awaitable[None]] | None = None,
+    ) -> dict:
         result = {"phone": phone, "first": first, "last": last, "status": "error", "detail": ""}
         try:
             btn = await _first_visible(self.page, S.ADD_CONTACT_BUTTON, timeout=6000)
@@ -364,45 +371,52 @@ class EitaaDriver:
             await self._type_into(fields.nth(phone_idx), phone)
             await self.page.wait_for_timeout(500)
 
-            confirm = await _first_visible(self.page, S.NEW_CONTACT_CONFIRM, timeout=3000)
-            if confirm is None:
-                for label in S.ADD_CONTACT_LABELS:
-                    try:
-                        c = self.page.get_by_text(label, exact=False).first
-                        if await c.is_visible():
-                            confirm = c
-                            break
-                    except Exception:  # noqa: BLE001
-                        continue
+            # The live form has exactly one observed Add action. Do not fall
+            # back to generic popup buttons: closing a dialog could otherwise
+            # be misreported as a successful contact creation.
+            confirm = await _first_visible(
+                self.page,
+                [".popup.active .btn-primary.btn-color-primary"],
+                timeout=3000,
+            )
             if confirm is None:
                 result["detail"] = "confirm button not found"
+                return result
+            confirm_text = " ".join((await confirm.inner_text()).split())
+            allowed_labels = {" ".join(label.split()) for label in S.ADD_CONTACT_LABELS}
+            if confirm_text not in allowed_labels:
+                result["detail"] = (
+                    "primary popup button label was not recognized; submit aborted"
+                )
                 return result
 
             # Wait until the confirm button is actually enabled (Eitaa validates
             # the phone asynchronously and enables the button a beat later).
+            disabled = False
             for _ in range(15):
                 try:
-                    dis = await confirm.evaluate(
+                    disabled = await confirm.evaluate(
                         "b => b.disabled === true || (b.className || '').includes('disable') "
                         "|| b.getAttribute('disabled') !== null"
                     )
                 except Exception:  # noqa: BLE001
-                    dis = False
-                if not dis:
+                    disabled = False
+                if not disabled:
                     break
                 await self.page.wait_for_timeout(400)
+            if disabled:
+                result["detail"] = "confirm button stayed disabled after validation wait"
+                return result
 
-            await confirm.click()
-            await self.page.wait_for_timeout(1200)
+            await confirm.scroll_into_view_if_needed()
+            if before_submit is not None:
+                await before_submit()
+            await confirm.click(timeout=5000)
+            if after_submit is not None:
+                await after_submit()
 
-            # If the popup is still open, try pressing Enter as a fallback.
-            still = await _first_visible(self.page, S.NEW_CONTACT_POPUP, timeout=500)
-            if still is not None:
-                try:
-                    await self.page.keyboard.press("Enter")
-                except Exception:  # noqa: BLE001
-                    pass
-
+            # Deliberately do not press Enter if the popup remains open. Enter
+            # can target the wrong SPA action and previously left Eitaa blank.
             result["status"], result["detail"] = await self._detect_add_result()
             return result
         except Exception as exc:  # noqa: BLE001
@@ -428,9 +442,8 @@ class EitaaDriver:
             if popup is None:
                 return "added", "popup closed"
 
-        # Still open -> dump exactly what the popup shows so we can diagnose:
-        # the full popup text, the current field values, and whether the
-        # confirm button is disabled (=> fields not accepted).
+        # Still open: collect exact UI error/status text, but never persist the
+        # names or phone typed into contenteditable fields.
         try:
             diag = await self.page.evaluate(
                 """
@@ -438,17 +451,24 @@ class EitaaDriver:
                   const p = document.querySelector('.popup.active');
                   if (!p) return null;
                   const fields = Array.from(p.querySelectorAll('.input-field-input'))
-                    .map(n => ((n.textContent || n.value || '')).trim());
-                  const btn = p.querySelector('.btn-primary, .popup-button, button');
+                    .map(n => ({
+                      tag: n.tagName,
+                      chars: ((n.textContent || n.value || '')).length,
+                      editable: n.getAttribute('contenteditable') === 'true',
+                    }));
+                  const btn = p.querySelector('.btn-primary.btn-color-primary, .btn-primary, .popup-button');
                   const disabled = btn ? (btn.disabled === true
                     || (btn.className || '').includes('disable')
                     || btn.getAttribute('disabled') !== null) : null;
-                  const err = p.querySelector('.error, .input-field-input-error, .popup-description');
+                  const messages = Array.from(p.querySelectorAll(
+                    '.error, .input-field-input-error, .popup-description, [role="alert"]'
+                  )).map(n => (n.textContent || '').replace(/\\s+/g, ' ').trim())
+                    .filter(Boolean).slice(0, 10);
                   return {
-                    text: (p.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 220),
-                    error_text: err ? (err.textContent || '').trim().slice(0, 120) : '',
+                    messages,
                     confirm_disabled: disabled,
-                    field_values: fields,
+                    confirm_class: btn ? (btn.className || '') : '',
+                    field_shapes: fields,
                   };
                 }
                 """
@@ -459,23 +479,28 @@ class EitaaDriver:
         if not diag:
             return "error", "popup vanished during diagnostics"
 
-        # Also scan document-wide toasts (the "not on Eitaa" message often
-        # appears as a toast OUTSIDE the popup).
+        # Scan document-wide toasts; these often carry the actual server result.
         try:
             toast = await self.page.evaluate(
-                "() => Array.from(document.querySelectorAll('.toast, .toast-body, [class*=toast]'))"
-                ".map(n => (n.textContent||'').trim()).join(' | ').slice(0, 200)"
+                "() => Array.from(document.querySelectorAll('.toast, .toast-body, [class*=toast], [role=alert]'))"
+                ".map(n => (n.textContent||'').replace(/\\s+/g,' ').trim())"
+                ".filter(Boolean).join(' | ').slice(0, 500)"
             )
         except Exception:  # noqa: BLE001
             toast = ""
 
-        low = ((diag.get("error_text") or "") + " " + (diag.get("text") or "") + " " + (toast or "")).lower()
+        from capture.redactor import scrub_text
+
+        messages = [scrub_text(str(m)) for m in (diag.get("messages") or [])]
+        toast = scrub_text(toast or "")
+        low = (" ".join(messages) + " " + toast).lower()
         not_on = ["not on", "isn't on", "not registered", "یافت نشد", "عضو نیست", "ثبت نشده", "وجود ندارد", "پیدا نشد"]
         invalid = ["invalid", "نامعتبر", "معتبر نیست", "اشتباه", "صحیح نیست", "correct"]
         detail = (
-            f"disabled={diag.get('confirm_disabled')} "
-            f"fields={diag.get('field_values')} "
-            f"err='{diag.get('error_text')}' toast='{toast}' text='{diag.get('text')}'"
+            f"popup_stayed_open disabled={diag.get('confirm_disabled')} "
+            f"confirm_class='{diag.get('confirm_class')}' "
+            f"fields={diag.get('field_shapes')} "
+            f"messages={messages} toast='{toast}'"
         )
         if any(m in low for m in not_on):
             return "not_on_eitaa", detail

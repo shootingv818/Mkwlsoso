@@ -9,6 +9,7 @@ number so the analyzer can order and correlate events across sources.
 
 from __future__ import annotations
 
+import hashlib
 import time
 from typing import Any, Callable
 
@@ -18,9 +19,15 @@ from capture import redactor
 
 
 class HttpRecorder:
-    def __init__(self, emit: Callable[[dict[str, Any]], None], seq: Callable[[], int]) -> None:
+    def __init__(
+        self,
+        emit: Callable[[dict[str, Any]], None],
+        seq: Callable[[], int],
+        metadata_only: bool = False,
+    ) -> None:
         self._emit = emit
         self._seq = seq
+        self._metadata_only = metadata_only
         self._page: Page | None = None
 
     def attach(self, page: Page) -> None:
@@ -46,6 +53,20 @@ class HttpRecorder:
             "ts": time.time(),
         }
 
+    def _body_summary(self, raw: bytes | str | None, content_type: str | None) -> dict[str, Any]:
+        if not self._metadata_only:
+            return redactor.summarize_body(raw, content_type)
+        if raw is None:
+            return {"present": False}
+        data = raw if isinstance(raw, bytes) else raw.encode("utf-8", "replace")
+        return {
+            "present": True,
+            "kind": "metadata-only",
+            "size": len(data),
+            "sha256_16": hashlib.sha256(data).hexdigest()[:16],
+            "content_type": content_type,
+        }
+
     def _on_request(self, request: Request) -> None:
         try:
             post = request.post_data_buffer
@@ -58,7 +79,7 @@ class HttpRecorder:
                 "url": redactor.scrub_text(request.url),
                 "resource_type": request.resource_type,
                 "headers": redactor.redact_headers(request.headers),
-                "body": redactor.summarize_body(
+                "body": self._body_summary(
                     post, request.headers.get("content-type")
                 ),
             }
