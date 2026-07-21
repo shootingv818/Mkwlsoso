@@ -164,3 +164,47 @@ ADD_CONTACT_LABELS = [
     "Add Contact",
     "Add",
 ]
+
+# --- File upload / send-file flow --------------------------------------
+# Confirmed on live Eitaa Web: the paperclip is a DIV inside
+# .new-message-wrapper. Clicking it opens a .btn-menu.active dropdown with two
+# items: tgico-image ("عکس یا ویدیو") and tgico-document ("فایل").
+ATTACH_BUTTON = [
+    ".new-message-wrapper .attach-file",
+    ".btn-icon.attach-file.tgico-attach",
+    ".btn-icon.tgico-attach",
+    ".attach-file",
+]
+
+# "فایل" -> sends the raw file (document). Accepts any file type.
+ATTACH_MENU_DOCUMENT = [
+    ".btn-menu.active .btn-menu-item.tgico-document",
+    ".btn-menu-item.tgico-document",
+]
+
+# "عکس یا ویدیو" -> sends compressed media (images/videos only).
+ATTACH_MENU_IMAGE = [
+    ".btn-menu.active .btn-menu-item.tgico-image",
+    ".btn-menu-item.tgico-image",
+]
+
+# The media-preview popup that opens after a file is chosen.
+MEDIA_PREVIEW_POPUP = [
+    ".popup-new-media",
+    ".popup.active",
+]
+
+# Caption box inside the preview popup (reuses the composer input).
+MEDIA_CAPTION_INPUT = [
+    ".popup-new-media .input-message-input",
+    ".popup.active .input-message-input",
+    ".popup.active [contenteditable='true']",
+]
+
+# Send button inside the preview popup.
+MEDIA_SEND_BUTTON = [
+    ".popup-new-media .btn-send",
+    ".popup.active .btn-send",
+    ".popup-new-media .btn-primary",
+    ".popup.active .btn-primary.btn-color-primary",
+]

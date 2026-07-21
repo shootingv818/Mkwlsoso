@@ -448,6 +448,7 @@ async def cmd_send_file(
     saved: bool,
     file: str | None,
     caption: str,
+    as_photo: bool = False,
 ) -> int:
     config.ensure_dirs()
     if not saved and not to:
@@ -481,7 +482,9 @@ async def cmd_send_file(
             target = "Saved Messages" if saved else to
             print(f"[send-file] sending {file!r} to {target!r}"
                   + (f" with caption {caption!r}" if caption else ""))
-            res = await driver.send_file(file, caption=caption, query=to, to_saved=saved)
+            res = await driver.send_file(
+                file, caption=caption, query=to, to_saved=saved, as_photo=as_photo
+            )
             print(f"[send-file] ok={res.ok} to={res.to!r} detail={res.detail}")
             return 0 if res.ok else 1
     finally:
@@ -702,6 +705,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_sfile.add_argument("--saved", action="store_true", help="send to your own Saved Messages (safe test)")
     p_sfile.add_argument("--file", default=None, help="file to send; if omitted a small test .txt is created")
     p_sfile.add_argument("--caption", default="", help="optional caption text")
+    p_sfile.add_argument("--as-photo", dest="as_photo", action="store_true",
+                        help="send as photo/video (عکس یا ویدیو) instead of a document (فایل)")
 
     p_col = sub.add_parser("collect", help="scroll all chats and write names to a file")
     p_col.add_argument("--account", required=True)
@@ -755,7 +760,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "send":
         return asyncio.run(cmd_send(args.account, args.to, args.text, args.no_verify))
     if args.command == "send-file":
-        return asyncio.run(cmd_send_file(args.account, args.to, args.saved, args.file, args.caption))
+        return asyncio.run(cmd_send_file(
+            args.account, args.to, args.saved, args.file, args.caption, args.as_photo
+        ))
     if args.command == "collect":
         return asyncio.run(cmd_collect(args.account, args.out, args.users_only))
     if args.command == "campaign":

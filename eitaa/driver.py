@@ -728,13 +728,17 @@ class EitaaDriver:
         caption: str = "",
         query: str | None = None,
         to_saved: bool = False,
+        as_photo: bool = False,
     ) -> SendResult:
         """Upload and send a file (optionally with a caption).
 
-        On this build of Eitaa Web the paperclip opens a native file chooser
-        directly, so we intercept it with Playwright. If instead a dropdown
-        appears, we fall back to clicking its upload item inside the chooser
-        context. The file is sent to `query` or to Saved Messages.
+        Confirmed flow on this Eitaa Web build: the paperclip opens a dropdown
+        (`.btn-menu.active`) with two items -- `tgico-image` ("عکس یا ویدیو")
+        and `tgico-document` ("فایل"). Clicking a menu item opens the native
+        file chooser. The click MUST be a real Playwright click (a trusted user
+        gesture); a JS `.click()` is blocked by the browser from opening the
+        file dialog. We default to the document ("فایل") item so any file type
+        is accepted; as_photo uses the image item instead.
         """
         target = "Saved Messages" if to_saved else (query or "")
         try:
@@ -745,71 +749,48 @@ class EitaaDriver:
         except DriverError as exc:
             return SendResult(ok=False, to=target, detail=str(exc))
 
-        attach = await _first_visible(
-            self.page,
-            [".chat-input .btn-icon.attach-file", ".btn-icon.tgico-attach", ".attach-file"],
-            timeout=8000,
-        )
+        # 1) Open the attach dropdown via the paperclip.
+        attach = await _first_visible(self.page, S.ATTACH_BUTTON, timeout=8000)
         if attach is None:
             return SendResult(ok=False, to=target, detail="attach (paperclip) button not found")
-
-        # Preferred path: the paperclip opens the file chooser directly.
-        chooser = None
         try:
-            async with self.page.expect_file_chooser(timeout=3500) as fc_info:
-                await attach.click()
+            await attach.click()
+        except Exception as exc:  # noqa: BLE001
+            return SendResult(ok=False, to=target, detail=f"could not open attach menu: {exc}")
+        await self.page.wait_for_timeout(600)
+
+        # 2) Pick the upload type. Document ("فایل") accepts any file; image
+        #    ("عکس یا ویدیو") is for photos/videos only.
+        item_selectors = S.ATTACH_MENU_IMAGE if as_photo else S.ATTACH_MENU_DOCUMENT
+        menu_item = await _first_visible(self.page, item_selectors, timeout=3000)
+        if menu_item is None:
+            return SendResult(
+                ok=False, to=target,
+                detail="attach menu item not found ("
+                       + ("image/عکس" if as_photo else "document/فایل") + ")",
+            )
+
+        # 3) A real click on the item raises the native file chooser.
+        try:
+            async with self.page.expect_file_chooser(timeout=6000) as fc_info:
+                await menu_item.click()
             chooser = await fc_info.value
         except PWTimeout:
-            # Fallback: a dropdown opened; click its upload item to raise the chooser.
-            try:
-                async with self.page.expect_file_chooser(timeout=4000) as fc_info:
-                    await self.page.evaluate(
-                        """
-                        () => {
-                          const menus = Array.from(document.querySelectorAll('.btn-menu'));
-                          for (const m of menus) {
-                            if (!m.offsetParent && !m.classList.contains('active')) continue;
-                            const items = Array.from(m.querySelectorAll('.btn-menu-item'));
-                            if (!items.length) continue;
-                            if (items.some(i => /tgico-(saved|settings|darkmode|admin|services)/.test(i.className))) continue;
-                            const t = items.find(i =>
-                              /tgico-(image|images|photo|media|document|attach)/.test(i.className)
-                              || /عکس|تصویر|فایل|سند|ویدیو/.test(i.textContent || '')
-                            ) || items[0];
-                            t.click();
-                            return true;
-                          }
-                          return false;
-                        }
-                        """
-                    )
-                chooser = await fc_info.value
-            except PWTimeout:
-                return SendResult(ok=False, to=target, detail="paperclip did not open a file chooser")
+            return SendResult(ok=False, to=target, detail="file chooser did not open after clicking the menu item")
 
         try:
             await chooser.set_files(file_path)
         except Exception as exc:  # noqa: BLE001
             return SendResult(ok=False, to=target, detail=f"could not set file: {exc}")
 
-        # Wait for the media-preview popup.
-        popup = await _first_visible(
-            self.page, [".popup-new-media", ".popup.active"], timeout=8000
-        )
+        # 4) Wait for the media-preview popup.
+        popup = await _first_visible(self.page, S.MEDIA_PREVIEW_POPUP, timeout=8000)
         if popup is None:
             return SendResult(ok=False, to=target, detail="media-preview popup did not open after attaching")
 
-        # Optional caption goes into the popup's message input.
+        # 5) Optional caption goes into the popup's message input.
         if caption:
-            capbox = await _first_visible(
-                self.page,
-                [
-                    ".popup-new-media .input-message-input",
-                    ".popup.active .input-message-input",
-                    ".popup.active [contenteditable='true']",
-                ],
-                timeout=4000,
-            )
+            capbox = await _first_visible(self.page, S.MEDIA_CAPTION_INPUT, timeout=4000)
             if capbox is not None:
                 try:
                     await capbox.click()
@@ -818,17 +799,8 @@ class EitaaDriver:
                 except Exception:  # noqa: BLE001
                     pass
 
-        # Send from within the preview popup.
-        send_btn = await _first_visible(
-            self.page,
-            [
-                ".popup-new-media .btn-send",
-                ".popup.active .btn-send",
-                ".popup-new-media .btn-primary",
-                ".popup.active .btn-primary.btn-color-primary",
-            ],
-            timeout=4000,
-        )
+        # 6) Send from within the preview popup.
+        send_btn = await _first_visible(self.page, S.MEDIA_SEND_BUTTON, timeout=4000)
         if send_btn is None:
             return SendResult(ok=False, to=target, detail="send button in preview popup not found")
         try:
@@ -836,10 +808,10 @@ class EitaaDriver:
         except Exception as exc:  # noqa: BLE001
             return SendResult(ok=False, to=target, detail=f"could not click send: {exc}")
 
-        await self.page.wait_for_timeout(1800)
+        await self.page.wait_for_timeout(2000)
 
-        # Verify: the preview popup should be gone and an outgoing bubble present.
-        still_open = await _first_visible(self.page, [".popup-new-media", ".popup.active"], timeout=800)
+        # 7) Verify: the preview popup should be gone.
+        still_open = await _first_visible(self.page, S.MEDIA_PREVIEW_POPUP, timeout=800)
         if still_open is not None:
             return SendResult(ok=False, to=target, detail="preview popup stayed open after clicking send")
         return SendResult(ok=True, to=target, detail="file sent (preview closed)")
