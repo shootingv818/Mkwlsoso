@@ -301,16 +301,89 @@ class EitaaDriver:
                 results.append({**e, "status": "error", "detail": str(exc)})
             return results
 
-        for e in entries:
+        for idx, e in enumerate(entries):
+            # Before every contact (except the first, where the Contacts view
+            # was just opened) make sure any leftover popup is closed and the
+            # '+' add button is actually available again. A stuck popup from a
+            # previous contact otherwise blocks the next '+' click.
+            if idx > 0:
+                ready = await self._reset_to_contacts_view()
+                if not ready:
+                    results.append({
+                        **e,
+                        "status": "error",
+                        "detail": "could not return to contacts view before next add",
+                    })
+                    continue
             r = await self._add_one(e["phone"], e.get("first", ""), e.get("last", ""))
             results.append(r)
-            # Return to the contacts view for the next '+' click.
-            try:
-                await self.page.keyboard.press("Escape")
-            except Exception:  # noqa: BLE001
-                pass
-            await self.page.wait_for_timeout(1000)
+        # Leave a clean state for whatever runs next.
+        await self._reset_to_contacts_view()
         return results
+
+    async def _new_contact_popup_open(self) -> bool:
+        return await _first_visible(self.page, S.NEW_CONTACT_POPUP, timeout=200) is not None
+
+    async def _popup_has_message(self) -> bool:
+        """True if the popup/page shows any inline error or toast text."""
+        try:
+            return await self.page.evaluate(
+                """
+                () => {
+                  const p = document.querySelector('.popup.active');
+                  const m = p && p.querySelector(
+                    '.error, .input-field-input-error, .popup-description, [role="alert"]'
+                  );
+                  const t = document.querySelector('.toast, .toast-body, [class*=toast]');
+                  return !!((m && (m.textContent || '').trim())
+                    || (t && (t.textContent || '').trim()));
+                }
+                """
+            )
+        except Exception:  # noqa: BLE001
+            return False
+
+    async def _reset_to_contacts_view(self) -> bool:
+        """Close any open popup/subview and ensure the '+' add button is back.
+
+        Returns True when the add-contact button is available afterwards.
+        """
+        for _ in range(5):
+            if not await self._new_contact_popup_open():
+                break
+            try:
+                closed = await self.page.evaluate(
+                    """
+                    () => {
+                      const p = document.querySelector('.popup.active');
+                      if (!p) return true;
+                      const b = p.querySelector(
+                        '.btn-icon.tgico-close, .popup-close, .popup-header .btn-icon'
+                      );
+                      if (b) { b.click(); return true; }
+                      return false;
+                    }
+                    """
+                )
+            except Exception:  # noqa: BLE001
+                closed = False
+            if not closed:
+                try:
+                    await self.page.keyboard.press("Escape")
+                except Exception:  # noqa: BLE001
+                    pass
+            await self.page.wait_for_timeout(500)
+
+        btn = await _first_visible(self.page, S.ADD_CONTACT_BUTTON, timeout=1500)
+        if btn is None:
+            # The view changed (e.g. a successful add opened the new chat). Go
+            # back to the Contacts view so the '+' button reappears.
+            try:
+                await self.open_contacts_view()
+            except DriverError:
+                return False
+            btn = await _first_visible(self.page, S.ADD_CONTACT_BUTTON, timeout=1500)
+        return btn is not None
 
     async def _add_one(
         self,
@@ -411,9 +484,38 @@ class EitaaDriver:
             await confirm.scroll_into_view_if_needed()
             if before_submit is not None:
                 await before_submit()
-            await confirm.click(timeout=5000)
-            if after_submit is not None:
-                await after_submit()
+
+            # Click the Add button, then confirm it actually took effect. The
+            # SPA re-renders the button as the phone validates, so a handle can
+            # go stale and its click silently no-ops. We re-query a fresh button
+            # each attempt and retry once if the popup stays open with no error.
+            for attempt in range(2):
+                fresh = await _first_visible(
+                    self.page,
+                    [".popup.active .btn-primary.btn-color-primary"],
+                    timeout=1500,
+                )
+                click_target = fresh or confirm
+                try:
+                    await click_target.click(timeout=5000)
+                except Exception:  # noqa: BLE001
+                    pass
+                if attempt == 0 and after_submit is not None:
+                    await after_submit()
+
+                closed = False
+                for _ in range(5):
+                    await self.page.wait_for_timeout(500)
+                    if not await self._new_contact_popup_open():
+                        closed = True
+                        break
+                if closed:
+                    result["status"], result["detail"] = "added", "popup closed after click"
+                    return result
+                # Still open with a real error/toast -> stop; let the detailed
+                # detector classify (not-on-eitaa, invalid, etc.).
+                if await self._popup_has_message():
+                    break
 
             # Deliberately do not press Enter if the popup remains open. Enter
             # can target the wrong SPA action and previously left Eitaa blank.
