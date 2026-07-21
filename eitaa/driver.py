@@ -377,7 +377,31 @@ class EitaaDriver:
             if confirm is None:
                 result["detail"] = "confirm button not found"
                 return result
+
+            # Wait until the confirm button is actually enabled (Eitaa validates
+            # the phone asynchronously and enables the button a beat later).
+            for _ in range(15):
+                try:
+                    dis = await confirm.evaluate(
+                        "b => b.disabled === true || (b.className || '').includes('disable') "
+                        "|| b.getAttribute('disabled') !== null"
+                    )
+                except Exception:  # noqa: BLE001
+                    dis = False
+                if not dis:
+                    break
+                await self.page.wait_for_timeout(400)
+
             await confirm.click()
+            await self.page.wait_for_timeout(1200)
+
+            # If the popup is still open, try pressing Enter as a fallback.
+            still = await _first_visible(self.page, S.NEW_CONTACT_POPUP, timeout=500)
+            if still is not None:
+                try:
+                    await self.page.keyboard.press("Enter")
+                except Exception:  # noqa: BLE001
+                    pass
 
             result["status"], result["detail"] = await self._detect_add_result()
             return result
@@ -435,13 +459,23 @@ class EitaaDriver:
         if not diag:
             return "error", "popup vanished during diagnostics"
 
-        low = ((diag.get("error_text") or "") + " " + (diag.get("text") or "")).lower()
+        # Also scan document-wide toasts (the "not on Eitaa" message often
+        # appears as a toast OUTSIDE the popup).
+        try:
+            toast = await self.page.evaluate(
+                "() => Array.from(document.querySelectorAll('.toast, .toast-body, [class*=toast]'))"
+                ".map(n => (n.textContent||'').trim()).join(' | ').slice(0, 200)"
+            )
+        except Exception:  # noqa: BLE001
+            toast = ""
+
+        low = ((diag.get("error_text") or "") + " " + (diag.get("text") or "") + " " + (toast or "")).lower()
         not_on = ["not on", "isn't on", "not registered", "یافت نشد", "عضو نیست", "ثبت نشده", "وجود ندارد", "پیدا نشد"]
         invalid = ["invalid", "نامعتبر", "معتبر نیست", "اشتباه", "صحیح نیست", "correct"]
         detail = (
             f"disabled={diag.get('confirm_disabled')} "
             f"fields={diag.get('field_values')} "
-            f"err='{diag.get('error_text')}' text='{diag.get('text')}'"
+            f"err='{diag.get('error_text')}' toast='{toast}' text='{diag.get('text')}'"
         )
         if any(m in low for m in not_on):
             return "not_on_eitaa", detail
