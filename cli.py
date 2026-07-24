@@ -52,6 +52,7 @@ from capture.bridge import (
     BRIDGE_JS, send_marker_to_saved, summarize_bridge, print_bridge_summary,
     bridge_send_test, print_bridge_send_summary,
 )
+from capture.bridge_file import run_file_test, print_file_test_summary
 
 
 async def cmd_login(account: str) -> int:
@@ -308,6 +309,45 @@ async def cmd_bridge_real(account: str, peer: str | None, text: str | None) -> i
         else:
             print(f"[bridge-real] ❌ failed: {res.get('code')}  "
                   f"(invoke_err={res.get('invoke_err')})")
+    return 0
+
+
+async def cmd_bridge_file(account: str, file_path: str | None) -> int:
+    """Investigate fast file sending (upload once + forward/reuse), safely.
+
+    Uploads a file ONCE to the owner's Saved Messages, then tests forwarding it
+    (drop_author) and re-using its uploaded document via sendMedia -- both send
+    the file WITHOUT re-uploading. If no --file is given, a tiny temp file is
+    created so it runs with zero setup.
+    """
+    import tempfile
+    config.ensure_dirs()
+
+    made_temp = False
+    if not file_path:
+        fd, file_path = tempfile.mkstemp(prefix="mkwl_filetest_", suffix=".txt")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write("MKWL file-bridge test file. Safe to delete.\n" * 20)
+        made_temp = True
+        print(f"[bridge-file] no --file given; created a tiny test file: {file_path}")
+
+    try:
+        async with open_session(account) as session:
+            await session.goto()
+            driver = EitaaDriver(session)
+            await driver.open()
+            if not await driver.is_logged_in():
+                print("[bridge-file] not logged in. run: python cli.py login --account", account)
+                return 2
+            print(f"[bridge-file] uploading once to Saved Messages, then testing forward + reuse...")
+            res = await run_file_test(driver, file_path)
+            print_file_test_summary(res)
+    finally:
+        if made_temp:
+            try:
+                os.remove(file_path)
+            except Exception:  # noqa: BLE001
+                pass
     return 0
 
 
@@ -851,6 +891,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_breal.add_argument("--peer", default=None, help="peer_id target (default: self/Saved Messages)")
     p_breal.add_argument("--text", default=None, help="message text (default: an auto test string)")
 
+    p_bfile = sub.add_parser(
+        "bridge-file",
+        help="investigate fast file send (upload once + forward/reuse) to your Saved Messages",
+    )
+    p_bfile.add_argument("--account", required=True)
+    p_bfile.add_argument("--file", default=None, help="file to test (default: an auto tiny .txt)")
+
     p_ext = sub.add_parser("extract", help="mine MTProto params (DCs/api/layer/RSA) from a run's assets")
     p_ext.add_argument("--run", required=True)
 
@@ -942,6 +989,8 @@ def main(argv: list[str] | None = None) -> int:
         return asyncio.run(cmd_bridge_send(args.account))
     if args.command == "bridge-real":
         return asyncio.run(cmd_bridge_real(args.account, args.peer, args.text))
+    if args.command == "bridge-file":
+        return asyncio.run(cmd_bridge_file(args.account, args.file))
     if args.command == "extract":
         return cmd_extract(args.run)
     if args.command == "list":
