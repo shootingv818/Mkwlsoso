@@ -130,10 +130,82 @@ def test_session_loader(tmp_path="/tmp/_mkwl_sess.json"):
     os.remove(tmp_path)
 
 
+def test_service_parser():
+    import gzip as _gz
+    from direct import service, tl
+
+    # rpc_error inside an rpc_result
+    err = tl.int_bytes(service.RPC_ERROR, signed=False) + tl.int_bytes(420) + tl.string_bytes("FLOOD_WAIT_30")
+    rr = tl.int_bytes(service.RPC_RESULT, signed=False) + tl.long_bytes(111, signed=False) + err
+    ev = service.parse_body(rr)
+    _check("rpc_result->rpc_error parsed", ev[0]["type"] == "rpc_error" and ev[0]["error_message"] == "FLOOD_WAIT_30")
+    _check("rpc_error req_msg_id", ev[0]["req_msg_id"] == 111)
+
+    # bad_server_salt
+    bss = (tl.int_bytes(service.BAD_SERVER_SALT, signed=False) + tl.long_bytes(9, signed=False)
+           + tl.int_bytes(1) + tl.int_bytes(48) + b"\x11\x22\x33\x44\x55\x66\x77\x88")
+    ev = service.parse_body(bss)
+    _check("bad_server_salt parsed", ev[0]["type"] == "bad_server_salt"
+           and ev[0]["new_server_salt"] == b"\x11\x22\x33\x44\x55\x66\x77\x88")
+
+    # rpc_result with a plain result payload
+    res = tl.int_bytes(0xDEADBEEF, signed=False) + b"\x01\x02\x03\x04"
+    rr2 = tl.int_bytes(service.RPC_RESULT, signed=False) + tl.long_bytes(222, signed=False) + res
+    ev = service.parse_body(rr2)
+    _check("rpc_result plain", ev[0]["type"] == "rpc_result" and ev[0]["result_cid"] == 0xDEADBEEF)
+
+    # gzip_packed rpc_result
+    gz = tl.int_bytes(service.GZIP_PACKED, signed=False) + tl.bytes_bytes(_gz.compress(res))
+    rr3 = tl.int_bytes(service.RPC_RESULT, signed=False) + tl.long_bytes(333, signed=False) + gz
+    ev = service.parse_body(rr3)
+    _check("rpc_result gzip inner", ev[0]["type"] == "rpc_result" and ev[0]["result_cid"] == 0xDEADBEEF)
+
+    # msg_container with a new_session + bad_salt
+    ns = (tl.int_bytes(service.NEW_SESSION_CREATED, signed=False) + tl.long_bytes(1, signed=False)
+          + b"\x00" * 8 + b"\xaa" * 8)
+    def sub(mid, body):
+        return tl.long_bytes(mid, signed=False) + tl.int_bytes(0) + tl.int_bytes(len(body), signed=False) + body
+    cont = (tl.int_bytes(service.MSG_CONTAINER, signed=False) + tl.int_bytes(2, signed=False)
+            + sub(1, ns) + sub(2, bss))
+    ev = service.parse_body(cont)
+    types = [e["type"] for e in ev]
+    _check("container unwrapped 2 msgs", types == ["new_session_created", "bad_server_salt"])
+
+
+def test_schema_wrap():
+    from direct import schema, tl
+    q = schema.help_get_config()
+    _check("help.getConfig id", tl.Reader(q).int(signed=False) == schema.HELP_GET_CONFIG)
+    wrapped = schema.wrap_initial(1025907, 135, q)
+    r = tl.Reader(wrapped)
+    _check("outer invokeWithLayer", r.int(signed=False) == schema.INVOKE_WITH_LAYER)
+    _check("layer=135", r.int() == 135)
+    _check("inner initConnection", r.int(signed=False) == schema.INIT_CONNECTION)
+    r.int(signed=False)   # flags
+    _check("api_id in initConnection", r.int() == 1025907)
+    users = schema.users_get_users_self()
+    _check("users.getUsers id", tl.Reader(users).int(signed=False) == schema.USERS_GET_USERS)
+
+
+def test_transport_url():
+    import os as _os
+    from direct import dc
+    _os.environ.pop("MKWL_DC_HOSTS", None)
+    _check("default dc url https", dc.dc_url(2).startswith("https://") and "/apiw" in dc.dc_url(2))
+    _os.environ["MKWL_DC_HOSTS"] = "2=https://majid.eitaa.com/eitaa/,4=https://vahid.eitaa.com/eitaa/"
+    _check("env override dc2", dc.dc_url(2) == "https://majid.eitaa.com/eitaa/")
+    _check("env override dc4", dc.dc_url(4) == "https://vahid.eitaa.com/eitaa/")
+    _os.environ.pop("MKWL_DC_HOSTS", None)
+    from direct.transport import HttpTransport
+    t = HttpTransport("https://majid.eitaa.com/eitaa/")
+    _check("transport parses host", t.host == "majid.eitaa.com" and t.port == 443 and t.path == "/eitaa/")
+
+
 def main():
     print("== direct client offline tests ==")
     for fn in (test_aes_nist, test_ige_roundtrip, test_crypto_helpers,
-               test_mtproto_envelope, test_tl_roundtrip, test_session_loader):
+               test_mtproto_envelope, test_tl_roundtrip, test_session_loader,
+               test_service_parser, test_schema_wrap, test_transport_url):
         print(f"[{fn.__name__}]")
         fn()
     print("\nALL DIRECT TESTS PASSED")

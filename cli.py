@@ -512,6 +512,54 @@ async def cmd_bridge_file_send(account: str, peer: str | None, file_path: str | 
     return 0
 
 
+async def cmd_direct_capture_transport(account: str) -> int:
+    """Pin Eitaa's real MTProto wire: URL per DC + transport envelope.
+
+    Installs a fetch/XHR probe, performs a controlled send to Saved Messages,
+    then reports the binary requests (URL + first bytes of request/response) so
+    the direct client's transport (direct/dc.py) can be set to the real URL and
+    we can confirm the body is raw MTProto with no extra framing.
+    """
+    import time as _time
+    from capture.bridge import send_marker_to_saved
+    config.ensure_dirs()
+    async with open_session(account) as session:
+        await session.goto()
+        driver = EitaaDriver(session)
+        await driver.open()
+        if not await driver.is_logged_in():
+            print("[tx] not logged in. run: python cli.py login --account", account)
+            return 2
+        if not await driver.inject_transport_probe():
+            print("[tx] could not inject transport probe.")
+            return 1
+        await driver.dump_transport()  # clear anything buffered pre-action
+
+        marker = f"MKWLTX{int(_time.time())}"
+        print("[tx] performing a controlled send to Saved Messages to trigger traffic...")
+        status = await send_marker_to_saved(driver, marker)
+        print(f"[tx] send status: {status}")
+        await session.page.wait_for_timeout(3500)
+
+        recs = await driver.dump_transport()
+        # De-dup by URL, keep the binary (MTProto) ones first.
+        seen_urls = {}
+        for r in recs:
+            u = r.get("url", "")
+            if u and u not in seen_urls:
+                seen_urls[u] = r
+        print("[tx] ===== TRANSPORT CAPTURE =====")
+        print(f"[tx] binary/MTProto requests captured: {len(recs)}")
+        for u, r in list(seen_urls.items())[:12]:
+            print(f"[tx] {r.get('via')} {r.get('method')} {u}")
+            print(f"[tx]    req {r.get('reqLen')}B head={ (r.get('reqHead') or '')[:48] }")
+            print(f"[tx]    res {r.get('respLen')}B head={ (r.get('respHead') or '')[:48] }")
+        print("[tx] =============================")
+        print("[tx] Send me these lines. The URL(s) pin the DC endpoint; the req head's")
+        print("[tx] first 8 bytes should be the auth_key_id (confirms raw MTProto over HTTP).")
+    return 0
+
+
 async def cmd_bridge_export_session(account: str) -> int:
     """Export the browser profile's MTProto session for the direct client.
 
@@ -614,6 +662,46 @@ async def cmd_bridge_reach(account: str, sample: int) -> int:
         print("[reach] TIP: for a real end-to-end test to any single peer, use:")
         print("[reach]   python cli.py bridge-real --account " + account + " --peer <peer_id>")
         print("[reach] ==========================================")
+    return 0
+
+
+def cmd_direct_probe(session_path: str, url: str | None) -> int:
+    """First LIVE direct-client call: load an exported session and help.getConfig.
+
+    No browser. Proves the headless client talks to Eitaa with the reused
+    auth_key. Prints the outcome or the exact error so we can adjust the
+    transport URL / schema.
+    """
+    from direct import session as dsession
+    from direct.client import DirectClient
+    from direct.errors import RpcError, DirectError
+
+    sess, report = dsession.load_export(session_path)
+    print(f"[direct] session: {sess.describe()}")
+    print(f"[direct] loader report: {report}")
+    if not sess.is_valid():
+        print(f"[direct] session invalid; missing: {report.get('missing')}")
+        return 2
+
+    client = DirectClient(sess, url=url)
+    print(f"[direct] POST target: {client.url}  (api_id={client.api_id or 'MISSING'})")
+    print("[direct] sending help.getConfig ...")
+    try:
+        ev = client.get_config()
+        if ev.get("type") == "rpc_result":
+            body = ev.get("result") or b""
+            print(f"[direct] ✅ RPC RESULT: result_cid=0x{ev.get('result_cid', 0):08x} "
+                  f"({len(body)} bytes). The direct client TALKS TO EITAA. 🎉")
+        else:
+            print(f"[direct] got: {ev}")
+    except RpcError as exc:
+        print(f"[direct] rpc_error: {exc}  (protocol reached the server — schema/params to adjust)")
+    except DirectError as exc:
+        print(f"[direct] ❌ {type(exc).__name__}: {exc}")
+        print("[direct] If this is a transport/HTTP error, run direct-capture-transport")
+        print("[direct] to pin the real URL, then pass it with --url.")
+    except Exception as exc:  # noqa: BLE001
+        print(f"[direct] ❌ unexpected {type(exc).__name__}: {exc}")
     return 0
 
 
@@ -1178,6 +1266,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_export.add_argument("--account", required=True)
 
+    p_txcap = sub.add_parser(
+        "direct-capture-transport",
+        help="pin Eitaa's real MTProto URL + transport envelope (for the direct client)",
+    )
+    p_txcap.add_argument("--account", required=True)
+
+    p_dprobe = sub.add_parser(
+        "direct-probe",
+        help="first LIVE direct-client call (help.getConfig) using an exported session",
+    )
+    p_dprobe.add_argument("--session", required=True, help="path to artifacts/sessions/<acct>_*.json")
+    p_dprobe.add_argument("--url", default=None, help="override DC URL (from direct-capture-transport)")
+
     p_fsend = sub.add_parser(
         "bridge-file-send",
         help="end-to-end test the production file path (upload once + reuse) to Saved Messages",
@@ -1290,6 +1391,10 @@ def main(argv: list[str] | None = None) -> int:
         return asyncio.run(cmd_bridge_reach(args.account, args.sample))
     if args.command == "bridge-export-session":
         return asyncio.run(cmd_bridge_export_session(args.account))
+    if args.command == "direct-capture-transport":
+        return asyncio.run(cmd_direct_capture_transport(args.account))
+    if args.command == "direct-probe":
+        return cmd_direct_probe(args.session, args.url)
     if args.command == "bridge-file-send":
         return asyncio.run(cmd_bridge_file_send(args.account, args.peer, args.file))
     if args.command == "bridge-login":

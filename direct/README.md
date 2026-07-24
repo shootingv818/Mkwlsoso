@@ -32,12 +32,25 @@ profile's MTProto session (auth_key / server_salt / DC / user id) from
 IndexedDB into a **gitignored** `artifacts/sessions/*.json`. The direct client
 reuses that authorized session — **no re-login**.
 
-## Not done yet (needs the user's authorized account, live)
-- Network transport (HTTPS POST to the Eitaa DC shards) + obfuscation/framing.
-- The layer-135 TL schema for the actual methods (messages.sendMessage, etc.).
-- Finalizing `session.load_export()` against the **real** exported key names
-  (pinned from one `bridge-export-session` run).
-- First live call: reuse the session and read config/contacts with the browser
-  CLOSED.
+## Network layer (built; verified offline, first live call pending)
+- `dc.py` — dc_id -> Eitaa shard URL (env `MKWL_DC_HOSTS` override) + api creds.
+- `transport.py` — HTTPS POST MTProto transport (stdlib only).
+- `service.py` — parses core MTProto service messages (rpc_result/rpc_error/
+  bad_server_salt/msg_container/gzip_packed/new_session_created/pong/…).
+- `schema.py` — minimal encoders (invokeWithLayer/initConnection/help.getConfig/
+  users.getUsers). Layer-sensitive ids flagged; adjusted from a real capture if off.
+- `client.py` — `DirectClient`: load session -> connect -> invoke (salt/seq
+  bookkeeping, bad_server_salt retry) -> decrypt+parse.
 
-Everything here is deterministic and was validated without a network.
+Session layout is CONFIRMED: browser localStorage holds `dc`, `user_auth`
+{dcID,id}, `dc<N>_auth_key` (512-hex), `dc<N>_server_salt` (16-hex).
+
+## How to bring it live (on the authorized server, browser can be closed for the probe)
+1. `python cli.py bridge-export-session --account <acct>`   → session JSON.
+2. `python cli.py direct-capture-transport --account <acct>` → pins the real DC URL.
+3. `python cli.py direct-probe --session artifacts/sessions/<acct>_*.json --url <captured>`
+   → first live `help.getConfig`. rpc_result = the headless client talks to Eitaa. 🎉
+
+Everything deterministic here is validated by `python -m direct.tests.test_direct`
+(AES NIST vector, IGE, MTProto envelope, TL, session loader, service parser,
+schema wrap, transport URL). Only the live round-trip needs the server.

@@ -56,6 +56,12 @@ try:
 except Exception:  # noqa: BLE001
     _SESSION_EXPORT_SRC = ""
 
+# Source of the in-page transport probe (window.__MKWL_txDump).
+try:
+    _TRANSPORT_PROBE_SRC = (Path(__file__).with_name("transport_probe.js")).read_text(encoding="utf-8")
+except Exception:  # noqa: BLE001
+    _TRANSPORT_PROBE_SRC = ""
+
 
 class DriverError(Exception):
     pass
@@ -906,6 +912,30 @@ class EitaaDriver:
         except Exception:  # noqa: BLE001
             return None
         return res if isinstance(res, dict) else None
+
+    async def inject_transport_probe(self) -> bool:
+        """Install the fetch/XHR transport hooks (window.__MKWL_txDump)."""
+        try:
+            has = await self.page.evaluate("() => typeof window.__MKWL_txDump === 'function'")
+        except Exception:  # noqa: BLE001
+            has = False
+        if has:
+            return True
+        if not _TRANSPORT_PROBE_SRC:
+            return False
+        try:
+            await self.page.evaluate(_TRANSPORT_PROBE_SRC)
+            return await self.page.evaluate("() => typeof window.__MKWL_txDump === 'function'")
+        except Exception:  # noqa: BLE001
+            return False
+
+    async def dump_transport(self) -> list:
+        """Drain the recorded MTProto HTTP requests (url + hex heads)."""
+        try:
+            res = await self.page.evaluate("() => window.__MKWL_txDump ? window.__MKWL_txDump() : []")
+        except Exception:  # noqa: BLE001
+            return []
+        return res if isinstance(res, list) else []
 
     async def ensure_stats_bridge(self) -> bool:
         """Make sure window.__MKWL_stats is defined."""
