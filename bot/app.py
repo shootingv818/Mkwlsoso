@@ -8,6 +8,7 @@ buttons, and posts English log cards for every run.
 from __future__ import annotations
 
 import asyncio
+import re
 from pathlib import Path
 
 from telethon import TelegramClient, events, Button
@@ -222,11 +223,13 @@ async def _handle_callback(event):
         await event.answer(f"Active: {acc}")
         return await event.edit(accounts_text(), buttons=kb_accounts())
     if data == "acc:add":
+        pending[event.sender_id] = {"step": "await_new_account"}
         return await event.edit(
             cards.card("➕ ADD ACCOUNT",
-                       [("Status", "auto-login coming next")],
-                       footer="Auto-login (phone + code) is the next build phase. "
-                              "For now, log in with the CLI: python cli.py login --account <name>"),
+                       footer="Send a short name for the new account "
+                              "(letters, numbers, underscore — e.g. acc2). "
+                              "Then finish the login on your noVNC screen; "
+                              "the bot detects and saves it automatically."),
             buttons=kb_back())
 
     # content
@@ -423,6 +426,27 @@ async def _conversation(event):
         store.set_file_content(str(dest), name, caption)
         pending.pop(event.sender_id, None)
         return await event.respond(content_text(), buttons=kb_content())
+
+    if step == "await_new_account":
+        name = text
+        if not re.fullmatch(r"[A-Za-z0-9_]{1,32}", name or ""):
+            return await event.respond(
+                "Send a valid name: letters, numbers, underscore (max 32). e.g. acc2")
+        if manager.is_busy(name):
+            return await event.respond("That account already has a running job. Try again later.")
+        pending.pop(event.sender_id, None)
+        started = await manager.run_login(name, report, config.NOVNC_URL)
+        if not started:
+            return await event.respond("Could not start login (account busy).")
+        hint = (f"Open noVNC: {config.NOVNC_URL}" if config.NOVNC_URL
+                else "Open your noVNC screen (browser display :99)")
+        return await event.respond(
+            cards.card("👤 LOGIN STARTED",
+                       [("Account", name)],
+                       footer=f"{hint} and log in (phone + code). I'll detect it "
+                              "and save automatically — a card will confirm when done. "
+                              "Never share your login code."),
+            buttons=kb_back())
 
     if step in ("await_textdelay", "await_contactdelay"):
         try:

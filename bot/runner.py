@@ -141,6 +141,74 @@ class JobManager:
         )
         return job
 
+    async def run_login(self, account: str, report: Report, novnc_url: str = "") -> bool:
+        """Start an interactive login for a (possibly new) account.
+
+        Opens a headed Eitaa Web session the owner completes on their noVNC
+        screen, then auto-detects success and saves the profile. Returns False
+        if the account is already busy with another job.
+        """
+        if account in self._busy:
+            return False
+        self._busy.add(account)
+        asyncio.create_task(self._login_job(account, report, novnc_url))
+        return True
+
+    async def _login_job(self, account: str, report: Report, novnc_url: str) -> None:
+        # Local imports keep this module importable without a browser present.
+        from capture.browser import open_session
+        from eitaa.driver import EitaaDriver
+        try:
+            # Headed so the owner can complete phone+code on the noVNC screen.
+            async with open_session(account, headed=True) as session:
+                await session.goto()
+                driver = EitaaDriver(session)
+                await driver.open()
+
+                if await driver.is_logged_in():
+                    await report(cards.card(
+                        "👤 ACCOUNT READY",
+                        [("Account", account), ("Status", "already logged in")],
+                        footer="This account is already logged in and ready to use."))
+                    return
+
+                hint = (f"Open noVNC: {novnc_url}" if novnc_url
+                        else "Open your noVNC screen (browser display :99)")
+                await report(cards.card(
+                    "👤 LOGIN STARTED",
+                    [("Account", account), ("Waiting", "up to 6 min")],
+                    footer=f"{hint} and log in (phone + code). I'll detect it and "
+                           f"save automatically. Never share your login code."))
+
+                deadline = time.time() + 360
+                ok = False
+                while time.time() < deadline:
+                    await asyncio.sleep(4)
+                    try:
+                        if await driver.is_logged_in():
+                            ok = True
+                            break
+                    except Exception:  # noqa: BLE001
+                        pass
+
+                if ok:
+                    # Let Eitaa Web persist its auth to the profile before close.
+                    await asyncio.sleep(2)
+                    await report(cards.card(
+                        "✅ ACCOUNT ADDED",
+                        [("Account", account)],
+                        footer="Login detected and saved. It now appears under Accounts."))
+                else:
+                    await report(cards.card(
+                        "⌛ LOGIN TIMEOUT",
+                        [("Account", account)],
+                        footer="No login detected in time. Tap Add Account to try again."))
+        except Exception as exc:  # noqa: BLE001
+            await report(cards.error_card(
+                "login", account, code=type(exc).__name__, detail=str(exc)))
+        finally:
+            self._busy.discard(account)
+
     # ---- send job ----
     async def _send_job(self, job: Job, content: dict, settings: dict,
                         report: Report, recipients: list[str] | None) -> None:

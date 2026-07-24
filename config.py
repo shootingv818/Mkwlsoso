@@ -74,6 +74,10 @@ class Config:
     OWNER_ID: int = _get_int("OWNER_ID", 0)
     REPORT_TO: int = _get_int("REPORT_TO", 0)  # 0 -> fall back to OWNER_ID
     BOT_VERSION: str = os.environ.get("BOT_VERSION", "1.0")
+    # Optional: the noVNC URL shown in the "Add Account" login hint so the
+    # owner knows where to complete the phone+code login (e.g.
+    # http://<ip>:6080/vnc.html). Left blank -> a generic hint is shown.
+    NOVNC_URL: str = os.environ.get("NOVNC_URL", "")
 
     # Runtime-tunable defaults (the Settings panel overrides these live and
     # persists them under DATA_DIR/settings.json).
