@@ -56,8 +56,10 @@
       if (of) self.fetch = function (input, init) {
         var url = (typeof input === "string") ? input : (input && input.url) || "";
         var body = init && init.body;
+        var hq = body ? hex(body) : null;
         var rec = { kind: "fetch", url: String(url),
-                    reqHead: body ? hex(body) : null, reqLen: (hex(body) || {}).len || 0 };
+                    reqHead: hq ? (hq.hex || ("text:" + hq.text)) : null,
+                    reqLen: hq ? hq.len : 0 };
         var p = of.apply(this, arguments);
         try {
           p.then(function (r) {

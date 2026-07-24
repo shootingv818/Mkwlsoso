@@ -512,6 +512,13 @@ async def cmd_bridge_file_send(account: str, peer: str | None, file_path: str | 
     return 0
 
 
+def _head_str(v) -> str:
+    """Normalize a captured head value (may be a hex string or a {hex,text} dict)."""
+    if isinstance(v, dict):
+        return v.get("hex") or (("text:" + v["text"]) if v.get("text") else "")
+    return v or ""
+
+
 async def cmd_direct_capture_worker(account: str) -> int:
     """Capture the EXACT bytes Eitaa's MTProto Worker sends on the wire.
 
@@ -568,17 +575,18 @@ async def cmd_direct_capture_worker(account: str) -> int:
                 print(f"[wcap] WS OPEN {r.get('url')}")
                 shown += 1
             elif k in ("ws_send", "ws_recv"):
-                head = r.get("reqHead") or r.get("resHead") or r.get("resText") or ""
+                head = _head_str(r.get("reqHead")) or _head_str(r.get("resHead")) or r.get("resText") or ""
                 print(f"[wcap] {k} {r.get('reqLen') or r.get('resLen') or 0}B  {str(head)[:64]}")
                 shown += 1
             elif k in ("fetch", "xhr"):
+                req = _head_str(r.get("reqHead"))
+                res = _head_str(r.get("resHead"))
                 # skip obvious media (jpeg/png responses) to reduce noise
-                res = (r.get("resHead") or "")
-                is_img = res[:6] in ("ffd8ff",) or res[:8] in ("89504e47",)
+                is_img = res[:6] == "ffd8ff" or res[:8] == "89504e47"
                 tag = " [media]" if is_img else ""
                 print(f"[wcap] {k}{tag} {r.get('url')}")
-                print(f"[wcap]    req {r.get('reqLen', 0)}B head={ (r.get('reqHead') or '')[:64] }")
-                print(f"[wcap]    res {r.get('resLen', 0)}B head={ res[:64] }")
+                print(f"[wcap]    req {r.get('reqLen', 0)}B head={req[:64]}")
+                print(f"[wcap]    res {r.get('resLen', 0)}B head={res[:64]}")
                 shown += 1
             if shown >= 25:
                 break

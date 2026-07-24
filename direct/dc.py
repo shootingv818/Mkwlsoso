@@ -24,7 +24,12 @@ LAYER = 135
 # so the probe TRIES all known shards with the home-DC auth_key and keeps the one
 # that returns a decryptable MTProto reply.
 DEFAULT_PATH = "/eitaa/"
-EITAA_SHARD_HOSTS = ["majid", "ghasem", "hossein", "vahid", "hadi"]
+# CONFIRMED by the worker capture: the MTProto API goes to bagher.eitaa.IR
+# (the .com shards like hadi serve MEDIA). Full hostnames, confirmed one first.
+EITAA_SHARD_HOSTS = [
+    "bagher.eitaa.ir",
+    "majid.eitaa.ir", "ghasem.eitaa.ir", "hossein.eitaa.ir", "vahid.eitaa.ir", "hadi.eitaa.ir",
+]
 
 
 def candidate_urls(dc_id: int) -> list[str]:
@@ -32,7 +37,7 @@ def candidate_urls(dc_id: int) -> list[str]:
     override = _load_env_hosts().get(dc_id)
     if override:
         return [override]
-    return [f"https://{h}.eitaa.com{DEFAULT_PATH}" for h in EITAA_SHARD_HOSTS]
+    return [f"https://{h}{DEFAULT_PATH}" for h in EITAA_SHARD_HOSTS]
 
 
 def _load_env_hosts() -> dict:

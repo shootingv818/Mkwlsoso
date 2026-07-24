@@ -192,7 +192,8 @@ def test_transport_url():
     from direct import dc
     _os.environ.pop("MKWL_DC_HOSTS", None)
     _check("default dc url https+/eitaa/", dc.dc_url(2).startswith("https://") and "/eitaa/" in dc.dc_url(2))
-    _check("candidate hosts = 5 shards", len(dc.candidate_urls(2)) == 5)
+    _check("bagher.eitaa.ir is first candidate",
+           dc.candidate_urls(2)[0] == "https://bagher.eitaa.ir/eitaa/")
     _os.environ["MKWL_DC_HOSTS"] = "2=https://majid.eitaa.com/eitaa/,4=https://vahid.eitaa.com/eitaa/"
     _check("env override dc2", dc.candidate_urls(2) == ["https://majid.eitaa.com/eitaa/"])
     _check("env override dc4", dc.candidate_urls(4) == ["https://vahid.eitaa.com/eitaa/"])
