@@ -32,6 +32,12 @@ try:
 except Exception:  # noqa: BLE001
     _BRIDGE_SEND_SRC = ""
 
+# Source of the in-page file bridge (window.__MKWL_fileInit / __MKWL_fileSend).
+try:
+    _BRIDGE_FILE_SRC = (Path(__file__).with_name("bridge_file_send.js")).read_text(encoding="utf-8")
+except Exception:  # noqa: BLE001
+    _BRIDGE_FILE_SRC = ""
+
 
 class DriverError(Exception):
     pass
@@ -790,6 +796,74 @@ class EitaaDriver:
             return res if isinstance(res, dict) else {"ok": False, "code": "bad bridge result"}
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "code": f"bridge evaluate error: {exc}"}
+
+    async def ensure_file_bridge(self) -> bool:
+        """Make sure window.__MKWL_fileInit / __MKWL_fileSend are defined."""
+        try:
+            has = await self.page.evaluate("() => typeof window.__MKWL_fileInit === 'function'")
+        except Exception:  # noqa: BLE001
+            has = False
+        if has:
+            return True
+        if not _BRIDGE_FILE_SRC:
+            return False
+        try:
+            await self.page.evaluate(_BRIDGE_FILE_SRC)
+            return await self.page.evaluate("() => typeof window.__MKWL_fileInit === 'function'")
+        except Exception:  # noqa: BLE001
+            return False
+
+    async def bridge_file_init(self, file_path: str, caption: str = "") -> dict:
+        """Upload `file_path` to Saved Messages ONCE via the bridge.
+
+        The heavy upload happens a single time here; every recipient afterwards
+        reuses the resulting document with no re-upload. Returns the raw result
+        {ok, msg_id, doc_id, code}. `caption` is unused for the upload itself
+        (recipients get their caption per-send) but kept for signature clarity.
+        """
+        import base64 as _b64
+        import mimetypes as _mt
+        import os as _os
+
+        if not file_path or not _os.path.isfile(file_path):
+            return {"ok": False, "code": f"file not found: {file_path}"}
+        if not await self.ensure_file_bridge():
+            return {"ok": False, "code": "file bridge unavailable"}
+        try:
+            with open(file_path, "rb") as f:
+                data = f.read()
+            b64 = _b64.b64encode(data).decode("ascii")
+            filename = _os.path.basename(file_path)
+            mime = _mt.guess_type(file_path)[0] or "application/octet-stream"
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "code": f"read error: {exc}"}
+        try:
+            res = await self.page.evaluate(
+                "(a) => window.__MKWL_fileInit(a.b, a.n, a.m)",
+                {"b": b64, "n": filename, "m": mime},
+            )
+            return res if isinstance(res, dict) else {"ok": False, "code": "bad init result"}
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "code": f"file init evaluate error: {exc}"}
+
+    async def bridge_file_send(self, peer_id: str, caption: str = "") -> dict:
+        """Deliver the already-uploaded file to one recipient (no re-upload).
+
+        Requires bridge_file_init() to have succeeded first. Returns
+        {ok, method, msg_id, limit, code}. Never raises.
+        """
+        if not peer_id:
+            return {"ok": False, "code": "no peer_id"}
+        if not await self.ensure_file_bridge():
+            return {"ok": False, "code": "file bridge unavailable"}
+        try:
+            res = await self.page.evaluate(
+                "(a) => window.__MKWL_fileSend(a.p, a.c)",
+                {"p": str(peer_id), "c": caption or ""},
+            )
+            return res if isinstance(res, dict) else {"ok": False, "code": "bad send result"}
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "code": f"file send evaluate error: {exc}"}
 
     async def send_text(self, query: str, text: str, verify: bool = True) -> SendResult:
         try:

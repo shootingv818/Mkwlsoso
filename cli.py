@@ -352,6 +352,76 @@ async def cmd_bridge_file(account: str, file_path: str | None) -> int:
     return 0
 
 
+async def cmd_bridge_file_send(account: str, peer: str | None, file_path: str | None) -> int:
+    """End-to-end test of the PRODUCTION file path (upload once + reuse-send).
+
+    Uploads the file once via the bridge, then sends it once via sendMedia
+    reuse. Defaults the target to the account's own Saved Messages (self), so
+    it is safe. Verifies the exact functions the campaign uses.
+    """
+    import tempfile
+    config.ensure_dirs()
+
+    made_temp = False
+    if not file_path:
+        fd, file_path = tempfile.mkstemp(prefix="mkwl_filesend_", suffix=".txt")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write("MKWL production file-send test. Safe to delete.\n" * 20)
+        made_temp = True
+        print(f"[file-send] no --file given; created a tiny test file: {file_path}")
+
+    try:
+        async with open_session(account) as session:
+            await session.goto()
+            driver = EitaaDriver(session)
+            await driver.open()
+            if not await driver.is_logged_in():
+                print("[file-send] not logged in. run: python cli.py login --account", account)
+                return 2
+
+            print("[file-send] uploading file ONCE via the bridge...")
+            finit = await driver.bridge_file_init(file_path, "")
+            print(f"[file-send] init: {finit}")
+            if not finit.get("ok"):
+                print(f"[file-send] ❌ upload/init failed: {finit.get('code')}")
+                return 0
+
+            if not peer:
+                try:
+                    peer = await session.page.evaluate(
+                        """() => {
+                            try { if (window.appPeersManager && window.appPeersManager.peerId != null)
+                                    return String(window.appPeersManager.peerId); } catch (e) {}
+                            try { if (window.appImManager && window.appImManager.myId != null)
+                                    return String(window.appImManager.myId); } catch (e) {}
+                            return null;
+                        }"""
+                    )
+                except Exception:  # noqa: BLE001
+                    peer = None
+                if not peer:
+                    print("[file-send] could not detect self id; pass --peer <peer_id>")
+                    return 2
+                print(f"[file-send] no --peer given; defaulting to self (Saved Messages) id={peer}")
+
+            res = await driver.bridge_file_send(peer, "MKWL file bridge test caption")
+            print(f"[file-send] send result: {res}")
+            if res.get("ok"):
+                print(f"[file-send] ✅ FILE SENT via {res.get('method')}  msg_id={res.get('msg_id')} "
+                      f"(no re-upload)")
+            elif res.get("limit"):
+                print(f"[file-send] 🚫 server limit: {res.get('code')}")
+            else:
+                print(f"[file-send] ❌ failed: {res.get('code')}")
+    finally:
+        if made_temp:
+            try:
+                os.remove(file_path)
+            except Exception:  # noqa: BLE001
+                pass
+    return 0
+
+
 async def cmd_bridge_reach(account: str, sample: int) -> int:
     """Measure how far the fast bridge reaches: PVs vs Contacts.
 
@@ -959,6 +1029,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_reach.add_argument("--sample", type=int, default=40,
                          help="how many peers per group to check (default 40)")
 
+    p_fsend = sub.add_parser(
+        "bridge-file-send",
+        help="end-to-end test the production file path (upload once + reuse) to Saved Messages",
+    )
+    p_fsend.add_argument("--account", required=True)
+    p_fsend.add_argument("--peer", default=None, help="target peer_id (default: self/Saved Messages)")
+    p_fsend.add_argument("--file", default=None, help="file to send (default: an auto tiny .txt)")
+
     p_ext = sub.add_parser("extract", help="mine MTProto params (DCs/api/layer/RSA) from a run's assets")
     p_ext.add_argument("--run", required=True)
 
@@ -1054,6 +1132,8 @@ def main(argv: list[str] | None = None) -> int:
         return asyncio.run(cmd_bridge_file(args.account, args.file))
     if args.command == "bridge-reach":
         return asyncio.run(cmd_bridge_reach(args.account, args.sample))
+    if args.command == "bridge-file-send":
+        return asyncio.run(cmd_bridge_file_send(args.account, args.peer, args.file))
     if args.command == "extract":
         return cmd_extract(args.run)
     if args.command == "list":

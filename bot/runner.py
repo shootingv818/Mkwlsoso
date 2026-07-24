@@ -181,46 +181,71 @@ class JobManager:
                 total = len(recipient_items)
                 await report(cards.send_started(account, kind, total, delay))
 
-                # Pre-warm the bridge once (text campaigns only; files use the UI).
-                if not is_file:
+                # Pre-warm the right bridge ONCE.
+                file_bridge_ready = False
+                if is_file:
+                    # Upload the file a single time; every recipient then reuses
+                    # that same uploaded document (no per-recipient re-upload ->
+                    # no server strain).
+                    finit = await driver.bridge_file_init(
+                        content.get("file_path", ""), content.get("caption", ""))
+                    if finit.get("ok"):
+                        file_bridge_ready = True
+                        print(f"[send] file uploaded ONCE (msg_id={finit.get('msg_id')}); "
+                              f"reusing via sendMedia per recipient", flush=True)
+                    else:
+                        print(f"[send] file bridge init failed ({finit.get('code')}); "
+                              f"falling back to UI file send", flush=True)
+                        await report(cards.error_card(
+                            "file_init", account, code="bridge_file_init",
+                            detail=str(finit.get("code")), trace_id=job.job_id))
+                else:
                     await driver.ensure_bridge()
 
                 consecutive_failures = 0
                 error_cards = 0
+                via_bridge = 0      # sent through Eitaa's own engine (fast path)
+                via_fallback = 0    # sent through the proven UI path
                 where = "send_file" if is_file else "send_text"
                 text_body = content.get("text", "")
+                caption_body = content.get("caption", "")
                 for i, (name, peer_id) in enumerate(recipient_items, start=1):
                     if job.stop:
                         break
                     limited = False
                     try:
-                        if is_file:
-                            # Files still go through the UI (the bridge send here
-                            # is text-only for now).
-                            res = await driver.send_file(
-                                content.get("file_path", ""),
-                                caption=content.get("caption", ""),
-                                query=name,
-                            )
-                        else:
-                            res = None
-                            # Fast path: send via Eitaa's own engine using peer_id.
-                            if peer_id:
+                        res = None
+                        used_bridge = False
+                        # Fast path: send via Eitaa's own engine using peer_id.
+                        # Text -> __MKWL_send; file -> reuse the once-uploaded doc.
+                        if peer_id:
+                            b = None
+                            if is_file and file_bridge_ready:
+                                b = await driver.bridge_file_send(peer_id, caption_body)
+                            elif not is_file:
                                 b = await driver.bridge_send(peer_id, text_body)
+                            if b is not None:
                                 if b.get("limit"):
                                     # Server itself reported a flood/limit.
                                     await report(cards.restriction_card(
                                         account, f"server: {b.get('code')}", sent))
                                     limited = True
                                 elif b.get("ok"):
+                                    used_bridge = True
                                     res = SendResult(
                                         ok=True, to=name,
                                         detail=f"bridge/{b.get('method')} id={b.get('msg_id')}")
                                 else:
                                     print(f"[send] bridge miss for {name[:18]!r} "
                                           f"({b.get('code')}); UI fallback", flush=True)
-                            # Fallback: proven UI send (also covers no-peer_id).
-                            if not limited and res is None:
+                        # Fallback: proven UI send (covers no-peer_id, a bridge
+                        # miss, or an unavailable file bridge).
+                        if not limited and res is None:
+                            if is_file:
+                                res = await driver.send_file(
+                                    content.get("file_path", ""),
+                                    caption=caption_body, query=name)
+                            else:
                                 res = await driver.send_text(name, text_body, verify=True)
 
                         if limited:
@@ -230,6 +255,10 @@ class JobManager:
                         elif res is not None and res.ok:
                             sent += 1
                             consecutive_failures = 0
+                            if used_bridge:
+                                via_bridge += 1
+                            else:
+                                via_fallback += 1
                         else:
                             failed += 1
                             consecutive_failures += 1
@@ -267,7 +296,14 @@ class JobManager:
 
                     await asyncio.sleep(delay)
 
-                job.summary = {"sent": sent, "failed": failed, "skipped": skipped, "total": total}
+                # Evidence of which path carried the load (fast bridge vs the UI
+                # fallback) so alternative methods stay observable at a glance.
+                print(f"[send] path summary: via_bridge={via_bridge} "
+                      f"via_fallback={via_fallback} sent={sent} failed={failed} "
+                      f"({'file' if is_file else 'text'})", flush=True)
+                job.summary = {"sent": sent, "failed": failed, "skipped": skipped,
+                               "total": total, "via_bridge": via_bridge,
+                               "via_fallback": via_fallback}
                 await report(cards.send_finished(
                     account, kind, sent, failed, skipped, total,
                     time.time() - start, stopped=job.stop))
