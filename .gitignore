@@ -15,6 +15,10 @@ profiles/
 # Capture output holds raw traffic/screenshots - NEVER commit
 artifacts/
 
+# Exported MTProto sessions (auth keys) - NEVER commit
+data/sessions/
+*.session.json
+
 # Logs
 *.log
 

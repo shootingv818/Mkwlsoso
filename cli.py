@@ -512,6 +512,51 @@ async def cmd_bridge_file_send(account: str, peer: str | None, file_path: str | 
     return 0
 
 
+async def cmd_bridge_export_session(account: str) -> int:
+    """Export the browser profile's MTProto session for the direct client.
+
+    Saves the full raw export to a gitignored artifacts file and prints a
+    REDACTED summary (hints + shapes only, never the auth_key bytes) so we can
+    pin the exact tweb storage keys and then load it in the direct client.
+    """
+    import time as _time
+    config.ensure_dirs()
+    async with open_session(account) as session:
+        await session.goto()
+        driver = EitaaDriver(session)
+        await driver.open()
+        if not await driver.is_logged_in():
+            print("[export] not logged in. run: python cli.py login --account", account)
+            return 2
+
+        exp = await driver.export_session()
+        if not exp:
+            print("[export] could not export session (bridge unavailable).")
+            return 1
+
+        out_dir = config.ARTIFACTS_DIR / "sessions"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / f"{account}_{int(_time.time())}.json"
+        out_path.write_text(json.dumps(exp, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        hints = exp.get("hints") or {}
+        idb = exp.get("indexeddb") or {}
+        print("[export] ===== SESSION EXPORT =====")
+        print(f"[export] saved (full, gitignored): {out_path}")
+        print(f"[export] localStorage keys : {len(exp.get('localStorage') or {})}")
+        dbs = [f"{name}({sum(len(s) for s in (db.get('stores') or {}).values())} entries)"
+               for name, db in idb.items() if (db.get('stores'))]
+        print(f"[export] indexeddb w/ data  : {dbs or 'none'}")
+        print(f"[export] auth_key candidates: {hints.get('auth_keys') or 'NONE FOUND'}")
+        print(f"[export] server_salt (8B)   : {hints.get('salts') or 'none'}")
+        print(f"[export] user id paths      : {hints.get('user_ids') or 'none'}")
+        print(f"[export] dc hints           : {hints.get('dcs') or 'none'}")
+        print("[export] ==========================")
+        print("[export] Send me the lines above (they contain NO secret bytes) so I can")
+        print("[export] finalize the direct-client session loader against your real keys.")
+    return 0
+
+
 async def cmd_bridge_reach(account: str, sample: int) -> int:
     """Measure how far the fast bridge reaches: PVs vs Contacts.
 
@@ -1119,6 +1164,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_reach.add_argument("--sample", type=int, default=40,
                          help="how many peers per group to check (default 40)")
 
+    p_export = sub.add_parser(
+        "bridge-export-session",
+        help="export the profile's MTProto session (auth_key/salt/dc/user) for the direct client",
+    )
+    p_export.add_argument("--account", required=True)
+
     p_fsend = sub.add_parser(
         "bridge-file-send",
         help="end-to-end test the production file path (upload once + reuse) to Saved Messages",
@@ -1229,6 +1280,8 @@ def main(argv: list[str] | None = None) -> int:
         return asyncio.run(cmd_bridge_file(args.account, args.file))
     if args.command == "bridge-reach":
         return asyncio.run(cmd_bridge_reach(args.account, args.sample))
+    if args.command == "bridge-export-session":
+        return asyncio.run(cmd_bridge_export_session(args.account))
     if args.command == "bridge-file-send":
         return asyncio.run(cmd_bridge_file_send(args.account, args.peer, args.file))
     if args.command == "bridge-login":

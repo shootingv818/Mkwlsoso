@@ -50,6 +50,12 @@ try:
 except Exception:  # noqa: BLE001
     _BRIDGE_STATS_SRC = ""
 
+# Source of the in-page session exporter (window.__MKWL_exportSession).
+try:
+    _SESSION_EXPORT_SRC = (Path(__file__).with_name("session_export.js")).read_text(encoding="utf-8")
+except Exception:  # noqa: BLE001
+    _SESSION_EXPORT_SRC = ""
+
 
 class DriverError(Exception):
     pass
@@ -876,6 +882,30 @@ class EitaaDriver:
             return res if isinstance(res, dict) else {"ok": False, "code": "bad send result"}
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "code": f"file send evaluate error: {exc}"}
+
+    async def export_session(self) -> dict | None:
+        """Dump the browser profile's MTProto session (IndexedDB + localStorage).
+
+        Returns the raw export {localStorage, indexeddb, hints} or None. This is
+        the bridge that lets the headless direct client reuse this exact
+        authorized session with no re-login.
+        """
+        try:
+            has = await self.page.evaluate("() => typeof window.__MKWL_exportSession === 'function'")
+        except Exception:  # noqa: BLE001
+            has = False
+        if not has:
+            if not _SESSION_EXPORT_SRC:
+                return None
+            try:
+                await self.page.evaluate(_SESSION_EXPORT_SRC)
+            except Exception:  # noqa: BLE001
+                return None
+        try:
+            res = await self.page.evaluate("() => window.__MKWL_exportSession()")
+        except Exception:  # noqa: BLE001
+            return None
+        return res if isinstance(res, dict) else None
 
     async def ensure_stats_bridge(self) -> bool:
         """Make sure window.__MKWL_stats is defined."""
