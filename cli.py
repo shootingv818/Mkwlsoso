@@ -512,6 +512,82 @@ async def cmd_bridge_file_send(account: str, peer: str | None, file_path: str | 
     return 0
 
 
+async def cmd_direct_capture_worker(account: str) -> int:
+    """Capture the EXACT bytes Eitaa's MTProto Worker sends on the wire.
+
+    Opens the session with worker_capture.js injected as an init script (so it
+    wraps window.Worker BEFORE the mtproto worker is created), performs a
+    controlled send to Saved Messages, then dumps the worker's fetch/XHR/WS
+    requests + responses (hex heads). This reveals Eitaa's transport envelope.
+    """
+    import time as _time
+    from pathlib import Path as _Path
+    from capture.bridge import send_marker_to_saved
+    config.ensure_dirs()
+
+    init_js = _Path("eitaa/worker_capture.js")
+    if not init_js.is_file():
+        print(f"[wcap] missing {init_js}")
+        return 1
+
+    async with open_session(account, init_script_path=str(init_js)) as session:
+        await session.goto()
+        driver = EitaaDriver(session)
+        await driver.open()
+        if not await driver.is_logged_in():
+            print("[wcap] not logged in. run: python cli.py login --account", account)
+            return 2
+
+        await driver.dump_worker_requests()  # clear anything buffered pre-action
+        marker = f"MKWLW{int(_time.time())}"
+        print("[wcap] performing a controlled send to trigger MTProto worker traffic...")
+        status = await send_marker_to_saved(driver, marker)
+        print(f"[wcap] send status: {status}")
+        await session.page.wait_for_timeout(4000)
+
+        recs = await driver.dump_worker_requests()
+        out_dir = config.ARTIFACTS_DIR / "sessions"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / f"worker_tx_{account}_{int(_time.time())}.json"
+        out_path.write_text(json.dumps(recs, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        print("[wcap] ===== WORKER TRANSPORT CAPTURE =====")
+        print(f"[wcap] records: {len(recs)}   saved: {out_path}")
+        kinds: dict = {}
+        for r in recs:
+            kinds[r.get("kind", "?")] = kinds.get(r.get("kind", "?"), 0) + 1
+        print(f"[wcap] by kind: {kinds}")
+        # Show the interesting ones: WS frames + binary POSTs (not media).
+        shown = 0
+        for r in recs:
+            k = r.get("kind")
+            if k in ("no_hook",):
+                print(f"[wcap] {r.get('note')}")
+                continue
+            if k in ("ws_open",):
+                print(f"[wcap] WS OPEN {r.get('url')}")
+                shown += 1
+            elif k in ("ws_send", "ws_recv"):
+                head = r.get("reqHead") or r.get("resHead") or r.get("resText") or ""
+                print(f"[wcap] {k} {r.get('reqLen') or r.get('resLen') or 0}B  {str(head)[:64]}")
+                shown += 1
+            elif k in ("fetch", "xhr"):
+                # skip obvious media (jpeg/png responses) to reduce noise
+                res = (r.get("resHead") or "")
+                is_img = res[:6] in ("ffd8ff",) or res[:8] in ("89504e47",)
+                tag = " [media]" if is_img else ""
+                print(f"[wcap] {k}{tag} {r.get('url')}")
+                print(f"[wcap]    req {r.get('reqLen', 0)}B head={ (r.get('reqHead') or '')[:64] }")
+                print(f"[wcap]    res {r.get('resLen', 0)}B head={ res[:64] }")
+                shown += 1
+            if shown >= 25:
+                break
+        print("[wcap] ====================================")
+        print("[wcap] Send me these lines. WS frames or a non-media binary POST reveal the")
+        print("[wcap] envelope: the FIRST send is usually a 64-byte obfuscation init header.")
+    return 0
+
+
 async def cmd_direct_capture_transport(account: str) -> int:
     """Pin Eitaa's real MTProto wire: URL per DC + transport envelope.
 
@@ -1292,9 +1368,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_txcap = sub.add_parser(
         "direct-capture-transport",
-        help="pin Eitaa's real MTProto URL + transport envelope (for the direct client)",
+        help="pin Eitaa's real MTProto URL + transport envelope (main-thread; sees media only)",
     )
     p_txcap.add_argument("--account", required=True)
+
+    p_wcap = sub.add_parser(
+        "direct-capture-worker",
+        help="capture the EXACT bytes the MTProto Worker sends (fetch/XHR/WebSocket)",
+    )
+    p_wcap.add_argument("--account", required=True)
 
     p_dprobe = sub.add_parser(
         "direct-probe",
@@ -1418,6 +1500,8 @@ def main(argv: list[str] | None = None) -> int:
         return asyncio.run(cmd_bridge_export_session(args.account))
     if args.command == "direct-capture-transport":
         return asyncio.run(cmd_direct_capture_transport(args.account))
+    if args.command == "direct-capture-worker":
+        return asyncio.run(cmd_direct_capture_worker(args.account))
     if args.command == "direct-probe":
         return cmd_direct_probe(args.session, args.account, args.url)
     if args.command == "bridge-file-send":

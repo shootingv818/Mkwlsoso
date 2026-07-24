@@ -937,6 +937,21 @@ class EitaaDriver:
             return []
         return res if isinstance(res, list) else []
 
+    async def dump_worker_requests(self) -> list:
+        """Drain the requests recorded INSIDE the workers (worker_capture.js).
+
+        Requires the session to have been opened with worker_capture.js as its
+        init script (it must wrap window.Worker before any worker is created).
+        """
+        try:
+            res = await self.page.evaluate(
+                "() => window.__MKWL_workerDump ? window.__MKWL_workerDump() : null")
+        except Exception:  # noqa: BLE001
+            return []
+        if res is None:
+            return [{"kind": "no_hook", "note": "worker_capture.js was not injected as init script"}]
+        return res if isinstance(res, list) else []
+
     async def ensure_stats_bridge(self) -> bool:
         """Make sure window.__MKWL_stats is defined."""
         try:
