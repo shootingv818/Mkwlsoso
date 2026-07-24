@@ -38,6 +38,12 @@ try:
 except Exception:  # noqa: BLE001
     _BRIDGE_FILE_SRC = ""
 
+# Source of the in-page contact-import bridge (window.__MKWL_importContacts).
+try:
+    _BRIDGE_CONTACTS_SRC = (Path(__file__).with_name("contacts_bridge.js")).read_text(encoding="utf-8")
+except Exception:  # noqa: BLE001
+    _BRIDGE_CONTACTS_SRC = ""
+
 
 class DriverError(Exception):
     pass
@@ -864,6 +870,39 @@ class EitaaDriver:
             return res if isinstance(res, dict) else {"ok": False, "code": "bad send result"}
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "code": f"file send evaluate error: {exc}"}
+
+    async def ensure_contacts_bridge(self) -> bool:
+        """Make sure window.__MKWL_importContacts is defined."""
+        try:
+            has = await self.page.evaluate("() => typeof window.__MKWL_importContacts === 'function'")
+        except Exception:  # noqa: BLE001
+            has = False
+        if has:
+            return True
+        if not _BRIDGE_CONTACTS_SRC:
+            return False
+        try:
+            await self.page.evaluate(_BRIDGE_CONTACTS_SRC)
+            return await self.page.evaluate("() => typeof window.__MKWL_importContacts === 'function'")
+        except Exception:  # noqa: BLE001
+            return False
+
+    async def bridge_import_contacts(self, entries: list[dict]) -> dict:
+        """Import a batch of phone numbers via contacts.importContacts.
+
+        entries: [{"phone": "+98...", "first": "...", "last": "..."}]. Returns
+        {ok, batch, imported_count, retry_count, added:[...]} or, on rate-limit,
+        {ok:False, limit:True, code, wait}. Never raises.
+        """
+        if not entries:
+            return {"ok": True, "batch": 0, "imported_count": 0, "added": []}
+        if not await self.ensure_contacts_bridge():
+            return {"ok": False, "code": "contacts bridge unavailable"}
+        try:
+            res = await self.page.evaluate("(a) => window.__MKWL_importContacts(a)", entries)
+            return res if isinstance(res, dict) else {"ok": False, "code": "bad import result"}
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "code": f"import evaluate error: {exc}"}
 
     async def send_text(self, query: str, text: str, verify: bool = True) -> SendResult:
         try:

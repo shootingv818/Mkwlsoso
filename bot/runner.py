@@ -404,39 +404,78 @@ class JobManager:
                                                   detail="account is not logged in"))
                     return
                 await report(cards.contacts_started(account, prefix, total, delay))
-                await driver.open_contacts_view()
 
-                for i, entry in enumerate(entries, start=1):
-                    if job.stop:
-                        break
-                    try:
-                        if i > 1:
-                            ok = await driver._reset_to_contacts_view()
-                            if not ok:
-                                error += 1
-                                continue
-                        res = await driver._add_one(entry["phone"], entry["first"], entry["last"])
-                        status = res.get("status")
-                        if status == "added":
-                            added += 1
-                        elif status == "not_on_eitaa":
-                            not_on += 1
-                        elif status == "invalid_number":
-                            invalid += 1
+                if await driver.ensure_contacts_bridge():
+                    # FAST PATH: contacts.importContacts in batches. The server
+                    # returns exactly which numbers are on Eitaa (as users WITH
+                    # access_hash -> instantly sendable). No per-number UI popup,
+                    # no server strain.
+                    BATCH = 50
+                    done = 0
+                    while done < total:
+                        if job.stop:
+                            break
+                        batch = entries[done:done + BATCH]
+                        r = await driver.bridge_import_contacts(batch)
+                        if r.get("limit"):
+                            wait = r.get("wait")
+                            detail = f"server: {r.get('code')}" + (f" (wait {wait}s)" if wait else "")
+                            await report(cards.restriction_card(account, detail, added))
+                            break
+                        if r.get("ok"):
+                            imp = int(r.get("imported_count", 0))
+                            rc = int(r.get("retry_count", 0))
+                            added += imp
+                            not_on += max(0, len(batch) - imp - rc)
+                            error += rc
                         else:
-                            error += 1
-                    except Exception as exc:  # noqa: BLE001
-                        error += 1
-                        await report(cards.error_card(
-                            "add_contact", account, target=entry.get("phone"),
-                            code=type(exc).__name__, detail=str(exc), trace_id=job.job_id))
-
-                    if i % log_every == 0:
+                            error += len(batch)
+                            await report(cards.error_card(
+                                "import_contacts", account, code="import_failed",
+                                detail=str(r.get("code")), trace_id=job.job_id))
+                        done += len(batch)
                         await report(cards.contacts_progress(
-                            added, not_on, invalid, error, total - i))
-                    await asyncio.sleep(delay)
+                            added, not_on, invalid, error, total - done))
+                        await asyncio.sleep(delay)
+                    print(f"[contacts] path=bridge added={added} not_on={not_on} "
+                          f"error={error} of {total}", flush=True)
+                else:
+                    # FALLBACK: the proven (slower) per-number UI add flow.
+                    await driver.open_contacts_view()
+                    for i, entry in enumerate(entries, start=1):
+                        if job.stop:
+                            break
+                        try:
+                            if i > 1:
+                                ok = await driver._reset_to_contacts_view()
+                                if not ok:
+                                    error += 1
+                                    continue
+                            res = await driver._add_one(entry["phone"], entry["first"], entry["last"])
+                            status = res.get("status")
+                            if status == "added":
+                                added += 1
+                            elif status == "not_on_eitaa":
+                                not_on += 1
+                            elif status == "invalid_number":
+                                invalid += 1
+                            else:
+                                error += 1
+                        except Exception as exc:  # noqa: BLE001
+                            error += 1
+                            await report(cards.error_card(
+                                "add_contact", account, target=entry.get("phone"),
+                                code=type(exc).__name__, detail=str(exc), trace_id=job.job_id))
 
-                await driver._reset_to_contacts_view()
+                        if i % log_every == 0:
+                            await report(cards.contacts_progress(
+                                added, not_on, invalid, error, total - i))
+                        await asyncio.sleep(delay)
+
+                    await driver._reset_to_contacts_view()
+                    print(f"[contacts] path=UI added={added} not_on={not_on} "
+                          f"error={error} of {total}", flush=True)
+
                 job.summary = {"added": added, "not_on": not_on, "invalid": invalid,
                                "error": error, "total": total}
                 await report(cards.contacts_finished(
