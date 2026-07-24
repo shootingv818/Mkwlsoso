@@ -162,27 +162,17 @@ class JobManager:
 
                 if recipients is None:
                     contacts = await driver.collect_all_contacts()
-                    # Keep BOTH the title and the peer_id. The peer_id lets us
-                    # open each chat directly (no per-message search); the title
-                    # confirms the right chat opened and is the search fallback.
-                    recipient_items = [
-                        (c.get("title", ""), c.get("peer_id"))
-                        for c in contacts if c.get("title")
-                    ]
+                    recipients = [c.get("title", "") for c in contacts if c.get("title")]
                     # collect_all_contacts leaves the Contacts subview open;
                     # return to the main chat list before we start opening chats.
                     await driver._return_to_chat_list()
-                else:
-                    # Externally-supplied recipients are plain names -> no
-                    # peer_id, so they use the proven search flow unchanged.
-                    recipient_items = [(name, None) for name in recipients]
-                total = len(recipient_items)
+                total = len(recipients)
                 await report(cards.send_started(account, kind, total, delay))
 
                 consecutive_failures = 0
                 error_cards = 0
                 where = "send_file" if content.get("kind") == "file" else "send_text"
-                for i, (name, peer_id) in enumerate(recipient_items, start=1):
+                for i, name in enumerate(recipients, start=1):
                     if job.stop:
                         break
                     limited = False
@@ -192,13 +182,9 @@ class JobManager:
                                 content.get("file_path", ""),
                                 caption=content.get("caption", ""),
                                 query=name,
-                                peer_id=peer_id,
                             )
                         else:
-                            res = await driver.send_text(
-                                name, content.get("text", ""), verify=True,
-                                peer_id=peer_id,
-                            )
+                            res = await driver.send_text(name, content.get("text", ""), verify=True)
                         if res.ok:
                             sent += 1
                             consecutive_failures = 0

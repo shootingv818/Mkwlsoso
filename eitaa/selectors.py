@@ -62,17 +62,6 @@ MESSAGE_TEXT = [
     ".message",
 ]
 
-# The currently-open chat's header title in the right column's top bar. Used
-# ONLY to CONFIRM that a direct peer_id navigation opened the intended chat
-# before anything is sent (never to search). Scoped to the chat top bar so it
-# can't accidentally match a left-column chat-list row.
-OPEN_CHAT_TITLE = [
-    ".chat .topbar .peer-title",
-    ".topbar .chat-info .peer-title",
-    ".chat-info .peer-title",
-    ".sidebar-header .chat-info .peer-title",
-]
-
 # Hamburger / main menu toggle in the left sidebar header. We avoid the
 # "sidebar-close-button" (that is a back button, not the menu opener).
 MENU_BUTTON = [

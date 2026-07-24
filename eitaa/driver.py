@@ -695,84 +695,6 @@ class EitaaDriver:
                     pass
             await self.page.wait_for_timeout(500)
 
-    async def _open_chat_title_matches(self, want: str) -> bool:
-        """True if any VISIBLE chat-header title equals `want` (exact match on
-        collapsed whitespace).
-
-        Used to CONFIRM a direct peer_id navigation opened the intended chat
-        before sending. We scan every candidate header (not just the first)
-        because tweb can briefly keep the previous chat's header in the DOM
-        during a switch. Exact match only -- never fuzzy -- so we can never
-        confirm the wrong peer.
-        """
-        want_norm = " ".join((want or "").split())
-        if not want_norm:
-            return False
-        js = """
-        (sels) => {
-          const out = [];
-          for (const s of sels) {
-            for (const n of document.querySelectorAll(s)) {
-              if (n && n.offsetParent !== null) {
-                const t = (n.textContent || '').replace(/\\s+/g, ' ').trim();
-                if (t) out.push(t);
-              }
-            }
-          }
-          return out;
-        }
-        """
-        try:
-            titles = await self.page.evaluate(js, S.OPEN_CHAT_TITLE)
-        except Exception:  # noqa: BLE001
-            return False
-        return any(" ".join(str(t).split()) == want_norm for t in (titles or []))
-
-    async def open_chat_by_peer_id(self, peer_id: str, expect_title: str = "") -> bool:
-        """Open a chat DIRECTLY by its tweb peer id via hash routing, skipping
-        the per-message search entirely (the big per-message cost).
-
-        Returns True ONLY when the intended chat is confirmed open: the
-        composer is present AND the open-chat header title matches
-        `expect_title`. On any doubt it returns False so the caller falls back
-        to the proven search flow -- we must never send to the wrong peer. A
-        known expected title is required to confirm against.
-        """
-        pid = str(peer_id or "").strip()
-        want = " ".join((expect_title or "").split())
-        if not pid or not want:
-            return False
-        _t0 = time.monotonic()
-        try:
-            # tweb (Telegram Web K) uses hash-based peer routing. Set the hash
-            # to the peer id and nudge the router with a hashchange event.
-            await self.page.evaluate(
-                "(pid) => { if (location.hash !== '#' + pid) { location.hash = '#' + pid; } "
-                "window.dispatchEvent(new HashChangeEvent('hashchange')); }",
-                pid,
-            )
-        except Exception:  # noqa: BLE001
-            return False
-
-        # The chat must actually open (composer present).
-        box = await _first_visible(self.page, S.MESSAGE_INPUT, timeout=3000)
-        if box is None:
-            return False
-
-        # Confirm the intended contact's header is on screen. During a chat
-        # switch tweb can briefly keep the previous chat's header in the DOM,
-        # so we accept the nav if ANY visible chat-header title equals the
-        # expected one (exact match only -- never a fuzzy match, so we can
-        # never confirm the wrong peer). Short bounded poll to keep the
-        # fallback fast when the nav was ignored.
-        for _ in range(5):
-            if await self._open_chat_title_matches(want):
-                print(f"[fast] peer_id nav OK id={pid} ({time.monotonic()-_t0:.2f}s)", flush=True)
-                return True
-            await self.page.wait_for_timeout(120)
-        print(f"[fast] peer_id nav unconfirmed id={pid} -> search fallback", flush=True)
-        return False
-
     async def open_chat(self, query: str) -> None:
         _t0 = time.monotonic()
         search = await _first_visible(self.page, S.SEARCH_INPUT, timeout=6000)
@@ -820,22 +742,11 @@ class EitaaDriver:
               f"results={time.monotonic()-_t1:.1f}s fallback={'Y' if used_fallback else 'N'} "
               f"total={time.monotonic()-_t0:.1f}s", flush=True)
 
-    async def send_text(self, query: str, text: str, verify: bool = True,
-                        peer_id: str | None = None) -> SendResult:
-        # Fast path: open the chat directly by peer_id (no search). Only used
-        # when it can be CONFIRMED the right chat opened; otherwise we fall
-        # back to the proven search flow below.
-        opened = False
-        if peer_id:
-            try:
-                opened = await self.open_chat_by_peer_id(peer_id, expect_title=query)
-            except Exception:  # noqa: BLE001
-                opened = False
-        if not opened:
-            try:
-                await self.open_chat(query)
-            except DriverError as exc:
-                return SendResult(ok=False, to=query, detail=str(exc))
+    async def send_text(self, query: str, text: str, verify: bool = True) -> SendResult:
+        try:
+            await self.open_chat(query)
+        except DriverError as exc:
+            return SendResult(ok=False, to=query, detail=str(exc))
 
         _ts = time.monotonic()
         box = await _first_visible(self.page, S.MESSAGE_INPUT, timeout=8000)
@@ -843,44 +754,9 @@ class EitaaDriver:
         if box is None:
             return SendResult(ok=False, to=query, detail="message input not found")
 
-        # Focus the composer and type. A direct pointer click on the
-        # contenteditable is often reported as "intercepted" by its own
-        # wrapper (.new-message-wrapper), which wastes the whole click
-        # timeout. Focus programmatically first (fast + reliable for a
-        # contenteditable), type, then CONFIRM the text actually landed. Only
-        # if it did not do we fall back to a real click and retype -- so we
-        # never "send" an empty message.
-        try:
-            await box.evaluate("el => el.focus()")
-        except Exception:  # noqa: BLE001
-            pass
+        await box.click()
         await box.type(text, delay=5)
-        await self.page.wait_for_timeout(120)
-
-        try:
-            entered = await box.evaluate("el => (el.textContent || '').trim().length > 0")
-        except Exception:  # noqa: BLE001
-            entered = True
-        if not entered:
-            # Programmatic focus did not take; do a real click on the composer
-            # wrapper (a trusted gesture that focuses the inner input) and type
-            # again. Short bounded timeouts so we never hang.
-            clicked = False
-            for sel in [".new-message-wrapper .input-message-input",
-                        ".new-message-wrapper", ".input-message-input"]:
-                try:
-                    await self.page.locator(sel).first.click(timeout=2500)
-                    clicked = True
-                    break
-                except Exception:  # noqa: BLE001
-                    continue
-            if not clicked:
-                try:
-                    await box.click(timeout=2500)
-                except Exception:  # noqa: BLE001
-                    pass
-            await box.type(text, delay=5)
-            await self.page.wait_for_timeout(120)
+        await self.page.wait_for_timeout(150)
 
         sent = await self._click_send_or_enter(box)
         if not sent:
@@ -905,7 +781,6 @@ class EitaaDriver:
         query: str | None = None,
         to_saved: bool = False,
         as_photo: bool = False,
-        peer_id: str | None = None,
     ) -> SendResult:
         """Upload and send a file (optionally with a caption).
 
@@ -922,16 +797,7 @@ class EitaaDriver:
             if to_saved:
                 await self.open_saved_messages()
             else:
-                # Fast path first (direct peer_id), else proven search flow.
-                opened = False
-                if peer_id:
-                    try:
-                        opened = await self.open_chat_by_peer_id(
-                            peer_id, expect_title=query or "")
-                    except Exception:  # noqa: BLE001
-                        opened = False
-                if not opened:
-                    await self.open_chat(query or "")
+                await self.open_chat(query or "")
         except DriverError as exc:
             return SendResult(ok=False, to=target, detail=str(exc))
 
@@ -1006,7 +872,7 @@ class EitaaDriver:
         btn = await _first_visible(self.page, S.SEND_BUTTON, timeout=2500)
         if btn is not None:
             try:
-                await btn.click(timeout=2500)
+                await btn.click()
                 return True
             except Exception:  # noqa: BLE001
                 pass
