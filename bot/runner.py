@@ -20,7 +20,7 @@ from typing import Awaitable, Callable
 
 from config import config
 from capture.browser import open_session
-from eitaa.driver import EitaaDriver
+from eitaa.driver import EitaaDriver, SendResult
 from bot import cards
 
 Report = Callable[[str], Awaitable[None]]
@@ -160,46 +160,89 @@ class JobManager:
                                                   detail="account is not logged in"))
                     return
 
+                is_file = content.get("kind") == "file"
                 if recipients is None:
                     contacts = await driver.collect_all_contacts()
-                    recipients = [c.get("title", "") for c in contacts if c.get("title")]
+                    # Keep BOTH title and peer_id: peer_id drives the fast bridge
+                    # send (Eitaa's own engine, no UI), title is the search
+                    # fallback + failure label. Collecting also warms tweb's peer
+                    # cache so peer resolution works for the bridge.
+                    recipient_items = [
+                        (c.get("title", ""), c.get("peer_id"))
+                        for c in contacts if c.get("title")
+                    ]
                     # collect_all_contacts leaves the Contacts subview open;
                     # return to the main chat list before we start opening chats.
                     await driver._return_to_chat_list()
-                total = len(recipients)
+                else:
+                    # Externally-supplied recipients are plain names -> no peer_id,
+                    # so they use the proven UI flow unchanged.
+                    recipient_items = [(name, None) for name in recipients]
+                total = len(recipient_items)
                 await report(cards.send_started(account, kind, total, delay))
+
+                # Pre-warm the bridge once (text campaigns only; files use the UI).
+                if not is_file:
+                    await driver.ensure_bridge()
 
                 consecutive_failures = 0
                 error_cards = 0
-                where = "send_file" if content.get("kind") == "file" else "send_text"
-                for i, name in enumerate(recipients, start=1):
+                where = "send_file" if is_file else "send_text"
+                text_body = content.get("text", "")
+                for i, (name, peer_id) in enumerate(recipient_items, start=1):
                     if job.stop:
                         break
                     limited = False
                     try:
-                        if content.get("kind") == "file":
+                        if is_file:
+                            # Files still go through the UI (the bridge send here
+                            # is text-only for now).
                             res = await driver.send_file(
                                 content.get("file_path", ""),
                                 caption=content.get("caption", ""),
                                 query=name,
                             )
                         else:
-                            res = await driver.send_text(name, content.get("text", ""), verify=True)
-                        if res.ok:
+                            res = None
+                            # Fast path: send via Eitaa's own engine using peer_id.
+                            if peer_id:
+                                b = await driver.bridge_send(peer_id, text_body)
+                                if b.get("limit"):
+                                    # Server itself reported a flood/limit.
+                                    await report(cards.restriction_card(
+                                        account, f"server: {b.get('code')}", sent))
+                                    limited = True
+                                elif b.get("ok"):
+                                    res = SendResult(
+                                        ok=True, to=name,
+                                        detail=f"bridge/{b.get('method')} id={b.get('msg_id')}")
+                                else:
+                                    print(f"[send] bridge miss for {name[:18]!r} "
+                                          f"({b.get('code')}); UI fallback", flush=True)
+                            # Fallback: proven UI send (also covers no-peer_id).
+                            if not limited and res is None:
+                                res = await driver.send_text(name, text_body, verify=True)
+
+                        if limited:
+                            # A server-reported limit was already surfaced above;
+                            # do not count it as a per-send failure.
+                            pass
+                        elif res is not None and res.ok:
                             sent += 1
                             consecutive_failures = 0
                         else:
                             failed += 1
                             consecutive_failures += 1
+                            detail = res.detail if res is not None else "send produced no result"
                             # Surface EXACTLY why the send failed (capped to
                             # avoid spam; the brake stops us after a few anyway).
                             if error_cards < 12:
                                 await report(cards.error_card(
                                     where, account, target=name, code="send_failed",
-                                    detail=res.detail, trace_id=job.job_id))
+                                    detail=detail, trace_id=job.job_id))
                                 error_cards += 1
-                            if _is_limit(res.detail):
-                                await report(cards.restriction_card(account, res.detail, sent))
+                            if _is_limit(detail):
+                                await report(cards.restriction_card(account, detail, sent))
                                 limited = True
                     except Exception as exc:  # noqa: BLE001
                         failed += 1

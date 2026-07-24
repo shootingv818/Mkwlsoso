@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Awaitable, Callable, Optional
 
 from playwright.async_api import Locator, Page, TimeoutError as PWTimeout
@@ -22,6 +23,14 @@ from playwright.async_api import Locator, Page, TimeoutError as PWTimeout
 from config import config
 from capture.browser import BrowserSession
 from eitaa import selectors as S
+
+
+# Source of the in-page bridge send function (window.__MKWL_send). Loaded once
+# at import; injected on demand by EitaaDriver.ensure_bridge().
+try:
+    _BRIDGE_SEND_SRC = (Path(__file__).with_name("bridge_send.js")).read_text(encoding="utf-8")
+except Exception:  # noqa: BLE001
+    _BRIDGE_SEND_SRC = ""
 
 
 class DriverError(Exception):
@@ -741,6 +750,46 @@ class EitaaDriver:
         print(f"[timing] open_chat({query!r}): find={t_find:.1f}s "
               f"results={time.monotonic()-_t1:.1f}s fallback={'Y' if used_fallback else 'N'} "
               f"total={time.monotonic()-_t0:.1f}s", flush=True)
+
+    async def ensure_bridge(self) -> bool:
+        """Make sure window.__MKWL_send is defined in the page.
+
+        Injected on demand (idempotent) so callers don't have to thread an
+        init script through session creation. Returns True if the bridge send
+        function is available.
+        """
+        try:
+            has = await self.page.evaluate("() => typeof window.__MKWL_send === 'function'")
+        except Exception:  # noqa: BLE001
+            has = False
+        if has:
+            return True
+        if not _BRIDGE_SEND_SRC:
+            return False
+        try:
+            await self.page.evaluate(_BRIDGE_SEND_SRC)  # IIFE defines window.__MKWL_send
+            return await self.page.evaluate("() => typeof window.__MKWL_send === 'function'")
+        except Exception:  # noqa: BLE001
+            return False
+
+    async def bridge_send(self, peer_id: str, text: str) -> dict:
+        """Send `text` to `peer_id` through Eitaa's own engine (no UI).
+
+        Returns the raw result dict from window.__MKWL_send:
+        {ok, method, msg_id, limit, code, detail}. Never raises.
+        """
+        if not peer_id:
+            return {"ok": False, "code": "no peer_id"}
+        if not await self.ensure_bridge():
+            return {"ok": False, "code": "bridge unavailable"}
+        try:
+            res = await self.page.evaluate(
+                "(a) => window.__MKWL_send(a.p, a.t)",
+                {"p": str(peer_id), "t": text},
+            )
+            return res if isinstance(res, dict) else {"ok": False, "code": "bad bridge result"}
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "code": f"bridge evaluate error: {exc}"}
 
     async def send_text(self, query: str, text: str, verify: bool = True) -> SendResult:
         try:

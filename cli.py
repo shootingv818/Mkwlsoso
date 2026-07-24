@@ -258,6 +258,59 @@ async def cmd_bridge_send(account: str) -> int:
     return 0
 
 
+async def cmd_bridge_real(account: str, peer: str | None, text: str | None) -> int:
+    """Send ONE real message through the bridge (driver.bridge_send).
+
+    With no --peer it defaults to the account's own Saved Messages (self id),
+    so it is safe to run. Prints the method used and the server message id,
+    verifying the exact fast-send path before trusting it in a campaign.
+    """
+    import time as _time
+    config.ensure_dirs()
+    text = text or f"MKWL bridge real test {int(_time.time())}"
+    async with open_session(account) as session:
+        await session.goto()
+        driver = EitaaDriver(session)
+        await driver.open()
+        if not await driver.is_logged_in():
+            print("[bridge-real] not logged in. run: python cli.py login --account", account)
+            return 2
+
+        if not peer:
+            # Default to self (Saved Messages) so the test bothers nobody.
+            try:
+                peer = await session.page.evaluate(
+                    """() => {
+                        try { if (window.appPeersManager && window.appPeersManager.peerId != null)
+                                return String(window.appPeersManager.peerId); } catch (e) {}
+                        try { if (window.appImManager && window.appImManager.myId != null)
+                                return String(window.appImManager.myId); } catch (e) {}
+                        try { if (window.appUsersManager && window.appUsersManager.getSelf) {
+                                const s = window.appUsersManager.getSelf();
+                                if (s) return String(s.id != null ? s.id : s); } } catch (e) {}
+                        return null;
+                    }"""
+                )
+            except Exception:  # noqa: BLE001
+                peer = None
+            if not peer:
+                print("[bridge-real] could not detect self id; pass --peer <peer_id>")
+                return 2
+            print(f"[bridge-real] no --peer given; defaulting to self (Saved Messages) id={peer}")
+
+        res = await driver.bridge_send(peer, text)
+        print(f"[bridge-real] peer   : {peer}")
+        print(f"[bridge-real] result : {res}")
+        if res.get("ok"):
+            print(f"[bridge-real] ✅ SENT via {res.get('method')}  msg_id={res.get('msg_id')}")
+        elif res.get("limit"):
+            print(f"[bridge-real] 🚫 server limit: {res.get('code')}")
+        else:
+            print(f"[bridge-real] ❌ failed: {res.get('code')}  "
+                  f"(invoke_err={res.get('invoke_err')})")
+    return 0
+
+
 def cmd_extract(run_id: str) -> int:
     out = extract_run(run_id)
     print(f"[extract] params written: {out}")
@@ -790,6 +843,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_bsend.add_argument("--account", required=True)
 
+    p_breal = sub.add_parser(
+        "bridge-real",
+        help="send ONE real message via the bridge (defaults to your Saved Messages)",
+    )
+    p_breal.add_argument("--account", required=True)
+    p_breal.add_argument("--peer", default=None, help="peer_id target (default: self/Saved Messages)")
+    p_breal.add_argument("--text", default=None, help="message text (default: an auto test string)")
+
     p_ext = sub.add_parser("extract", help="mine MTProto params (DCs/api/layer/RSA) from a run's assets")
     p_ext.add_argument("--run", required=True)
 
@@ -879,6 +940,8 @@ def main(argv: list[str] | None = None) -> int:
         return asyncio.run(cmd_bridge(args.account, manual=args.manual))
     if args.command == "bridge-send":
         return asyncio.run(cmd_bridge_send(args.account))
+    if args.command == "bridge-real":
+        return asyncio.run(cmd_bridge_real(args.account, args.peer, args.text))
     if args.command == "extract":
         return cmd_extract(args.run)
     if args.command == "list":
