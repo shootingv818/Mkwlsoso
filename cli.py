@@ -665,43 +665,67 @@ async def cmd_bridge_reach(account: str, sample: int) -> int:
     return 0
 
 
-def cmd_direct_probe(session_path: str, url: str | None) -> int:
-    """First LIVE direct-client call: load an exported session and help.getConfig.
+def cmd_direct_probe(session_path: str | None, account: str | None, url: str | None) -> int:
+    """First LIVE direct-client call: help.getConfig with the reused auth_key.
 
-    No browser. Proves the headless client talks to Eitaa with the reused
-    auth_key. Prints the outcome or the exact error so we can adjust the
-    transport URL / schema.
+    No browser. Auto-finds the newest exported session for --account, then
+    tries each candidate Eitaa shard host (or --url) until one returns a
+    decryptable MTProto reply. Prints exactly what each host did so we can
+    pin the DC endpoint and confirm the transport is raw MTProto.
     """
-    from direct import session as dsession
+    from pathlib import Path as _Path
+    from direct import session as dsession, dc as dccfg, crypto
     from direct.client import DirectClient
-    from direct.errors import RpcError, DirectError
+    from direct.errors import RpcError, DirectError, SecurityError
+
+    # Resolve the session file.
+    if not session_path and account:
+        matches = sorted(config.ARTIFACTS_DIR.glob(f"sessions/{account}_*.json"))
+        if not matches:
+            print(f"[direct] no session found: run bridge-export-session --account {account}")
+            return 2
+        session_path = str(matches[-1])
+        print(f"[direct] using newest session: {session_path}")
+    if not session_path:
+        print("[direct] pass --account <name> or --session <file>")
+        return 2
 
     sess, report = dsession.load_export(session_path)
     print(f"[direct] session: {sess.describe()}")
-    print(f"[direct] loader report: {report}")
     if not sess.is_valid():
         print(f"[direct] session invalid; missing: {report.get('missing')}")
         return 2
+    print(f"[direct] auth_key_id (home dc {sess.dc_id}): {sess.auth_key_id.hex()}")
 
-    client = DirectClient(sess, url=url)
-    print(f"[direct] POST target: {client.url}  (api_id={client.api_id or 'MISSING'})")
-    print("[direct] sending help.getConfig ...")
-    try:
-        ev = client.get_config()
-        if ev.get("type") == "rpc_result":
-            body = ev.get("result") or b""
-            print(f"[direct] ✅ RPC RESULT: result_cid=0x{ev.get('result_cid', 0):08x} "
-                  f"({len(body)} bytes). The direct client TALKS TO EITAA. 🎉")
-        else:
-            print(f"[direct] got: {ev}")
-    except RpcError as exc:
-        print(f"[direct] rpc_error: {exc}  (protocol reached the server — schema/params to adjust)")
-    except DirectError as exc:
-        print(f"[direct] ❌ {type(exc).__name__}: {exc}")
-        print("[direct] If this is a transport/HTTP error, run direct-capture-transport")
-        print("[direct] to pin the real URL, then pass it with --url.")
-    except Exception as exc:  # noqa: BLE001
-        print(f"[direct] ❌ unexpected {type(exc).__name__}: {exc}")
+    urls = [url] if url else dccfg.candidate_urls(sess.dc_id)
+    print(f"[direct] trying {len(urls)} candidate endpoint(s)...")
+    for u in urls:
+        client = DirectClient(sess, url=u)
+        tag = f"[direct] {u}"
+        try:
+            ev = client.get_config()
+            if ev.get("type") == "rpc_result":
+                print(f"{tag}  ✅ RPC RESULT cid=0x{ev.get('result_cid', 0):08x} "
+                      f"({len(ev.get('result') or b'')} bytes)")
+                print("[direct] 🎉🎉 THE HEADLESS CLIENT TALKS TO EITAA. This is the DC endpoint.")
+                print(f"[direct] Lock it in: export MKWL_DC_HOSTS='{sess.dc_id}={u}'")
+                return 0
+            print(f"{tag}  ? no rpc_result: {ev}")
+        except SecurityError as exc:
+            print(f"{tag}  ✗ decrypt/auth mismatch ({exc}) — wrong DC or wrapped transport")
+        except RpcError as exc:
+            # Reached the server and it spoke MTProto back -> RIGHT endpoint!
+            print(f"{tag}  ⚠ rpc_error: {exc}")
+            print("[direct] (server answered in MTProto -> endpoint is correct; schema/params to adjust)")
+            print(f"[direct] Lock it in: export MKWL_DC_HOSTS='{sess.dc_id}={u}'")
+            return 0
+        except DirectError as exc:
+            print(f"{tag}  ✗ transport: {exc}")
+        except Exception as exc:  # noqa: BLE001
+            print(f"{tag}  ✗ {type(exc).__name__}: {exc}")
+    print("[direct] none of the candidate hosts returned MTProto.")
+    print("[direct] Likely the /eitaa/ POST body is wrapped (not raw MTProto) -> we then")
+    print("[direct] capture the WORKER request (CDP) to see the exact envelope.")
     return 0
 
 
@@ -1276,8 +1300,9 @@ def build_parser() -> argparse.ArgumentParser:
         "direct-probe",
         help="first LIVE direct-client call (help.getConfig) using an exported session",
     )
-    p_dprobe.add_argument("--session", required=True, help="path to artifacts/sessions/<acct>_*.json")
-    p_dprobe.add_argument("--url", default=None, help="override DC URL (from direct-capture-transport)")
+    p_dprobe.add_argument("--account", default=None, help="use the newest exported session for this account")
+    p_dprobe.add_argument("--session", default=None, help="explicit path to a session JSON")
+    p_dprobe.add_argument("--url", default=None, help="force a single DC URL (skip auto-try)")
 
     p_fsend = sub.add_parser(
         "bridge-file-send",
@@ -1394,7 +1419,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "direct-capture-transport":
         return asyncio.run(cmd_direct_capture_transport(args.account))
     if args.command == "direct-probe":
-        return cmd_direct_probe(args.session, args.url)
+        return cmd_direct_probe(args.session, args.account, args.url)
     if args.command == "bridge-file-send":
         return asyncio.run(cmd_bridge_file_send(args.account, args.peer, args.file))
     if args.command == "bridge-login":

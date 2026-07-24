@@ -19,17 +19,20 @@ from pathlib import Path
 
 LAYER = 135
 
-# Best-effort defaults. Eitaa shard subdomains seen in the earlier capture:
-# majid/ghasem/hossein/vahid/hadi.eitaa.com. The dc_id -> subdomain mapping and
-# the path are PINNED by the transport capture before we rely on them.
-DEFAULT_PATH = "/apiw1"
-DEFAULT_HOSTS = {
-    1: "eitaa.com",
-    2: "eitaa.com",
-    3: "eitaa.com",
-    4: "eitaa.com",
-    5: "eitaa.com",
-}
+# CONFIRMED from the transport capture: Eitaa POSTs to https://<shard>.eitaa.com/eitaa/
+# (path "/eitaa/"; hadi served media). The dc_id -> shard mapping is not known yet,
+# so the probe TRIES all known shards with the home-DC auth_key and keeps the one
+# that returns a decryptable MTProto reply.
+DEFAULT_PATH = "/eitaa/"
+EITAA_SHARD_HOSTS = ["majid", "ghasem", "hossein", "vahid", "hadi"]
+
+
+def candidate_urls(dc_id: int) -> list[str]:
+    """All URLs worth trying for this DC (env override wins)."""
+    override = _load_env_hosts().get(dc_id)
+    if override:
+        return [override]
+    return [f"https://{h}.eitaa.com{DEFAULT_PATH}" for h in EITAA_SHARD_HOSTS]
 
 
 def _load_env_hosts() -> dict:
@@ -49,12 +52,8 @@ def _load_env_hosts() -> dict:
 
 
 def dc_url(dc_id: int) -> str:
-    """Return the full https URL to POST MTProto payloads to for this DC."""
-    override = _load_env_hosts().get(dc_id)
-    if override:
-        return override
-    host = DEFAULT_HOSTS.get(dc_id, "eitaa.com")
-    return f"https://{host}{DEFAULT_PATH}"
+    """Return the primary URL to POST MTProto payloads to for this DC."""
+    return candidate_urls(dc_id)[0]
 
 
 def resolve_api_creds() -> tuple[int, str]:

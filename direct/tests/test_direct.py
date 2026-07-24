@@ -191,10 +191,11 @@ def test_transport_url():
     import os as _os
     from direct import dc
     _os.environ.pop("MKWL_DC_HOSTS", None)
-    _check("default dc url https", dc.dc_url(2).startswith("https://") and "/apiw" in dc.dc_url(2))
+    _check("default dc url https+/eitaa/", dc.dc_url(2).startswith("https://") and "/eitaa/" in dc.dc_url(2))
+    _check("candidate hosts = 5 shards", len(dc.candidate_urls(2)) == 5)
     _os.environ["MKWL_DC_HOSTS"] = "2=https://majid.eitaa.com/eitaa/,4=https://vahid.eitaa.com/eitaa/"
-    _check("env override dc2", dc.dc_url(2) == "https://majid.eitaa.com/eitaa/")
-    _check("env override dc4", dc.dc_url(4) == "https://vahid.eitaa.com/eitaa/")
+    _check("env override dc2", dc.candidate_urls(2) == ["https://majid.eitaa.com/eitaa/"])
+    _check("env override dc4", dc.candidate_urls(4) == ["https://vahid.eitaa.com/eitaa/"])
     _os.environ.pop("MKWL_DC_HOSTS", None)
     from direct.transport import HttpTransport
     t = HttpTransport("https://majid.eitaa.com/eitaa/")
