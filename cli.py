@@ -414,8 +414,18 @@ async def cmd_bridge_login(account: str, phone: str) -> int:
             print(f"[login] ❌ signIn failed: {si.get('code')}")
             return 0
 
-        print(f"[login] signIn OK (result={si.get('result')}). Reloading so Eitaa Web "
-              "picks up the session...")
+        print(f"[login] signIn OK (result={si.get('result')})")
+        print(f"[login] finalize steps : {si.get('finalize')}")
+        print(f"[login] auth probe     : {si.get('probe')}")
+
+        # First see if tweb switched to logged-in state LIVE (no reload).
+        await driver.page.wait_for_timeout(1500)
+        if await driver.is_logged_in():
+            print("[login] ✅✅ LOGGED IN via the bridge (recognized live, no reload). "
+                  "Profile saved -- no noVNC needed.")
+            return 0
+
+        print("[login] not logged-in live; reloading so Eitaa Web reloads the saved session...")
         try:
             await driver.page.reload(wait_until="domcontentloaded")
         except Exception:  # noqa: BLE001
@@ -423,13 +433,12 @@ async def cmd_bridge_login(account: str, phone: str) -> int:
         await driver.page.wait_for_timeout(6000)
 
         if await driver.is_logged_in():
-            print("[login] ✅✅ LOGGED IN via the bridge and Eitaa Web recognizes it. "
+            print("[login] ✅✅ LOGGED IN via the bridge (after reload). "
                   "Profile saved -- no noVNC needed.")
         else:
-            print("[login] ⚠️ signIn succeeded but the Eitaa Web UI didn't show logged-in "
-                  "after reload.")
-            print("[login]   (The DC is authorized; tweb may need extra state. Paste this "
-                  "output so we can adjust the last step.)")
+            print("[login] ⚠️ signIn + finalize done, but the UI still isn't logged-in.")
+            print("[login]   Paste the 'auth probe' + 'finalize steps' lines above so we can")
+            print("[login]   call the exact state method this Eitaa build uses.")
     return 0
 
 
