@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -61,6 +62,10 @@ class Session:
     user_id: int = 0
     server_address: str = ""
     server_port: int = 443
+    # All DCs whose auth keys tweb had stored (dc_id -> 256-byte key / 8-byte salt).
+    # dc_id/auth_key/server_salt above are the HOME DC's, taken from these.
+    auth_keys_by_dc: dict = field(default_factory=dict)
+    salts_by_dc: dict = field(default_factory=dict)
     # extra fields we captured but don't model yet (kept for debugging)
     extra: dict = field(default_factory=dict)
 
@@ -87,6 +92,10 @@ class Session:
             "user_id": self.user_id,
             "server_address": self.server_address,
             "server_port": self.server_port,
+            "auth_keys_by_dc": {str(k): base64.b64encode(v).decode()
+                                for k, v in self.auth_keys_by_dc.items()},
+            "salts_by_dc": {str(k): base64.b64encode(v).decode()
+                            for k, v in self.salts_by_dc.items()},
         }
 
     @classmethod
@@ -101,17 +110,94 @@ class Session:
         )
 
 
-def load_export(path: str | Path) -> tuple[Session, dict]:
-    """Load a raw session export and best-effort assemble a Session.
+_AUTH_KEY_RE = re.compile(r"^dc(\d+)_auth_key$")
+_SALT_RE = re.compile(r"^dc(\d+)_server_salt$")
 
-    Returns (session, report) where report explains what was found/missing so
-    we can pin the exact tweb IndexedDB keys from a real export.
+
+def load_export(path: str | Path) -> tuple[Session, dict]:
+    """Load a raw session export and assemble a Session.
+
+    Pinned to the confirmed Eitaa/tweb layout: the session lives in
+    localStorage as `dc` (home dc), `user_auth` ({dcID,id}), and per-DC
+    `dc<N>_auth_key` (512-hex = 256 bytes) + `dc<N>_server_salt` (16-hex =
+    8 bytes). Falls back to a flat IndexedDB scan if localStorage lacks them.
+    Returns (session, report).
     """
     raw = json.loads(Path(path).read_text(encoding="utf-8"))
-    report: dict = {"found": {}, "missing": [], "dc_keys": []}
+    ls = raw.get("localStorage") if isinstance(raw, dict) else None
+    if isinstance(ls, dict) and any(_AUTH_KEY_RE.match(str(k)) for k in ls):
+        return _load_from_localstorage(ls, raw)
+    return _load_flat(raw)
 
-    # The exporter returns a flat dict of "store/key" -> value plus a
-    # convenience "flat" map. We scan for auth-key-shaped values (256 bytes).
+
+def _load_from_localstorage(ls: dict, raw: dict) -> tuple[Session, dict]:
+    report: dict = {"source": "localStorage", "found": {}, "missing": [], "dcs_with_keys": []}
+
+    home_dc = 0
+    try:
+        home_dc = int(ls.get("dc") or 0)
+    except (TypeError, ValueError):
+        pass
+
+    user_id = 0
+    ua = ls.get("user_auth")
+    if isinstance(ua, str):
+        try:
+            ua = json.loads(ua)
+        except Exception:  # noqa: BLE001
+            ua = None
+    if isinstance(ua, dict):
+        try:
+            user_id = int(ua.get("id") or 0)
+        except (TypeError, ValueError):
+            pass
+        if not home_dc:
+            try:
+                home_dc = int(ua.get("dcID") or 0)
+            except (TypeError, ValueError):
+                pass
+
+    auth_keys: dict[int, bytes] = {}
+    salts: dict[int, bytes] = {}
+    for k, v in ls.items():
+        mk = _AUTH_KEY_RE.match(str(k))
+        if mk and isinstance(v, str):
+            b = _to_bytes(v)
+            if b and len(b) == 256:
+                auth_keys[int(mk.group(1))] = b
+                continue
+        ms = _SALT_RE.match(str(k))
+        if ms and isinstance(v, str):
+            sb = _to_bytes(v)
+            if sb and len(sb) == 8:
+                salts[int(ms.group(1))] = sb
+
+    report["dcs_with_keys"] = sorted(auth_keys.keys())
+    report["found"] = {"home_dc": home_dc, "user_id": user_id,
+                       "dcs": sorted(auth_keys.keys()), "salts": sorted(salts.keys())}
+
+    sess = Session(
+        dc_id=home_dc,
+        auth_key=auth_keys.get(home_dc, b""),
+        server_salt=salts.get(home_dc, b""),
+        user_id=user_id,
+        auth_keys_by_dc=auth_keys,
+        salts_by_dc=salts,
+        extra={"eitaa_auth": ls.get("eitaa_auth"), "token": bool(ls.get("token")),
+               "imei": bool(ls.get("imei")), "state_id": ls.get("state_id")},
+    )
+    if not sess.auth_key:
+        report["missing"].append(f"auth_key for home dc {home_dc}")
+    if not sess.user_id:
+        report["missing"].append("user_id")
+    if not sess.dc_id:
+        report["missing"].append("home dc")
+    return sess, report
+
+
+def _load_flat(raw: Any) -> tuple[Session, dict]:
+    """Fallback: scan a flat IndexedDB/localStorage map for auth-shaped values."""
+    report: dict = {"source": "flat-scan", "found": {}, "missing": [], "dc_keys": []}
     flat: dict = {}
     if isinstance(raw, dict):
         flat.update(raw.get("localStorage") or {})
@@ -120,7 +206,6 @@ def load_export(path: str | Path) -> tuple[Session, dict]:
                 if isinstance(entries, dict):
                     for k, v in entries.items():
                         flat[f"{store}/{k}"] = v
-    flat.update(raw if isinstance(raw, dict) else {})
 
     best_key: bytes | None = None
     best_dc = 0
@@ -131,24 +216,19 @@ def load_export(path: str | Path) -> tuple[Session, dict]:
         kl = str(k).lower()
         if b and len(b) == 256 and ("auth" in kl or best_key is None):
             best_key = b
-            report["found"][str(k)] = "auth_key(256B)"
             report["dc_keys"].append(str(k))
-            # dc id often embedded in the key name, e.g. dc2_auth_key
             for ch in str(k):
                 if ch.isdigit():
                     best_dc = best_dc or int(ch)
-        if "user" in kl and "auth" in kl:
+        if "user" in kl and "auth" in kl and isinstance(v, dict) and v.get("id"):
             try:
-                if isinstance(v, dict) and v.get("id"):
-                    user_id = int(v["id"])
-                    report["found"]["user_auth"] = user_id
+                user_id = int(v["id"])
             except Exception:  # noqa: BLE001
                 pass
         if "salt" in kl:
             sb = _to_bytes(v)
             if sb and len(sb) == 8:
                 salt = sb
-                report["found"][str(k)] = "server_salt(8B)"
 
     sess = Session(dc_id=best_dc, auth_key=best_key or b"", server_salt=salt, user_id=user_id)
     if not sess.auth_key:

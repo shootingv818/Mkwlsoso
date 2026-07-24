@@ -92,26 +92,41 @@ def test_tl_roundtrip():
 
 def test_session_loader(tmp_path="/tmp/_mkwl_sess.json"):
     import json
-    ak_hex = "ab" * 256           # 256-byte auth key as 512 hex chars
+    # The CONFIRMED Eitaa/tweb layout: session in localStorage, per-DC auth
+    # keys as 512-hex strings, salts as 16-hex strings, user_auth as a dict.
+    # (dummy key bytes here -- the real auth_key never leaves the server.)
     export = {
-        "localStorage": {"dc": 2, "user_auth": {"id": 50267193, "dcID": 2}},
-        "indexeddb": {"tweb": {"stores": {
-            "session": {
-                "dc2_auth_key": ak_hex,
-                "dc2_server_salt": {"__hex": "1122334455667788", "__len": 8},
-            }
-        }}},
+        "localStorage": {
+            "dc": 2,
+            "user_auth": {"dcID": 2, "date": 1784581460, "id": 777000},
+            "dc1_auth_key": "cd" * 256,
+            "dc1_server_salt": "b7304c2e7cf08c82",
+            "dc2_auth_key": "ab" * 256,
+            "dc2_server_salt": "b7304c2e7cf08c82",
+            "dc4_auth_key": "ef" * 256,
+            "eitaa_auth": "x", "token": "y", "imei": "z", "state_id": "123",
+        },
+        "indexeddb": {"tweb": {"stores": {}, "skipped": {"users": 1493}}},
         "hints": {},
     }
     from pathlib import Path
     Path(tmp_path).write_text(json.dumps(export), encoding="utf-8")
     sess, report = session.load_export(tmp_path)
-    _check("loader found 256B auth_key", len(sess.auth_key) == 256)
-    _check("loader found user_id", sess.user_id == 50267193)
-    _check("loader found dc", sess.dc_id == 2)
-    _check("loader found salt", len(sess.server_salt) == 8)
-    _check("session json round-trip",
-           session.Session.from_json(sess.to_json()).auth_key == sess.auth_key)
+    _check("loader source is localStorage", report.get("source") == "localStorage")
+    _check("home dc = 2", sess.dc_id == 2)
+    _check("home auth_key 256B", len(sess.auth_key) == 256)
+    _check("home auth_key is dc2", sess.auth_key == bytes.fromhex("ab" * 256))
+    _check("user_id from user_auth dict", sess.user_id == 777000)
+    _check("home salt 8B", len(sess.server_salt) == 8)
+    _check("multi-dc keys captured (1,2,4)", sorted(sess.auth_keys_by_dc) == [1, 2, 4])
+    _check("session valid", sess.is_valid())
+    rt = session.Session.from_json(sess.to_json())
+    _check("json round-trip auth_key", rt.auth_key == sess.auth_key)
+    # user_auth may also arrive as a JSON string -> must still parse.
+    export["localStorage"]["user_auth"] = json.dumps({"dcID": 2, "id": 888})
+    Path(tmp_path).write_text(json.dumps(export), encoding="utf-8")
+    sess2, _ = session.load_export(tmp_path)
+    _check("user_auth JSON-string parsed", sess2.user_id == 888)
     os.remove(tmp_path)
 
 
