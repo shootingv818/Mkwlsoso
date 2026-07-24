@@ -543,10 +543,18 @@ async def cmd_bridge_export_session(account: str) -> int:
         idb = exp.get("indexeddb") or {}
         print("[export] ===== SESSION EXPORT =====")
         print(f"[export] saved (full, gitignored): {out_path}")
-        print(f"[export] localStorage keys : {len(exp.get('localStorage') or {})}")
-        dbs = [f"{name}({sum(len(s) for s in (db.get('stores') or {}).values())} entries)"
-               for name, db in idb.items() if (db.get('stores'))]
-        print(f"[export] indexeddb w/ data  : {dbs or 'none'}")
+        print(f"[export] localStorage keys : {sorted((exp.get('localStorage') or {}).keys())}")
+        # Non-bulk stores: show their KEY names (this is where auth lives).
+        for name, db in idb.items():
+            stores = db.get("stores") or {}
+            skipped = db.get("skipped") or {}
+            for sname, entries in stores.items():
+                keys = sorted(entries.keys())
+                if keys:
+                    print(f"[export] idb {name}/{sname} keys: {keys[:40]}")
+            if skipped:
+                print(f"[export] idb {name} skipped(bulk): "
+                      + ", ".join(f"{k}={v}" for k, v in skipped.items()))
         print(f"[export] auth_key candidates: {hints.get('auth_keys') or 'NONE FOUND'}")
         print(f"[export] server_salt (8B)   : {hints.get('salts') or 'none'}")
         print(f"[export] user id paths      : {hints.get('user_ids') or 'none'}")
