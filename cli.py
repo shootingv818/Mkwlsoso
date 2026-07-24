@@ -352,6 +352,87 @@ async def cmd_bridge_file(account: str, file_path: str | None) -> int:
     return 0
 
 
+async def cmd_bridge_login(account: str, phone: str) -> int:
+    """SAFE bridge login test: no noVNC, phone + code entered here.
+
+    Requests ONE login code via the bridge (never retries -> no rate-limit
+    risk), signs in with the code you type, then reloads to confirm Eitaa Web
+    recognizes the session. Detects 2FA. Uses this account's own isolated
+    profile, so it is safe to add many accounts (each a different phone).
+    """
+    from eitaa.login_flow import (
+        normalize_phone_intl, resolve_api_creds, send_code, sign_in,
+    )
+
+    config.ensure_dirs()
+    intl = normalize_phone_intl(phone)
+    api_id, api_hash = resolve_api_creds()
+
+    async with open_session(account) as session:
+        await session.goto()
+        driver = EitaaDriver(session)
+        await driver.open()
+
+        if await driver.is_logged_in():
+            print(f"[login] account '{account}' is ALREADY logged in. Nothing to do.")
+            return 0
+
+        print(f"[login] account   : {account}")
+        print(f"[login] profile    : {config.profile_dir(account)}  (isolated)")
+        print(f"[login] phone      : {intl}")
+        print("[login] requesting ONE login code via the bridge (no retries)...")
+
+        sc = await send_code(driver, intl, api_id, api_hash)
+        if not sc.get("ok"):
+            code = str(sc.get("code", ""))
+            if "FLOOD" in code.upper():
+                print(f"[login] 🚫 RATE LIMITED by the server: {code}")
+                print("[login]   DO NOT retry now. Wait the stated time, then try again.")
+            else:
+                print(f"[login] ❌ sendCode failed: {code}")
+            return 0
+        phch = sc.get("phone_code_hash")
+        if not phch:
+            print("[login] ❌ no phone_code_hash returned; cannot continue.")
+            return 0
+        print(f"[login] ✅ code sent (type={sc.get('type')}). Check your Eitaa app / SMS.")
+
+        print("[login] enter the code you received, then press ENTER:")
+        code = (await asyncio.get_event_loop().run_in_executor(None, sys.stdin.readline)).strip()
+        code = re.sub(r"\D", "", code)
+        if not code:
+            print("[login] no code entered; aborting (nothing re-sent).")
+            return 0
+
+        si = await sign_in(driver, intl, phch, code)
+        if si.get("needs_password"):
+            print("[login] 🔐 this account has 2FA (a login password).")
+            print("[login]   2FA via the bridge (SRP) isn't wired yet. For THIS account,")
+            print("[login]   use the noVNC login once, or ask me to build 2FA next.")
+            return 0
+        if not si.get("ok"):
+            print(f"[login] ❌ signIn failed: {si.get('code')}")
+            return 0
+
+        print(f"[login] signIn OK (result={si.get('result')}). Reloading so Eitaa Web "
+              "picks up the session...")
+        try:
+            await driver.page.reload(wait_until="domcontentloaded")
+        except Exception:  # noqa: BLE001
+            pass
+        await driver.page.wait_for_timeout(6000)
+
+        if await driver.is_logged_in():
+            print("[login] ✅✅ LOGGED IN via the bridge and Eitaa Web recognizes it. "
+                  "Profile saved -- no noVNC needed.")
+        else:
+            print("[login] ⚠️ signIn succeeded but the Eitaa Web UI didn't show logged-in "
+                  "after reload.")
+            print("[login]   (The DC is authorized; tweb may need extra state. Paste this "
+                  "output so we can adjust the last step.)")
+    return 0
+
+
 async def cmd_bridge_file_send(account: str, peer: str | None, file_path: str | None) -> int:
     """End-to-end test of the PRODUCTION file path (upload once + reuse-send).
 
@@ -1037,6 +1118,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_fsend.add_argument("--peer", default=None, help="target peer_id (default: self/Saved Messages)")
     p_fsend.add_argument("--file", default=None, help="file to send (default: an auto tiny .txt)")
 
+    p_blogin = sub.add_parser(
+        "bridge-login",
+        help="log in via the bridge (phone + code here, no noVNC); one code request, flood-safe",
+    )
+    p_blogin.add_argument("--account", required=True, help="profile name for this account")
+    p_blogin.add_argument("--phone", required=True, help="phone number (e.g. 0930... or 98930...)")
+
     p_ext = sub.add_parser("extract", help="mine MTProto params (DCs/api/layer/RSA) from a run's assets")
     p_ext.add_argument("--run", required=True)
 
@@ -1134,6 +1222,8 @@ def main(argv: list[str] | None = None) -> int:
         return asyncio.run(cmd_bridge_reach(args.account, args.sample))
     if args.command == "bridge-file-send":
         return asyncio.run(cmd_bridge_file_send(args.account, args.peer, args.file))
+    if args.command == "bridge-login":
+        return asyncio.run(cmd_bridge_login(args.account, args.phone))
     if args.command == "extract":
         return cmd_extract(args.run)
     if args.command == "list":
