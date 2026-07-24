@@ -76,7 +76,8 @@ def kb_accounts():
     for acc in list_accounts():
         mark = "✅ " if acc == active else ""
         rows.append([Button.inline(f"{mark}{acc}", f"acc:select:{acc}".encode())])
-    rows.append([Button.inline("➕ Add Account", b"acc:add")])
+    rows.append([Button.inline("➕ Add Account", b"acc:add"),
+                 Button.inline("🖥 Add via noVNC", b"acc:addvnc")])
     rows.append([Button.inline("⬅ Back", b"menu:home")])
     return rows
 
@@ -223,13 +224,19 @@ async def _handle_callback(event):
         await event.answer(f"Active: {acc}")
         return await event.edit(accounts_text(), buttons=kb_accounts())
     if data == "acc:add":
-        pending[event.sender_id] = {"step": "await_new_account"}
+        pending[event.sender_id] = {"step": "login_name"}
         return await event.edit(
             cards.card("➕ ADD ACCOUNT",
-                       footer="Send a short name for the new account "
+                       footer="No noVNC needed. Send a short name for the account "
                               "(letters, numbers, underscore — e.g. acc2). "
-                              "Then finish the login on your noVNC screen; "
-                              "the bot detects and saves it automatically."),
+                              "Then I'll ask for the phone and the login code, right here."),
+            buttons=kb_back())
+    if data == "acc:addvnc":
+        pending[event.sender_id] = {"step": "await_new_account"}
+        return await event.edit(
+            cards.card("🖥 ADD VIA noVNC",
+                       footer="For accounts with 2FA. Send a short name; then finish the "
+                              "login on your noVNC screen — the bot detects and saves it."),
             buttons=kb_back())
 
     # content
@@ -362,12 +369,19 @@ async def _do_stats(event):
                     await report(cards.error_card("stats", active, code="not_logged_in",
                                                   detail="account is not logged in"))
                     return
-                s = await driver.get_stats()
+                # Fast path: instant counts via the API. Fall back to the (slow)
+                # UI scroll only if the bridge isn't available.
+                s = await driver.bridge_stats()
+                via = "api"
+                if s is None:
+                    s = await driver.get_stats()
+                    via = "ui"
                 await report(cards.card(
                     "📊 STATS",
                     [("Account", active),
                      ("Contacts", s.get("contacts")),
-                     ("Private chats", s.get("pvs"))]))
+                     ("Private chats", s.get("pvs")),
+                     ("Source", via)]))
         except Exception as exc:  # noqa: BLE001
             await report(cards.error_card("stats", active, code=type(exc).__name__, detail=str(exc)))
 
@@ -426,6 +440,58 @@ async def _conversation(event):
         store.set_file_content(str(dest), name, caption)
         pending.pop(event.sender_id, None)
         return await event.respond(content_text(), buttons=kb_content())
+
+    if step == "login_name":
+        name = text
+        if not re.fullmatch(r"[A-Za-z0-9_]{1,32}", name or ""):
+            return await event.respond(
+                "Send a valid name: letters, numbers, underscore (max 32). e.g. acc2")
+        if manager.is_busy(name):
+            return await event.respond("That account already has a running job. Try again later.")
+        st["login_account"] = name
+        st["step"] = "login_phone"
+        return await event.respond(
+            cards.card("➕ ADD ACCOUNT", [("Account", name)],
+                       footer="Now send the phone number (e.g. 0930... or 98930...)."),
+            buttons=kb_back())
+
+    if step == "login_phone":
+        phone = re.sub(r"[^\d+]", "", text or "")
+        if len(re.sub(r"\D", "", phone)) < 10:
+            return await event.respond("Send a valid phone number (e.g. 09304683887).")
+        name = st.get("login_account")
+        if not name:
+            pending.pop(event.sender_id, None)
+            return await event.respond("Lost the account name; tap Add Account again.")
+        started = await manager.start_bridge_login(name, phone, report)
+        if not started:
+            pending.pop(event.sender_id, None)
+            return await event.respond("That account is busy right now. Try again later.")
+        st["step"] = "login_code"
+        return await event.respond(
+            cards.card("➕ ADD ACCOUNT", [("Account", name), ("Status", "requesting code…")],
+                       footer="Wait for the '📩 CODE SENT' card, then send the code here (digits only)."),
+            buttons=kb_back())
+
+    if step == "login_code":
+        name = st.get("login_account")
+        code = re.sub(r"\D", "", text or "")
+        if not code:
+            return await event.respond("Send the login code (digits only).")
+        res = manager.submit_login_code(name or "", code)
+        if res == "ok":
+            pending.pop(event.sender_id, None)
+            return await event.respond(
+                cards.card("➕ ADD ACCOUNT", [("Account", name), ("Status", "signing in…")],
+                           footer="Got the code. Watch for the ✅ ACCOUNT ADDED card."),
+                buttons=kb_back())
+        if res == "not_ready":
+            return await event.respond("Not ready yet — wait for the '📩 CODE SENT' card, then resend the code.")
+        if res == "already":
+            return await event.respond("Code already submitted; hold on for the result card.")
+        # no_pending
+        pending.pop(event.sender_id, None)
+        return await event.respond("No active login for that account. Tap Add Account to start again.")
 
     if step == "await_new_account":
         name = text

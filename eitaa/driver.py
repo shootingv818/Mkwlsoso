@@ -44,6 +44,12 @@ try:
 except Exception:  # noqa: BLE001
     _BRIDGE_CONTACTS_SRC = ""
 
+# Source of the in-page stats bridge (window.__MKWL_stats).
+try:
+    _BRIDGE_STATS_SRC = (Path(__file__).with_name("stats_bridge.js")).read_text(encoding="utf-8")
+except Exception:  # noqa: BLE001
+    _BRIDGE_STATS_SRC = ""
+
 
 class DriverError(Exception):
     pass
@@ -870,6 +876,34 @@ class EitaaDriver:
             return res if isinstance(res, dict) else {"ok": False, "code": "bad send result"}
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "code": f"file send evaluate error: {exc}"}
+
+    async def ensure_stats_bridge(self) -> bool:
+        """Make sure window.__MKWL_stats is defined."""
+        try:
+            has = await self.page.evaluate("() => typeof window.__MKWL_stats === 'function'")
+        except Exception:  # noqa: BLE001
+            has = False
+        if has:
+            return True
+        if not _BRIDGE_STATS_SRC:
+            return False
+        try:
+            await self.page.evaluate(_BRIDGE_STATS_SRC)
+            return await self.page.evaluate("() => typeof window.__MKWL_stats === 'function'")
+        except Exception:  # noqa: BLE001
+            return False
+
+    async def bridge_stats(self) -> dict | None:
+        """Instant stats via the API: {contacts, pvs}. None if unavailable."""
+        if not await self.ensure_stats_bridge():
+            return None
+        try:
+            res = await self.page.evaluate("() => window.__MKWL_stats()")
+        except Exception:  # noqa: BLE001
+            return None
+        if isinstance(res, dict) and res.get("ok"):
+            return {"contacts": res.get("contacts", -1), "pvs": res.get("pvs", -1)}
+        return None
 
     async def ensure_contacts_bridge(self) -> bool:
         """Make sure window.__MKWL_importContacts is defined."""

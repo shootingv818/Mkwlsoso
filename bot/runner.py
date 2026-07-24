@@ -89,12 +89,22 @@ class Job:
     summary: dict = field(default_factory=dict)
 
 
+@dataclass
+class LoginState:
+    """Tracks an in-progress bridge login waiting for the user's code."""
+    account: str
+    phone: str
+    code_future: asyncio.Future
+    stage: str = "sending"   # sending | awaiting_code | done
+
+
 class JobManager:
     """Tracks running jobs and enforces one job per account at a time."""
 
     def __init__(self) -> None:
         self._jobs: dict[str, Job] = {}
         self._busy: set[str] = set()
+        self._logins: dict[str, LoginState] = {}
 
     def is_busy(self, account: str) -> bool:
         return account in self._busy
@@ -207,6 +217,136 @@ class JobManager:
             await report(cards.error_card(
                 "login", account, code=type(exc).__name__, detail=str(exc)))
         finally:
+            self._busy.discard(account)
+
+    # ---- bridge login (no noVNC: phone + code in Telegram) ----
+    async def start_bridge_login(self, account: str, phone: str, report: Report) -> bool:
+        """Begin a no-noVNC login: send the code, then wait for the user's code.
+
+        Returns False if the account is busy. The code is delivered later via
+        submit_login_code().
+        """
+        if account in self._busy:
+            return False
+        self._busy.add(account)
+        asyncio.create_task(self._bridge_login_job(account, phone, report))
+        return True
+
+    def login_stage(self, account: str) -> str | None:
+        st = self._logins.get(account)
+        return st.stage if st else None
+
+    def submit_login_code(self, account: str, code: str) -> str:
+        """Hand a received code to a waiting bridge-login job."""
+        st = self._logins.get(account)
+        if not st:
+            return "no_pending"
+        if st.stage != "awaiting_code":
+            return "not_ready"
+        if st.code_future.done():
+            return "already"
+        st.code_future.set_result(code)
+        return "ok"
+
+    async def _bridge_login_job(self, account: str, phone: str, report: Report) -> None:
+        from capture.browser import open_session
+        from eitaa.driver import EitaaDriver
+        from eitaa.login_flow import (
+            normalize_phone_intl, resolve_api_creds, send_code, sign_in,
+        )
+
+        state = LoginState(account, phone, asyncio.get_event_loop().create_future())
+        self._logins[account] = state
+        api_id, api_hash = resolve_api_creds()
+        intl = normalize_phone_intl(phone)
+        try:
+            async with open_session(account) as session:
+                await session.goto()
+                driver = EitaaDriver(session)
+                await driver.open()
+
+                if await driver.is_logged_in():
+                    await report(cards.card(
+                        "👤 ACCOUNT READY",
+                        [("Account", account), ("Status", "already logged in")]))
+                    return
+
+                sc = await send_code(driver, intl, api_id, api_hash)
+                if not sc.get("ok"):
+                    code = str(sc.get("code", ""))
+                    if "FLOOD" in code.upper():
+                        await report(cards.card(
+                            "🚫 RATE LIMITED",
+                            [("Account", account), ("Phone", intl), ("Server", code)],
+                            footer="Too many code requests. Wait the stated time, don't retry now."))
+                    else:
+                        await report(cards.error_card(
+                            "login_sendcode", account, code="sendCode", detail=code))
+                    return
+
+                phch = sc.get("phone_code_hash")
+                if not phch:
+                    await report(cards.error_card(
+                        "login_sendcode", account, code="no_hash",
+                        detail="server returned no phone_code_hash"))
+                    return
+
+                state.stage = "awaiting_code"
+                await report(cards.card(
+                    "📩 CODE SENT",
+                    [("Account", account), ("Phone", intl)],
+                    footer="Send me the login code here (digits only). "
+                           "Never share your code anywhere else."))
+
+                try:
+                    code = await asyncio.wait_for(state.code_future, timeout=300)
+                except asyncio.TimeoutError:
+                    await report(cards.card(
+                        "⌛ LOGIN TIMEOUT",
+                        [("Account", account)],
+                        footer="No code received in time. Tap Add Account to try again."))
+                    return
+
+                si = await sign_in(driver, intl, phch, code)
+                if si.get("needs_password"):
+                    await report(cards.card(
+                        "🔐 2FA REQUIRED",
+                        [("Account", account)],
+                        footer="This account has a login password (2FA). Add it via the "
+                               "noVNC button for now, or ask to build 2FA."))
+                    return
+                if not si.get("ok"):
+                    await report(cards.error_card(
+                        "login_signin", account, code="signIn", detail=str(si.get("code"))))
+                    return
+
+                # finalize (setUserAuth) already ran in-page; confirm live, else reload.
+                await session.page.wait_for_timeout(1500)
+                logged = await driver.is_logged_in()
+                if not logged:
+                    try:
+                        await session.page.reload(wait_until="domcontentloaded")
+                    except Exception:  # noqa: BLE001
+                        pass
+                    await session.page.wait_for_timeout(6000)
+                    logged = await driver.is_logged_in()
+
+                if logged:
+                    await report(cards.card(
+                        "✅ ACCOUNT ADDED",
+                        [("Account", account), ("Phone", intl)],
+                        footer="Logged in via the bridge (no noVNC). It now appears under Accounts."))
+                else:
+                    await report(cards.card(
+                        "⚠️ LOGIN INCOMPLETE",
+                        [("Account", account)],
+                        footer="signIn succeeded but the app didn't switch to logged-in. "
+                               "Try again, or use the noVNC button."))
+        except Exception as exc:  # noqa: BLE001
+            await report(cards.error_card(
+                "bridge_login", account, code=type(exc).__name__, detail=str(exc)))
+        finally:
+            self._logins.pop(account, None)
             self._busy.discard(account)
 
     # ---- send job ----
