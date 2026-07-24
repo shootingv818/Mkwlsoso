@@ -250,3 +250,182 @@ def print_bridge_summary(summary: dict) -> None:
     if summary.get("run_dir"):
         print(f"[bridge] raw evidence saved : {summary['run_dir']}")
     print("[bridge] ======================================")
+
+
+
+# ---------------------------------------------------------------------------
+# Bridge SEND verification.
+#
+# The discovery step proved the managers exist on window and that the send task
+# crosses the worker boundary in plaintext. This step proves we can actually
+# CALL the bridge to send a real message -- and learns the exact working
+# invocation -- by sending only to the owner's own Saved Messages (peer
+# inputPeerSelf / self id), then confirming the message really appears.
+# ---------------------------------------------------------------------------
+
+# Runs in the page. Tries each known bridge entry point against Saved Messages
+# and reports, per attempt, whether the call resolved and what it returned.
+# Each attempt uses a distinct suffix so we can tell from the DOM which one
+# actually delivered.
+BRIDGE_SEND_JS = r"""
+async (marker) => {
+  const out = { self_id: null, attempts: [] };
+
+  function randId() {
+    try {
+      const a = new Uint32Array(2);
+      crypto.getRandomValues(a);
+      return a[0].toString() + a[1].toString().padStart(10, '0');
+    } catch (e) { return String(Date.now()) + '007'; }
+  }
+
+  function safeRet(r) {
+    try {
+      if (r == null) return 'null/undefined (resolved)';
+      if (typeof r === 'object') {
+        const ctor = r._ || (r.constructor && r.constructor.name) || 'object';
+        return ctor + ' {' + Object.keys(r).slice(0, 12).join(',') + '}';
+      }
+      return String(r).slice(0, 120);
+    } catch (e) { return 'unserializable'; }
+  }
+
+  async function attempt(name, fn) {
+    try {
+      const r = await fn();
+      out.attempts.push({ name: name, ok: true, ret: safeRet(r) });
+    } catch (e) {
+      out.attempts.push({ name: name, ok: false, err: String((e && e.message) || e).slice(0, 220) });
+    }
+  }
+
+  function getSelfId() {
+    const c = [];
+    try { c.push(window.appPeersManager && window.appPeersManager.peerId); } catch (e) {}
+    try { c.push(window.appImManager && window.appImManager.myId); } catch (e) {}
+    try { c.push(window.rootScope && window.rootScope.myId); } catch (e) {}
+    try {
+      if (window.appUsersManager && window.appUsersManager.getSelf) {
+        const s = window.appUsersManager.getSelf();
+        c.push(s && (s.id != null ? s.id : s));
+      }
+    } catch (e) {}
+    for (const x of c) {
+      if (x != null && (typeof x === 'number' || typeof x === 'string' || typeof x === 'bigint')) {
+        return String(x);
+      }
+    }
+    return null;
+  }
+  out.self_id = getSelfId();
+
+  const peerSelf = { _: 'inputPeerSelf' };
+
+  // Lower-level: invokeApi('messages.sendMessage', ...) straight to self.
+  if (window.apiManager && window.apiManager.invokeApi) {
+    await attempt('apiManager.invokeApi', () =>
+      window.apiManager.invokeApi('messages.sendMessage',
+        { peer: peerSelf, message: marker + ' B', random_id: randId() }));
+  }
+  if (window.apiManagerProxy && window.apiManagerProxy.invokeApi) {
+    await attempt('apiManagerProxy.invokeApi', () =>
+      window.apiManagerProxy.invokeApi('messages.sendMessage',
+        { peer: peerSelf, message: marker + ' C', random_id: randId() }));
+  }
+
+  // Highest-level: appMessagesManager.sendText(selfId, text) -- handles peer
+  // resolution and random_id internally (the ideal call if it works).
+  if (window.appMessagesManager && window.appMessagesManager.sendText && out.self_id != null) {
+    const pid = isNaN(+out.self_id) ? out.self_id : +out.self_id;
+    await attempt('appMessagesManager.sendText', () =>
+      window.appMessagesManager.sendText(pid, marker + ' A'));
+  }
+
+  return out;
+}
+"""
+
+
+async def bridge_send_test(driver: Any, marker: str) -> dict:
+    """Open Saved Messages, call each bridge entry point, and confirm delivery.
+
+    Returns {self_id, attempts:[{name,ok,ret|err}], delivered:[labels]} where
+    `delivered` lists the strategies whose message actually appeared in Saved
+    Messages (the real proof, not just a resolved promise).
+    """
+    # Open Saved Messages so a successful bridge send becomes visible for
+    # verification.
+    try:
+        await driver.open_saved_messages()
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"could not open Saved Messages: {exc}", "attempts": []}
+
+    try:
+        result = await driver.page.evaluate(BRIDGE_SEND_JS, marker)
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"bridge evaluate failed: {exc}", "attempts": []}
+
+    # Give the round-trip a moment, then confirm which suffixed messages landed.
+    await driver.page.wait_for_timeout(3000)
+    delivered: list[str] = []
+    label_by_suffix = {
+        "B": "apiManager.invokeApi",
+        "C": "apiManagerProxy.invokeApi",
+        "A": "appMessagesManager.sendText",
+    }
+    for suffix, label in label_by_suffix.items():
+        text = f"{marker} {suffix}"
+        try:
+            loc = driver.page.locator(".bubble.is-out", has_text=text)
+            if await loc.count() > 0:
+                delivered.append(label)
+        except Exception:  # noqa: BLE001
+            # Fallback: any element carrying the exact text.
+            try:
+                if await driver.page.get_by_text(text, exact=False).count() > 0:
+                    delivered.append(label)
+            except Exception:  # noqa: BLE001
+                pass
+
+    result["delivered"] = delivered
+    return result
+
+
+def print_bridge_send_summary(result: dict) -> None:
+    """Print the send-verification outcome for the user to paste back."""
+    LINE = "-" * 31
+    print("")
+    print("[bridge-send] ===== BRIDGE SEND VERIFICATION =====")
+    print(f"[bridge-send] {LINE}")
+    if result.get("error"):
+        print(f"[bridge-send] ERROR: {result['error']}")
+        print("[bridge-send] ====================================")
+        return
+
+    print(f"[bridge-send] self id (Saved Messages) : {result.get('self_id')}")
+    print(f"[bridge-send] {LINE}")
+    print("[bridge-send] call attempts:")
+    for a in result.get("attempts", []):
+        if a.get("ok"):
+            print(f"[bridge-send]   ✅ {a.get('name')}  -> resolved: {a.get('ret')}")
+        else:
+            print(f"[bridge-send]   ❌ {a.get('name')}  -> error: {a.get('err')}")
+
+    delivered = result.get("delivered") or []
+    print(f"[bridge-send] {LINE}")
+    if delivered:
+        print("[bridge-send] REAL MESSAGES CONFIRMED in Saved Messages via:  ✅")
+        for d in delivered:
+            print(f"[bridge-send]     - {d}")
+        print(f"[bridge-send] {LINE}")
+        print("[bridge-send] VERDICT: the bridge SENDS FOR REAL. Best working call above.")
+        print("[bridge-send]   Next: build the hybrid sender using this call as the fast path,")
+        print("[bridge-send]   with the UI engine as fallback and real message-id verification.")
+    else:
+        print("[bridge-send] REAL MESSAGES CONFIRMED in Saved Messages:  NONE  ❌")
+        print(f"[bridge-send] {LINE}")
+        print("[bridge-send] VERDICT: calls may have resolved but nothing was delivered.")
+        print("[bridge-send]   Check the per-attempt errors above (likely a param format such as")
+        print("[bridge-send]   random_id, or a manager needing a different signature). Paste this")
+        print("[bridge-send]   output back so we can adjust the exact call.")
+    print("[bridge-send] ====================================")

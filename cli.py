@@ -50,6 +50,7 @@ from capture.dossier import build_dossier
 from capture.extract_params import extract_run, summarize
 from capture.bridge import (
     BRIDGE_JS, send_marker_to_saved, summarize_bridge, print_bridge_summary,
+    bridge_send_test, print_bridge_send_summary,
 )
 
 
@@ -229,6 +230,31 @@ async def cmd_bridge(account: str, manual: bool) -> int:
         summary["run_dir"] = str(run_dir)
 
         print_bridge_summary(summary)
+    return 0
+
+
+async def cmd_bridge_send(account: str) -> int:
+    """Verify the discovered bridge can actually SEND (to Saved Messages only).
+
+    Calls each bridge entry point (apiManager/apiManagerProxy.invokeApi and
+    appMessagesManager.sendText) against the owner's own Saved Messages, then
+    confirms which one truly delivered a message. This pins down the exact
+    working call before we build the hybrid campaign sender.
+    """
+    config.ensure_dirs()
+    import time as _time
+    async with open_session(account) as session:
+        await session.goto()
+        driver = EitaaDriver(session)
+        await driver.open()
+        if not await driver.is_logged_in():
+            print("[bridge-send] not logged in. run: python cli.py login --account", account)
+            return 2
+
+        marker = f"MKWLSEND{int(_time.time())}"
+        print(f"[bridge-send] marker: {marker} (sending only to your Saved Messages)")
+        result = await bridge_send_test(driver, marker)
+        print_bridge_send_summary(result)
     return 0
 
 
@@ -758,6 +784,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="you send the marker to Saved Messages yourself instead of automating it",
     )
 
+    p_bsend = sub.add_parser(
+        "bridge-send",
+        help="verify the bridge can actually send (to your Saved Messages only)",
+    )
+    p_bsend.add_argument("--account", required=True)
+
     p_ext = sub.add_parser("extract", help="mine MTProto params (DCs/api/layer/RSA) from a run's assets")
     p_ext.add_argument("--run", required=True)
 
@@ -845,6 +877,8 @@ def main(argv: list[str] | None = None) -> int:
         return asyncio.run(cmd_probe(args.account, args.op, manual=not args.auto))
     if args.command == "bridge":
         return asyncio.run(cmd_bridge(args.account, manual=args.manual))
+    if args.command == "bridge-send":
+        return asyncio.run(cmd_bridge_send(args.account))
     if args.command == "extract":
         return cmd_extract(args.run)
     if args.command == "list":
