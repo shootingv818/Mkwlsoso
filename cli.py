@@ -48,6 +48,9 @@ from capture import deep
 from capture.deep import HOOKS_JS
 from capture.dossier import build_dossier
 from capture.extract_params import extract_run, summarize
+from capture.bridge import (
+    BRIDGE_JS, send_marker_to_saved, summarize_bridge, print_bridge_summary,
+)
 
 
 async def cmd_login(account: str) -> int:
@@ -144,6 +147,88 @@ async def cmd_probe(account: str, op: str, manual: bool) -> int:
     out = build_dossier(rec.run_id)
     print(f"[probe] dossier written: {out}")
     print(out.read_text(encoding="utf-8"))
+    return 0
+
+
+async def cmd_bridge(account: str, manual: bool) -> int:
+    """Discover whether Eitaa Web exposes a directly-usable send bridge.
+
+    Injects bridge.js, performs ONE controlled send of a unique marker to the
+    owner's Saved Messages, then reports whether the marker (the message text)
+    crossed a JS worker/port boundary in plaintext -- i.e. whether we can post
+    a high-level send task to Eitaa's own engine instead of driving the UI.
+    """
+    import time as _time
+    from capture import redactor
+
+    config.ensure_dirs()
+    async with open_session(account, init_script_path=BRIDGE_JS) as session:
+        await session.goto()
+        driver = EitaaDriver(session)
+        await driver.open()
+        if not await driver.is_logged_in():
+            print("[bridge] not logged in. run: python cli.py login --account", account)
+            return 2
+
+        marker = f"MKWLBRIDGE{int(_time.time())}"
+        try:
+            await session.page.evaluate(
+                "(m) => { if (window.__MKWLB_setMarker) window.__MKWLB_setMarker(m); }", marker
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+        # Structural scan of window globals for a directly-callable send method.
+        try:
+            probe = await session.page.evaluate(
+                "() => window.__MKWLB_probe ? window.__MKWLB_probe() : []"
+            )
+        except Exception:  # noqa: BLE001
+            probe = []
+
+        # Clear anything buffered before the action so we isolate the send.
+        try:
+            await session.page.evaluate("() => window.__MKWLB_dump ? window.__MKWLB_dump() : []")
+        except Exception:  # noqa: BLE001
+            pass
+
+        print(f"[bridge] marker: {marker}")
+        if manual:
+            await _wait_enter(
+                "[bridge] SEND ONE MESSAGE NOW to your Saved Messages with EXACTLY this "
+                f"text: {marker}\n[bridge] then press ENTER here..."
+            )
+            send_status = "manual"
+        else:
+            print("[bridge] sending the marker to your Saved Messages (safe)...")
+            send_status = await send_marker_to_saved(driver, marker)
+            print(f"[bridge] send status: {send_status}")
+
+        # Let async worker traffic settle, then drain the instrumentation buffer.
+        await session.page.wait_for_timeout(3000)
+        try:
+            records = await session.page.evaluate(
+                "() => window.__MKWLB_dump ? window.__MKWLB_dump() : []"
+            )
+        except Exception:  # noqa: BLE001
+            records = []
+
+        summary = summarize_bridge(records or [], marker, probe or [])
+        summary["send_status"] = send_status
+
+        run_dir = config.ARTIFACTS_DIR / f"bridge_{account}_{int(_time.time())}"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        (run_dir / "bridge_records.json").write_text(
+            json.dumps(redactor.redact_value(records or []), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        (run_dir / "bridge_summary.json").write_text(
+            json.dumps(redactor.redact_value(summary), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        summary["run_dir"] = str(run_dir)
+
+        print_bridge_summary(summary)
     return 0
 
 
@@ -663,6 +748,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_probe.add_argument("--op", required=True, help="label, e.g. login, contacts, send_text, send_file")
     p_probe.add_argument("--auto", action="store_true", help="no manual action (baseline+trail only)")
 
+    p_bridge = sub.add_parser(
+        "bridge",
+        help="discover if a high-level send bridge exists at the JS worker boundary",
+    )
+    p_bridge.add_argument("--account", required=True)
+    p_bridge.add_argument(
+        "--manual", action="store_true",
+        help="you send the marker to Saved Messages yourself instead of automating it",
+    )
+
     p_ext = sub.add_parser("extract", help="mine MTProto params (DCs/api/layer/RSA) from a run's assets")
     p_ext.add_argument("--run", required=True)
 
@@ -748,6 +843,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_analyze(args.run)
     if args.command == "probe":
         return asyncio.run(cmd_probe(args.account, args.op, manual=not args.auto))
+    if args.command == "bridge":
+        return asyncio.run(cmd_bridge(args.account, manual=args.manual))
     if args.command == "extract":
         return cmd_extract(args.run)
     if args.command == "list":
