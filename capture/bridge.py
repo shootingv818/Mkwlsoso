@@ -429,3 +429,59 @@ def print_bridge_send_summary(result: dict) -> None:
         print("[bridge-send]   random_id, or a manager needing a different signature). Paste this")
         print("[bridge-send]   output back so we can adjust the exact call.")
     print("[bridge-send] ====================================")
+
+
+
+# ---------------------------------------------------------------------------
+# Reach check: for a list of peer_ids, ask Eitaa's own peer manager whether it
+# can resolve each one to a real inputPeer (with access_hash). This tells us,
+# WITHOUT sending anything, which peers the fast bridge (invokeApi) can hit
+# directly vs which would need the sendText/UI fallback. Used to compare the
+# reach across PVs (private chats) and Contacts.
+# ---------------------------------------------------------------------------
+RESOLVE_PEERS_JS = r"""
+(peerIds) => {
+  const APM = window.appPeersManager;
+  const out = [];
+  for (let i = 0; i < peerIds.length; i++) {
+    const pid = peerIds[i];
+    let resolved = false, type = null, hasHash = false, err = null;
+    try {
+      let p = null;
+      if (APM && APM.getInputPeerById) {
+        try { p = APM.getInputPeerById(pid); } catch (e) {}
+        if (!p && !isNaN(+pid)) { try { p = APM.getInputPeerById(+pid); } catch (e) {} }
+      }
+      if (p) {
+        type = p._ || null;
+        hasHash = (p.access_hash != null);
+        // inputPeerEmpty / inputPeerSelf are edge cases; a real user peer with
+        // an access_hash (or a self peer) is what we can send to directly.
+        resolved = (type && type !== "inputPeerEmpty");
+      }
+    } catch (e) { err = String((e && e.message) || e).slice(0, 60); }
+    out.push({ pid: String(pid), resolved: resolved, type: type, hasHash: hasHash, err: err });
+  }
+  return out;
+}
+"""
+
+
+def print_reach_group(name: str, total: int, results: list) -> dict:
+    """Print reach stats for one group and return a small summary dict."""
+    LINE = "-" * 31
+    n = len(results)
+    resolvable = sum(1 for r in results if r.get("resolved"))
+    with_hash = sum(1 for r in results if r.get("hasHash"))
+    print(f"[reach] {LINE}")
+    print(f"[reach] {name}")
+    print(f"[reach]   total collected : {total}")
+    print(f"[reach]   sampled         : {n}")
+    print(f"[reach]   resolvable      : {resolvable}"
+          + (f"  ({int(100 * resolvable / n)}%)" if n else ""))
+    print(f"[reach]   with access_hash: {with_hash}")
+    for r in results[:6]:
+        print(f"[reach]     - pid={r.get('pid')} resolved={r.get('resolved')} "
+              f"type={r.get('type')} hash={r.get('hasHash')}")
+    return {"name": name, "total": total, "sampled": n,
+            "resolvable": resolvable, "with_hash": with_hash}

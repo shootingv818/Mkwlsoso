@@ -53,6 +53,7 @@ from capture.bridge import (
     bridge_send_test, print_bridge_send_summary,
 )
 from capture.bridge_file import run_file_test, print_file_test_summary
+from capture.bridge import RESOLVE_PEERS_JS, print_reach_group
 
 
 async def cmd_login(account: str) -> int:
@@ -348,6 +349,58 @@ async def cmd_bridge_file(account: str, file_path: str | None) -> int:
                 os.remove(file_path)
             except Exception:  # noqa: BLE001
                 pass
+    return 0
+
+
+async def cmd_bridge_reach(account: str, sample: int) -> int:
+    """Measure how far the fast bridge reaches: PVs vs Contacts.
+
+    Collects the account's private chats (PVs) and its Contacts, then asks
+    Eitaa's own peer manager whether each peer_id resolves to a real inputPeer
+    (with access_hash). NOTHING is sent -- this only reports which group the
+    fast direct send (invokeApi) can hit vs which would use the fallback.
+    """
+    config.ensure_dirs()
+    async with open_session(account) as session:
+        await session.goto()
+        driver = EitaaDriver(session)
+        await driver.open()
+        if not await driver.is_logged_in():
+            print("[reach] not logged in. run: python cli.py login --account", account)
+            return 2
+
+        print("[reach] collecting PVs (private chats)...")
+        chats = await driver.collect_all_chats()
+        pvs = [c for c in chats if c.get("kind") == "user" and c.get("peer_id")]
+        print(f"[reach] PVs found: {len(pvs)}")
+
+        print("[reach] collecting Contacts...")
+        try:
+            contacts = await driver.collect_all_contacts()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[reach] contacts collection failed: {exc}")
+            contacts = []
+        await driver._return_to_chat_list()
+        cts = [c for c in contacts if c.get("peer_id")]
+        print(f"[reach] Contacts found: {len(cts)}")
+
+        pv_ids = [c["peer_id"] for c in pvs[:sample]]
+        ct_ids = [c["peer_id"] for c in cts[:sample]]
+        pv_res = await session.page.evaluate(RESOLVE_PEERS_JS, pv_ids) if pv_ids else []
+        ct_res = await session.page.evaluate(RESOLVE_PEERS_JS, ct_ids) if ct_ids else []
+
+        print("")
+        print("[reach] ===== BRIDGE REACH: PVs vs CONTACTS =====")
+        s_pv = print_reach_group("PVs (private chats)", len(pvs), pv_res)
+        s_ct = print_reach_group("Contacts", len(cts), ct_res)
+        print("[reach] " + "-" * 31)
+        print("[reach] NOTE: resolvable peers are sent via the FAST bridge (invokeApi,")
+        print("[reach]   server-ACK). Non-resolvable ones fall back to sendText/UI, which")
+        print("[reach]   can still deliver (and creates the private chat). The campaign")
+        print("[reach]   currently targets your CONTACTS list.")
+        print("[reach] TIP: for a real end-to-end test to any single peer, use:")
+        print("[reach]   python cli.py bridge-real --account " + account + " --peer <peer_id>")
+        print("[reach] ==========================================")
     return 0
 
 
@@ -898,6 +951,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_bfile.add_argument("--account", required=True)
     p_bfile.add_argument("--file", default=None, help="file to test (default: an auto tiny .txt)")
 
+    p_reach = sub.add_parser(
+        "bridge-reach",
+        help="measure how far the bridge reaches (PVs vs Contacts); sends nothing",
+    )
+    p_reach.add_argument("--account", required=True)
+    p_reach.add_argument("--sample", type=int, default=40,
+                         help="how many peers per group to check (default 40)")
+
     p_ext = sub.add_parser("extract", help="mine MTProto params (DCs/api/layer/RSA) from a run's assets")
     p_ext.add_argument("--run", required=True)
 
@@ -991,6 +1052,8 @@ def main(argv: list[str] | None = None) -> int:
         return asyncio.run(cmd_bridge_real(args.account, args.peer, args.text))
     if args.command == "bridge-file":
         return asyncio.run(cmd_bridge_file(args.account, args.file))
+    if args.command == "bridge-reach":
+        return asyncio.run(cmd_bridge_reach(args.account, args.sample))
     if args.command == "extract":
         return cmd_extract(args.run)
     if args.command == "list":
