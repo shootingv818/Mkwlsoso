@@ -671,6 +671,135 @@ def cmd_direct_replay(account: str, index=None) -> int:
     return 0
 
 
+def _print_op_capture(label: str, recs: list) -> list:
+    """Pretty-print the API requests captured for one operation and return the
+    replayable ones (fully-captured, non-media, /eitaa/ POSTs)."""
+    def _is_media(res_hex: str) -> bool:
+        return res_hex[:6] == "ffd8ff" or res_hex[:8] == "89504e47"
+
+    api = []
+    for i, r in enumerate(recs):
+        if r.get("kind") not in ("fetch", "xhr"):
+            continue
+        url = r.get("url") or ""
+        if "/eitaa/" not in url:
+            continue
+        req_hex = _head_str(r.get("reqHead"))
+        res_hex = _head_str(r.get("resHead"))
+        if not req_hex.startswith("ed77be7a") or _is_media(res_hex):
+            continue
+        api.append((i, r, req_hex, res_hex))
+
+    print(f"\n[capall] ===== OP: {label} =====  ({len(api)} API request(s))")
+    if not api:
+        print("[capall]   (no API request captured for this op)")
+        return []
+    # The method call is almost always the LARGEST new request in the batch.
+    api_sorted = sorted(api, key=lambda t: -(t[1].get("reqLen") or 0))
+    for rank, (i, r, req_hex, res_hex) in enumerate(api_sorted):
+        raw = bytes.fromhex(req_hex)
+        # Strip envelope to isolate the TL body we must learn to build.
+        body_hex = ""
+        try:
+            p = 4
+            l1 = raw[p]; p += 1 + l1
+            l2 = raw[p]; p += 1 + l2
+            blen = int.from_bytes(raw[p:p + 4], "big"); p += 4
+            body_hex = raw[p:p + blen].hex()
+        except Exception:  # noqa: BLE001
+            body_hex = "(parse error)"
+        tag = "  <== LIKELY THE METHOD CALL" if rank == 0 else ""
+        print(f"[capall]  req#{i}  {r.get('reqLen')}B{tag}")
+        print(f"[capall]     body({len(body_hex)//2}B)={body_hex}")
+        print(f"[capall]     res {r.get('resLen')}B head={res_hex[:96]}")
+    return [t[1] for t in api]
+
+
+async def cmd_direct_capture_all(account: str, phone: str, first: str) -> int:
+    """Capture the wire bytes for ALL current bot operations in ONE browser run:
+    send text, send file (document), and add/import a contact.
+
+    Each operation's worker traffic is drained separately and labelled, so we
+    can reverse each TL method (sendMessage / sendMedia+upload / importContacts)
+    and rebuild them browser-free in direct/.
+    The contact uses a throwaway test number (default is an obviously-fake,
+    unassigned MSISDN) so no real person is touched; override with --phone.
+    """
+    import time as _time
+    import tempfile as _tf
+    from pathlib import Path as _Path
+    from capture.bridge import send_marker_to_saved
+    config.ensure_dirs()
+
+    init_js = _Path("eitaa/worker_capture.js")
+    if not init_js.is_file():
+        print(f"[capall] missing {init_js}")
+        return 1
+
+    all_labeled: dict = {}
+    async with open_session(account, init_script_path=str(init_js)) as session:
+        await session.goto()
+        driver = EitaaDriver(session)
+        await driver.open()
+        if not await driver.is_logged_in():
+            print("[capall] not logged in. run: python cli.py login --account", account)
+            return 2
+
+        await driver.dump_worker_requests()  # clear anything buffered pre-action
+
+        # ---- 1) SEND TEXT -------------------------------------------------
+        marker = f"MKWLTX{int(_time.time())}"
+        print(f"[capall] (1/3) sending TEXT to Saved Messages: {marker}")
+        st = await send_marker_to_saved(driver, marker)
+        print(f"[capall]      text status: {st}")
+        await session.page.wait_for_timeout(3500)
+        all_labeled["text"] = await driver.dump_worker_requests()
+
+        # ---- 2) SEND FILE (document) -------------------------------------
+        tmp = _Path(_tf.gettempdir()) / f"mkwl_capall_{int(_time.time())}.txt"
+        tmp.write_text(f"mkwlsoso capture-all file test {marker}\n", encoding="utf-8")
+        print(f"[capall] (2/3) sending FILE to Saved Messages: {tmp.name}")
+        try:
+            fr = await driver.send_file(str(tmp), caption=f"cap {marker}", to_saved=True)
+            print(f"[capall]      file status: ok={getattr(fr, 'ok', '?')} detail={getattr(fr, 'detail', '')}")
+        except Exception as exc:  # noqa: BLE001
+            print(f"[capall]      file send raised: {exc}")
+        await session.page.wait_for_timeout(4500)
+        all_labeled["file"] = await driver.dump_worker_requests()
+
+        # ---- 3) ADD / IMPORT CONTACT -------------------------------------
+        print(f"[capall] (3/3) adding CONTACT (test number {phone})")
+        try:
+            cr = await driver.add_contacts_batch([{"phone": phone, "first": first, "last": ""}])
+            print(f"[capall]      contact result: {cr}")
+        except Exception as exc:  # noqa: BLE001
+            print(f"[capall]      add-contact raised: {exc}")
+        await session.page.wait_for_timeout(3500)
+        all_labeled["contact"] = await driver.dump_worker_requests()
+
+        try:
+            tmp.unlink()
+        except Exception:  # noqa: BLE001
+            pass
+
+    # Persist everything (gitignored artifacts) for offline reversing.
+    out_dir = config.ARTIFACTS_DIR / "sessions"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"capall_{account}_{int(_time.time())}.json"
+    out_path.write_text(json.dumps(all_labeled, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    print("\n[capall] ================= SUMMARY =================")
+    total = sum(len(v) for v in all_labeled.values())
+    print(f"[capall] total worker records: {total}   saved: {out_path}")
+    for label in ("text", "file", "contact"):
+        _print_op_capture(label, all_labeled.get(label, []))
+    print("\n[capall] ==========================================")
+    print("[capall] Send me the 3 OP sections above (esp. the 'LIKELY THE METHOD CALL'")
+    print("[capall] body of each). I'll reverse sendMessage / sendMedia / importContacts")
+    print("[capall] and build them into the browser-free direct client.")
+    return 0
+
+
 async def cmd_direct_capture_worker(account: str) -> int:
     """Capture the EXACT bytes Eitaa's MTProto Worker sends on the wire.
 
@@ -1541,6 +1670,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_wcap.add_argument("--account", required=True)
 
+    p_capall = sub.add_parser(
+        "direct-capture-all",
+        help="capture wire bytes for ALL ops in one run: send text + send file + add contact",
+    )
+    p_capall.add_argument("--account", required=True)
+    p_capall.add_argument("--phone", default="+989000000000",
+                        help="throwaway test number for the add-contact capture (default: fake/unassigned)")
+    p_capall.add_argument("--first", default="MkwlTest", help="first name for the test contact")
+
     p_dprobe = sub.add_parser(
         "direct-probe",
         help="first LIVE direct-client call (help.getConfig) using an exported session",
@@ -1673,6 +1811,8 @@ def main(argv: list[str] | None = None) -> int:
         return asyncio.run(cmd_direct_capture_transport(args.account))
     if args.command == "direct-capture-worker":
         return asyncio.run(cmd_direct_capture_worker(args.account))
+    if args.command == "direct-capture-all":
+        return asyncio.run(cmd_direct_capture_all(args.account, args.phone, args.first))
     if args.command == "direct-probe":
         return cmd_direct_probe(args.session, args.account, args.url)
     if args.command == "direct-replay":
