@@ -17,6 +17,72 @@ import http.client
 
 from .errors import TransportError
 
+# ---------------------------------------------------------------------------
+# Eitaa transport envelope (CONFIRMED by worker capture, all requests share it)
+#
+#   ed77be7a                 4-byte constant magic
+#   <1 byte>  len1           length of the ASCII routing token
+#   <len1 B>  token1         e.g. "9179.c756a2d10f.e41c4e_<userid>"  (session/route token)
+#   <1 byte>  len2           length of the ASCII session-instance id
+#   <len2 B>  token2         e.g. "mrtpgmi2y9fm222__web"            (client session id)
+#   <4 bytes> bodyLen (BE)   big-endian length of the payload that follows
+#   <bodyLen> body           the (plaintext) TL payload — NOT AES-encrypted
+#   0000008700000020000000   11-byte constant trailer (contains layer=135, 32)
+#
+# The body being plaintext (msg_ids in an ack request matched the ack response
+# byte-for-byte) means this transport needs NO auth_key / AES-IGE: auth is the
+# token. We only replicate the envelope and serialize the TL body.
+# ---------------------------------------------------------------------------
+EITAA_MAGIC = bytes.fromhex("ed77be7a")
+EITAA_TRAILER = bytes.fromhex("0000008700000020000000")
+
+
+def _as_bytes(tok) -> bytes:
+    if isinstance(tok, bytes):
+        return tok
+    return str(tok).encode("ascii")
+
+
+def wrap_eitaa(token1, token2, body: bytes) -> bytes:
+    """Build the exact on-wire request Eitaa's worker sends."""
+    t1 = _as_bytes(token1)
+    t2 = _as_bytes(token2)
+    if len(t1) > 255 or len(t2) > 255:
+        raise TransportError("eitaa token too long for a 1-byte length prefix")
+    return (
+        EITAA_MAGIC
+        + bytes([len(t1)]) + t1
+        + bytes([len(t2)]) + t2
+        + len(body).to_bytes(4, "big")
+        + body
+        + EITAA_TRAILER
+    )
+
+
+def unwrap_eitaa(raw: bytes) -> dict:
+    """Parse an Eitaa envelope (request or response-shaped) into its fields.
+
+    Returns {token1, token2, body, trailer, ok}. Raises TransportError on a
+    structurally invalid envelope.
+    """
+    if raw[:4] != EITAA_MAGIC:
+        raise TransportError("not an eitaa envelope (bad magic)")
+    p = 4
+    l1 = raw[p]; p += 1
+    t1 = raw[p:p + l1]; p += l1
+    l2 = raw[p]; p += 1
+    t2 = raw[p:p + l2]; p += l2
+    body_len = int.from_bytes(raw[p:p + 4], "big"); p += 4
+    body = raw[p:p + body_len]; p += body_len
+    trailer = raw[p:]
+    return {
+        "token1": t1.decode("ascii", "replace"),
+        "token2": t2.decode("ascii", "replace"),
+        "body": body,
+        "trailer": trailer,
+        "ok": len(body) == body_len,
+    }
+
 
 class HttpTransport:
     def __init__(self, url: str, timeout: float = 30.0) -> None:

@@ -557,6 +557,120 @@ def _decode_eitaa_envelope(hexstr: str):
     )
 
 
+def cmd_direct_replay(account: str, index=None) -> int:
+    """PROVE the browser-free transport end-to-end with ZERO body guessing.
+
+    Loads the newest worker-capture for the account, picks ONE small idempotent
+    API request (Eitaa's config request is a 4-byte body -> smallest total), and
+    resends its EXACT captured bytes to the SAME URL straight from Python via
+    direct/transport.HttpTransport. If Eitaa returns a valid reply (the DC/config
+    list contains "eitaa" hostnames, or any TL-looking bytes), then our HTTPS
+    transport + the ed77be7a envelope + the session token all work headless.
+
+    This burns at most ONE idempotent request (no message is sent).
+    """
+    import glob as _glob
+    from pathlib import Path as _Path
+    from direct.transport import HttpTransport, unwrap_eitaa, wrap_eitaa
+
+    cap_dir = config.ARTIFACTS_DIR / "sessions"
+    pattern = str(cap_dir / f"worker_tx_{account}_*.json")
+    files = sorted(_glob.glob(pattern))
+    if not files:
+        print(f"[replay] no worker capture found. first run:")
+        print(f"[replay]   DISPLAY=:99 python cli.py direct-capture-worker --account {account}")
+        return 1
+    cap_path = files[-1]
+    print(f"[replay] using capture: {cap_path}")
+    try:
+        recs = json.loads(_Path(cap_path).read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001
+        print(f"[replay] cannot read capture: {exc}")
+        return 1
+
+    # Build the list of REPLAYABLE api requests: fetch to a /eitaa/ endpoint,
+    # NOT a media/image response, and FULLY captured (reqHead holds every byte).
+    def _is_media(res_hex: str) -> bool:
+        return res_hex[:6] == "ffd8ff" or res_hex[:8] == "89504e47"
+
+    candidates = []
+    for i, r in enumerate(recs):
+        if r.get("kind") not in ("fetch", "xhr"):
+            continue
+        url = r.get("url") or ""
+        if "/eitaa/" not in url:
+            continue
+        req_hex = _head_str(r.get("reqHead"))
+        res_hex = _head_str(r.get("resHead"))
+        if not req_hex or not req_hex.startswith("ed77be7a"):
+            continue
+        if _is_media(res_hex):
+            continue
+        req_len = int(r.get("reqLen") or 0)
+        if req_len == 0 or (len(req_hex) // 2) < req_len:
+            continue  # request body was truncated -> cannot replay exactly
+        candidates.append((i, req_len, url, req_hex))
+
+    if not candidates:
+        print("[replay] no fully-captured, non-media API request to replay.")
+        print("[replay] re-run direct-capture-worker (need the small config request).")
+        return 2
+
+    if index is not None:
+        chosen = next((c for c in candidates if c[0] == index), None)
+        if not chosen:
+            print(f"[replay] index {index} is not a replayable API request. options:")
+            for i, ln, url, _ in candidates:
+                print(f"[replay]   #{i}  {ln}B  {url}")
+            return 2
+    else:
+        # smallest request => Eitaa's idempotent config (safest to replay)
+        chosen = min(candidates, key=lambda c: c[1])
+
+    idx, req_len, url, req_hex = chosen
+    raw = bytes.fromhex(req_hex)[:req_len]
+
+    parsed = unwrap_eitaa(raw)
+    # Offline self-check: our wrap_eitaa must reproduce the real bytes exactly.
+    rebuilt = wrap_eitaa(parsed["token1"], parsed["token2"], parsed["body"])
+    wrap_ok = rebuilt == raw
+    print(f"[replay] record #{idx}  {req_len}B  -> {url}")
+    print(f"[replay] token2 (session id): {parsed['token2']}")
+    print(f"[replay] body ({len(parsed['body'])}B): {parsed['body'].hex()}")
+    print(f"[replay] wrap_eitaa reproduces captured bytes exactly: "
+          f"{'YES' if wrap_ok else 'NO (envelope model wrong!)'}")
+
+    print("[replay] sending the SAME bytes from pure Python (browser closed)...")
+    try:
+        resp = HttpTransport(url, timeout=30.0).post(raw)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[replay] ✗ transport error: {exc}")
+        print("[replay] (a 4xx/5xx or TLS error still tells us the host answered)")
+        return 3
+
+    head = resp[:80].hex()
+    print(f"[replay] ✓ HTTP 200, response {len(resp)}B  head={head}")
+    # Heuristics: did we get a real, meaningful reply?
+    txt = resp.decode("latin-1", "ignore")
+    looks_config = "eitaa" in txt
+    looks_gzip = resp[:3] == b"\x1f\x8b\x08"
+    looks_vector = b"\x1c\xb5\xc4\x15" in resp[:64]  # 15c4b51c LE vector id
+    if looks_config:
+        hosts = sorted({w for w in txt.replace("\x00", " ").split()
+                        if "eitaa" in w and "." in w})[:8]
+        print(f"[replay] 🎉 CONFIG REPLY — contains eitaa hosts: {hosts}")
+        print("[replay] TRANSPORT PROVEN: headless Python talks to Eitaa via the envelope.")
+    elif looks_gzip:
+        print("[replay] reply is gzip (a real TL payload) — transport works; "
+              "will gunzip+parse in the client step.")
+    elif looks_vector:
+        print("[replay] reply starts with a TL Vector — transport works.")
+    else:
+        print("[replay] reply received (not obviously config). Paste this head to me "
+              "and I'll decode the response framing.")
+    return 0
+
+
 async def cmd_direct_capture_worker(account: str) -> int:
     """Capture the EXACT bytes Eitaa's MTProto Worker sends on the wire.
 
@@ -1435,6 +1549,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_dprobe.add_argument("--session", default=None, help="explicit path to a session JSON")
     p_dprobe.add_argument("--url", default=None, help="force a single DC URL (skip auto-try)")
 
+    p_drep = sub.add_parser(
+        "direct-replay",
+        help="PROVE the direct transport: resend ONE captured idempotent request (config) from pure Python",
+    )
+    p_drep.add_argument("--account", required=True, help="account whose newest worker-capture to replay")
+    p_drep.add_argument("--index", type=int, default=None,
+                        help="replay a specific record index (default: auto-pick the smallest API request)")
+
     p_fsend = sub.add_parser(
         "bridge-file-send",
         help="end-to-end test the production file path (upload once + reuse) to Saved Messages",
@@ -1553,6 +1675,8 @@ def main(argv: list[str] | None = None) -> int:
         return asyncio.run(cmd_direct_capture_worker(args.account))
     if args.command == "direct-probe":
         return cmd_direct_probe(args.session, args.account, args.url)
+    if args.command == "direct-replay":
+        return cmd_direct_replay(args.account, args.index)
     if args.command == "bridge-file-send":
         return asyncio.run(cmd_bridge_file_send(args.account, args.peer, args.file))
     if args.command == "bridge-login":

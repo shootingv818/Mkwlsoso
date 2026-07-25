@@ -203,11 +203,38 @@ def test_transport_url():
     _check("transport parses host", t.host == "majid.eitaa.com" and t.port == 443 and t.path == "/eitaa/")
 
 
+def test_eitaa_envelope():
+    # Real bytes captured from Eitaa's MTProto worker (config + msgs_ack + a
+    # query request). wrap_eitaa must reproduce them byte-for-byte, and
+    # unwrap_eitaa must round-trip. This pins the CONFIRMED transport framing:
+    #   ed77be7a | len1 token1 | len2 token2 | BElen | body | trailer(11).
+    from direct.transport import wrap_eitaa, unwrap_eitaa, EITAA_MAGIC, EITAA_TRAILER
+    real = [
+        ("ed77be7a1f393137392e633735366132643130662e6534316334655f353032363731"
+         "3933146d727470676d69327939666d3232325f5f776562000000046b18f9c400000087"
+         "00000020000000"),
+        ("ed77be7a1f393137392e633735366132643130662e6534316334655f353032363731"
+         "3933146d727470676d69327939666d3232325f5f7765620000003400ef2e734ca5e8dd"
+         "3904ff0200000000ec7a9c440000000015c4b51c05000000e4f0e95688f1dd9e87ddf0"
+         "7e9eb45137a4177c7a0000008700000020000000"),
+    ]
+    for h in real:
+        raw = bytes.fromhex(h)
+        p = unwrap_eitaa(raw)
+        _check("envelope magic", raw[:4] == EITAA_MAGIC)
+        _check("envelope trailer constant", p["trailer"] == EITAA_TRAILER)
+        _check("envelope body length ok", p["ok"])
+        _check("token1 is route token", p["token1"].startswith("9179."))
+        _check("token2 is __web session id", p["token2"].endswith("__web"))
+        _check("wrap reproduces real bytes", wrap_eitaa(p["token1"], p["token2"], p["body"]) == raw)
+
+
 def main():
     print("== direct client offline tests ==")
     for fn in (test_aes_nist, test_ige_roundtrip, test_crypto_helpers,
                test_mtproto_envelope, test_tl_roundtrip, test_session_loader,
-               test_service_parser, test_schema_wrap, test_transport_url):
+               test_service_parser, test_schema_wrap, test_transport_url,
+               test_eitaa_envelope):
         print(f"[{fn.__name__}]")
         fn()
     print("\nALL DIRECT TESTS PASSED")
