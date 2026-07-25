@@ -27,11 +27,99 @@ from bot.runner import manager, expand_range
 
 # ---- helpers -----------------------------------------------------------
 
+# Every list in the panel is paged at this size so a keyboard never grows huge.
+PAGE_SIZE = 10
+
+
 def list_accounts() -> list[str]:
     d = config.PROFILES_DIR
     if not d.is_dir():
         return []
     return sorted(p.name for p in d.iterdir() if p.is_dir())
+
+
+def account_name_for_phone(phone: str) -> str:
+    """The profile (account) name for a phone number: its digits.
+
+    Accounts used to need a made-up name; now the number is the identity, so the
+    profile directory is simply "989304683887" and every list can show the number
+    with nothing extra to remember. Iranian numbers are normalized to 98XXXXXXXXXX
+    so 0930..., 930... and +98930... all map to the SAME account.
+    """
+    digits = re.sub(r"\D", "", phone or "")
+    if digits.startswith("0098"):
+        digits = digits[4:]
+    elif digits.startswith("98"):
+        digits = digits[2:]
+    elif digits.startswith("0"):
+        digits = digits[1:]
+    if len(digits) == 10 and digits.startswith("9"):
+        return "98" + digits
+    # Not an Iranian mobile: keep the digits as given rather than mangling them.
+    return re.sub(r"\D", "", phone or "")
+
+
+def _page_slice(items: list, page: int) -> tuple[list, int, int]:
+    """(items on this page, clamped page index, page count) for PAGE_SIZE paging."""
+    pages = max(1, (len(items) + PAGE_SIZE - 1) // PAGE_SIZE)
+    page = max(0, min(page, pages - 1))
+    start = page * PAGE_SIZE
+    return items[start:start + PAGE_SIZE], page, pages
+
+
+def _pager_row(prefix: str, page: int, pages: int) -> list:
+    """A ◀ / page / ▶ row for a paged keyboard (only when there's >1 page)."""
+    if pages <= 1:
+        return []
+    prev_page = (page - 1) % pages
+    next_page = (page + 1) % pages
+    return [
+        Button.inline("◀", f"{prefix}{prev_page}".encode()),
+        Button.inline(f"{page + 1}/{pages}", b"noop"),
+        Button.inline("▶", f"{prefix}{next_page}".encode()),
+    ]
+
+
+def delete_account_files(account: str) -> list[str]:
+    """Remove an account's browser profile and its per-account artifacts.
+
+    Returns human labels of what was actually removed, for the log card.
+    """
+    import shutil
+
+    removed: list[str] = []
+    profile = config.profile_dir(account)
+    try:
+        if profile.is_dir():
+            shutil.rmtree(profile)
+            removed.append("browser profile")
+    except OSError as exc:
+        print(f"[account] could not remove profile {profile}: {exc}", flush=True)
+
+    # Saved peers live in the isolated direct/ store; ask it to clean up.
+    try:
+        from direct import peers as peer_store
+        if peer_store.forget(account):
+            removed.append("saved peers")
+    except Exception:  # noqa: BLE001 - direct/ may have been deleted on purpose
+        pass
+
+    # Captured session + cookies for this account (gitignored artifacts).
+    sessions = config.ARTIFACTS_DIR / "sessions"
+    if sessions.is_dir():
+        patterns = (f"capall_{account}_*.json", f"worker_tx_{account}_*.json",
+                    f"cookies_{account}.json", f"{account}_*.json")
+        hit = False
+        for pattern in patterns:
+            for path in sessions.glob(pattern):
+                try:
+                    path.unlink()
+                    hit = True
+                except OSError:
+                    pass
+        if hit:
+            removed.append("captured session")
+    return removed
 
 
 def is_owner(event) -> bool:
@@ -117,13 +205,21 @@ def kb_back():
     return [[Button.inline("⬅ Back", b"menu:home")]]
 
 
-def kb_accounts():
-    rows = []
+def kb_accounts(page: int = 0):
+    """Accounts list, 10 per page. Each button is just the account's number."""
+    accounts = list_accounts()
+    shown, page, pages = _page_slice(accounts, page)
     active = store.active_account
-    for acc in list_accounts():
+    rows = []
+    for acc in shown:
         mark = "🟢 " if acc == active else "• "
-        label = store.account_phone(acc)
-        rows.append([Button.inline(f"{mark}{label}", f"acc:open:{acc}".encode())])
+        rows.append([Button.inline(f"{mark}{store.account_phone(acc)}",
+                                   f"acc:open:{acc}".encode())])
+    pager = _pager_row("acc:page:", page, pages)
+    if pager:
+        rows.append(pager)
+    if accounts:
+        rows.append([Button.inline("🚀 Multi-Account Send", b"multi:open:0")])
     rows.append([Button.inline("➕ Add Account", b"acc:add"),
                  Button.inline("⬅ Back", b"menu:home")])
     return rows
@@ -138,8 +234,35 @@ def kb_account_panel(acc: str):
     ]
     if busy:
         rows.append([Button.inline("⏹ Stop", b"pnl:stop")])
+    rows.append([Button.inline("🗑 Delete Account", f"acc:del:{acc}".encode())])
     rows.append([Button.inline("👤 Accounts", b"menu:accounts"),
                  Button.inline("⬅ Home", b"menu:home")])
+    return rows
+
+
+def kb_confirm_delete(acc: str):
+    return [
+        [Button.inline("✅ Yes, delete", f"acc:delx:{acc}".encode()),
+         Button.inline("❌ Cancel", f"acc:open:{acc}".encode())],
+    ]
+
+
+def kb_multi(page: int = 0):
+    """Tick several accounts, then send from all of them at once (10 per page)."""
+    accounts = list_accounts()
+    selected = store.prune_selected(accounts)
+    shown, page, pages = _page_slice(accounts, page)
+    rows = []
+    for acc in shown:
+        mark = "☑" if acc in selected else "☐"
+        rows.append([Button.inline(f"{mark} {store.account_phone(acc)}",
+                                   f"multi:tog:{page}:{acc}".encode())])
+    pager = _pager_row("multi:open:", page, pages)
+    if pager:
+        rows.append(pager)
+    rows.append([Button.inline(f"🚀 Send from {len(selected)} account(s)", b"multi:go")])
+    rows.append([Button.inline("🧹 Clear", f"multi:clear:{page}".encode()),
+                 Button.inline("⬅ Back", b"menu:accounts")])
     return rows
 
 
@@ -178,9 +301,45 @@ def accounts_text() -> str:
         "👤 ACCOUNTS",
         [("Total ", len(accs)), ("Active", store.account_phone(store.active_account)
                                   if store.active_account else "none")],
-        footer=("Tap an account's number to open its panel (send + build contacts)."
+        footer=("Tap a number to open its panel, or use Multi-Account Send to "
+                "send from several accounts at once."
                 if accs else "No accounts yet. Use ➕ Add Account."),
     )
+
+
+def multi_text() -> str:
+    accounts = list_accounts()
+    selected = store.prune_selected(accounts)
+    peers_total = 0
+    if store.engine == "direct":
+        try:
+            from direct import peers as peer_store
+            peers_total = sum(peer_store.count(a) for a in selected)
+        except Exception:  # noqa: BLE001
+            peers_total = 0
+    pairs = [
+        ("Accounts", len(accounts)),
+        ("Selected", len(selected)),
+        ("Engine  ", store.engine),
+        ("Content ", store.content_summary()),
+    ]
+    if store.engine == "direct":
+        pairs.append(("Peers   ", peers_total))
+    return cards.card(
+        "🚀 MULTI-ACCOUNT SEND",
+        pairs,
+        footer="Tick the accounts, then press Send. They run at the same time and "
+               "report into ONE live card with the combined totals.",
+    )
+
+
+def peer_count(acc: str) -> int | None:
+    """How many contacts the browser-free sender can reach for this account."""
+    try:
+        from direct import peers as peer_store
+        return peer_store.count(acc)
+    except Exception:  # noqa: BLE001 - direct/ is optional by design
+        return None
 
 
 def account_panel_text(acc: str) -> str:
@@ -188,7 +347,7 @@ def account_panel_text(acc: str) -> str:
     return cards.account_panel(
         acc, store.account_phone(acc),
         meta.get("contacts"), meta.get("pvs"),
-        store.engine, manager.is_busy(acc),
+        store.engine, manager.is_busy(acc), peers=peer_count(acc),
     )
 
 
@@ -263,8 +422,13 @@ async def _handle_callback(event):
     if data == "menu:home":
         pending.pop(event.sender_id, None)
         return await show_home(event, edit=True)
+    if data == "noop":
+        return await event.answer()
     if data == "menu:accounts":
-        return await event.edit(accounts_text(), buttons=kb_accounts())
+        return await event.edit(accounts_text(), buttons=kb_accounts(0))
+    if data.startswith("acc:page:"):
+        page = int(data.rsplit(":", 1)[1] or 0)
+        return await event.edit(accounts_text(), buttons=kb_accounts(page))
     if data == "menu:content":
         return await event.edit(content_text(), buttons=kb_content())
     if data == "menu:settings":
@@ -277,13 +441,50 @@ async def _handle_callback(event):
         await event.answer(f"Active: {store.account_phone(acc)}")
         return await event.edit(account_panel_text(acc), buttons=kb_account_panel(acc))
     if data == "acc:add":
-        pending[event.sender_id] = {"step": "login_name"}
+        # No name step: the phone number IS the account, so that's all we ask.
+        pending[event.sender_id] = {"step": "login_phone"}
         return await event.edit(
             cards.card("➕ ADD ACCOUNT",
-                       footer="Send a short name for the account (letters, numbers, "
-                              "underscore — e.g. acc2). Then I'll ask for the phone and "
-                              "the login code, right here. No noVNC needed."),
+                       footer="Send the phone number (e.g. 09304683887). Then I'll ask "
+                              "for the login code, right here. No noVNC needed."),
             buttons=kb_back())
+
+    # ---- delete an account ----
+    if data.startswith("acc:del:"):
+        acc = data.split(":", 2)[2]
+        if manager.is_busy(acc):
+            return await event.answer("Account is busy with a running job.", alert=True)
+        return await event.edit(
+            cards.card("🗑 DELETE ACCOUNT",
+                       [("Phone", store.account_phone(acc))],
+                       footer="This removes its browser profile, saved peers and captured "
+                              "session. You would have to log in again. Are you sure?"),
+            buttons=kb_confirm_delete(acc))
+    if data.startswith("acc:delx:"):
+        acc = data.split(":", 2)[2]
+        if manager.is_busy(acc):
+            return await event.answer("Account is busy with a running job.", alert=True)
+        phone = store.account_phone(acc)
+        removed = delete_account_files(acc)
+        store.remove_account(acc)
+        await event.answer("Deleted.")
+        await report(cards.account_deleted(phone, removed))
+        return await event.edit(accounts_text(), buttons=kb_accounts(0))
+
+    # ---- multi-account send ----
+    if data.startswith("multi:open:"):
+        page = int(data.rsplit(":", 1)[1] or 0)
+        return await event.edit(multi_text(), buttons=kb_multi(page))
+    if data.startswith("multi:tog:"):
+        _, _, page_s, acc = data.split(":", 3)
+        store.toggle_selected(acc)
+        return await event.edit(multi_text(), buttons=kb_multi(int(page_s or 0)))
+    if data.startswith("multi:clear:"):
+        page = int(data.rsplit(":", 1)[1] or 0)
+        store.clear_selected()
+        return await event.edit(multi_text(), buttons=kb_multi(page))
+    if data == "multi:go":
+        return await _start_multi_send(event)
 
     # ---- per-account panel actions (operate on active) ----
     if data == "pnl:refresh":
@@ -373,7 +574,7 @@ async def _refresh_account(event, acc: str):
                 store.set_account_meta(acc, contacts=s.get("contacts"), pvs=s.get("pvs"))
                 await report(cards.account_panel(
                     acc, store.account_phone(acc), s.get("contacts"), s.get("pvs"),
-                    store.engine, False))
+                    store.engine, False, peers=peer_count(acc)))
         except Exception as exc:  # noqa: BLE001
             await report(cards.error_card("stats", acc, code=type(exc).__name__,
                                           detail=str(exc), phase="refresh"))
@@ -394,6 +595,37 @@ async def _start_send(event):
                            live=live, account_phone=store.account_phone(active))
     await event.answer("Send job started.")
     await event.edit(account_panel_text(active), buttons=kb_account_panel(active))
+
+
+async def _start_multi_send(event):
+    """Send from every ticked account at once, into ONE shared live card."""
+    accounts = list_accounts()
+    selected = store.prune_selected(accounts)
+    if not selected:
+        return await event.answer("Tick at least one account first.", alert=True)
+    if store.content.get("kind") not in ("text", "file"):
+        return await event.answer("Set content first (Content menu).", alert=True)
+    busy = [a for a in selected if manager.is_busy(a)]
+    free = [a for a in selected if not manager.is_busy(a)]
+    if not free:
+        return await event.answer("All selected accounts already have a running job.",
+                                  alert=True)
+    live = LiveCard(config.report_to())
+    pairs = [(a, store.account_phone(a)) for a in free]
+    jobs = await manager.run_send_multi(pairs, dict(store.content),
+                                        dict(store.settings), report, live=live)
+    await event.answer(f"Started on {len(jobs)} account(s).")
+    footer = None
+    if busy:
+        footer = ("Skipped (already busy): "
+                  + ", ".join(store.account_phone(a) for a in busy))
+    await event.edit(
+        cards.card("🚀 MULTI-ACCOUNT SEND QUEUED",
+                   [("Accounts", len(jobs)),
+                    ("Engine  ", store.engine),
+                    ("Content ", store.content_summary())],
+                   footer=footer or "One live card will follow and update in place."),
+        buttons=kb_back())
 
 
 @bot.on(events.NewMessage)
@@ -429,35 +661,28 @@ async def _conversation(event):
         pending.pop(event.sender_id, None)
         return await event.respond(content_text(), buttons=kb_content())
 
-    if step == "login_name":
-        name = text
-        if not re.fullmatch(r"[A-Za-z0-9_]{1,32}", name or ""):
-            return await event.respond(
-                "Send a valid name: letters, numbers, underscore (max 32). e.g. acc2")
-        if manager.is_busy(name):
-            return await event.respond("That account already has a running job. Try again later.")
-        st["login_account"] = name
-        st["step"] = "login_phone"
-        return await event.respond(
-            cards.card("➕ ADD ACCOUNT", [("Account", name)],
-                       footer="Now send the phone number (e.g. 0930... or 98930...)."),
-            buttons=kb_back())
-
     if step == "login_phone":
         phone = re.sub(r"[^\d+]", "", text or "")
         if len(re.sub(r"\D", "", phone)) < 10:
             return await event.respond("Send a valid phone number (e.g. 09304683887).")
-        name = st.get("login_account")
-        if not name:
+        # The phone number IS the account: no separate name to invent or remember.
+        name = account_name_for_phone(phone)
+        if name in list_accounts():
             pending.pop(event.sender_id, None)
-            return await event.respond("Lost the account name; tap Add Account again.")
+            return await event.respond(
+                cards.card("➕ ADD ACCOUNT", [("Phone", store.account_phone(name))],
+                           footer="This number is already added. Open it from Accounts."),
+                buttons=kb_back())
+        if manager.is_busy(name):
+            return await event.respond("That account already has a running job. Try again later.")
         started = await manager.start_bridge_login(name, phone, report)
         if not started:
             pending.pop(event.sender_id, None)
             return await event.respond("That account is busy right now. Try again later.")
+        st["login_account"] = name
         st["step"] = "login_code"
         return await event.respond(
-            cards.card("➕ ADD ACCOUNT", [("Account", name), ("Status", "requesting code…")],
+            cards.card("➕ ADD ACCOUNT", [("Phone ", name), ("Status", "requesting code…")],
                        footer="Wait for the '📩 CODE SENT' card, then send the code here (digits only)."),
             buttons=kb_back())
 

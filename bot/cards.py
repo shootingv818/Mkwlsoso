@@ -126,6 +126,56 @@ def live_send(phone: str, sent: int, failed: int, total: int, elapsed: float,
     )
 
 
+# Per-account state marks used in the multi-account breakdown.
+_STATE_MARK = {
+    "pending": "⏳",
+    "running": "🟢",
+    "done": "✅",
+    "stopped": "🛑",
+    "failed": "⚠️",
+    "limited": "🚫",
+}
+
+
+def live_send_multi(accounts: list[dict], current: str | None, sent: int,
+                    failed: int, total: int, elapsed: float,
+                    status: str = "🟢 Sending", engine: str | None = None,
+                    kind: str | None = None) -> str:
+    """ONE live card for a simultaneous multi-account send.
+
+    `sent`/`failed`/`total` are the COMBINED numbers across every selected
+    account (their contact lists added together), so the top block answers "how
+    much of the whole job is done". `current` names the account that most
+    recently sent, and the breakdown block shows each account's own progress.
+
+    accounts: [{"phone": str, "sent": int, "failed": int, "total": int,
+                "state": "pending|running|done|stopped|failed|limited"}]
+    """
+    head = _rows([
+        ("Accounts", len(accounts)),
+        ("Current ", current or "—"),
+        ("Engine  ", engine),
+        ("Type    ", kind),
+        ("Status  ", status),
+        ("Sent    ", f"{sent} of {total} — {_pct(sent, total)}"),
+        ("Failed  ", failed),
+        ("Elapsed ", fmt_duration(elapsed)),
+    ])
+    lines = ["📤 Multi-Account Send — Live", DIVIDER, *head]
+    if accounts:
+        lines.append(DIVIDER)
+        width = max(len(str(a.get("phone", ""))) for a in accounts)
+        for a in accounts:
+            mark = _STATE_MARK.get(str(a.get("state", "pending")), "•")
+            phone = str(a.get("phone", "")).ljust(width)
+            row = (f"{mark} {phone} · {a.get('sent', 0)}/{a.get('total', 0)}")
+            if a.get("failed"):
+                row += f" · ✗{a['failed']}"
+            lines.append(row)
+    lines.append(f"🕒 {now_hms()}")
+    return "\n".join(lines)
+
+
 # ---- ready-made cards --------------------------------------------------
 
 def panel_home(version: str, accounts: int, active: str | None,
@@ -168,18 +218,25 @@ def account_added(account: str, phone: str, contacts: int | None, pvs: int | Non
 
 
 def account_panel(account: str, phone: str, contacts: int | None, pvs: int | None,
-                  engine: str | None, busy: bool) -> str:
+                  engine: str | None, busy: bool, peers: int | None = None) -> str:
+    """One account's panel. `peers` is how many contacts the browser-free (fast)
+    sender can reach, which is the difference between a direct send working and
+    having no targets at all."""
+    footer = "Send content or build contacts with this account."
+    if engine == "direct" and not peers:
+        footer = ("No saved peers yet, so the fast engine has no targets. Build "
+                  "contacts (or send once with the bridge engine) to harvest them.")
     return card(
         "👤 ACCOUNT",
         [
-            ("Account ", account),
             ("Phone   ", phone),
             ("Contacts", contacts if contacts is not None else "—"),
             ("Chats   ", pvs if pvs is not None else "—"),
+            ("Peers   ", peers if peers is not None else "—"),
             ("Engine  ", engine),
             ("State   ", "⏳ busy" if busy else "🟢 idle"),
         ],
-        footer="Send content or build contacts with this account.",
+        footer=footer,
     )
 
 
@@ -312,3 +369,95 @@ def paused_card(account: str, reason: str, sent_before: int) -> str:
             ("Time       ", now_hms()),
         ],
     )
+
+
+
+def contacts_probe(account: str, tried: list[dict], chosen: str | None,
+                   fallback: bool = False) -> str:
+    """Report EXACTLY what the server answered for the first import batch.
+
+    Contact building used to report "0 found" with no explanation when the
+    server matched nothing, which looked like the job doing nothing at all.
+    Each probe row is one phone format we tried, with the raw counts.
+
+    tried: [{"format": "98"|"+98", "imported": int, "users": int,
+             "retry": int, "batch": int, "code": str|None}]
+    """
+    rows = []
+    for t in tried:
+        if t.get("code"):
+            rows.append((f"Format {t.get('format', '?')}", f"error: {sanitize(t['code'], 90)}"))
+        else:
+            rows.append((
+                f"Format {t.get('format', '?')}",
+                f"imported={t.get('imported', 0)} users={t.get('users', 0)} "
+                f"retry={t.get('retry', 0)} of {t.get('batch', 0)}",
+            ))
+    footer = None
+    if chosen:
+        footer = f"Using phone format {chosen} for the rest of this job."
+    elif fallback:
+        footer = ("Neither phone format matched anyone, so the job switched to the "
+                  "proven one-by-one add flow. If that also finds nobody, these "
+                  "numbers are simply not registered on Eitaa.")
+    return card(
+        "🔬 IMPORT PROBE",
+        [("Account", account), *rows, ("Time   ", now_hms())],
+        footer=footer,
+    )
+
+
+def peers_saved(account: str, new_peers: int, total_peers: int,
+                source: str = "import") -> str:
+    """Peers are what the browser-free (fast) sender needs to reach a contact."""
+    return card(
+        "🔑 PEERS SAVED",
+        [
+            ("Account", account),
+            ("Source ", source),
+            ("New    ", new_peers),
+            ("Total  ", total_peers),
+            ("Time   ", now_hms()),
+        ],
+        footer="These contacts can now be reached with the fast (no-browser) sender.",
+    )
+
+
+def account_deleted(phone: str, removed: list[str]) -> str:
+    return card(
+        "🗑 ACCOUNT DELETED",
+        [
+            ("Phone  ", phone),
+            ("Removed", ", ".join(removed) if removed else "nothing found"),
+            ("Time   ", now_hms()),
+        ],
+        footer="Its browser profile, saved peers and captured session are gone.",
+    )
+
+
+def multi_send_finished(accounts: list[dict], sent: int, failed: int, total: int,
+                        elapsed: float, kind: str | None = None,
+                        engine: str | None = None, stopped: bool = False) -> str:
+    """Final summary of a multi-account send (combined + per account)."""
+    lines = [
+        "🛑 MULTI-ACCOUNT SEND STOPPED" if stopped else "✅ MULTI-ACCOUNT SEND FINISHED",
+        DIVIDER,
+        *_rows([
+            ("Accounts", len(accounts)),
+            ("Engine  ", engine),
+            ("Type    ", kind),
+            ("Sent    ", f"{sent} of {total}"),
+            ("Failed  ", failed),
+            ("Time    ", fmt_duration(elapsed)),
+        ]),
+    ]
+    if accounts:
+        lines.append(DIVIDER)
+        for a in accounts:
+            mark = _STATE_MARK.get(str(a.get("state", "done")), "•")
+            lines.append(f"{mark} {a.get('phone', '')} · "
+                         f"{a.get('sent', 0)}/{a.get('total', 0)}"
+                         + (f" · ✗{a['failed']}" if a.get("failed") else ""))
+    lines.append(DIVIDER)
+    lines.append(f"🕒 {now_hms()}")
+    return "\n".join(lines)

@@ -4,7 +4,9 @@ Comprehensive record of the browser-free Eitaa Direct Client + the Telegram bot
 v2 update. Read this first when continuing on a new session/account.
 
 - Repo: `shootingv818/Mkwlsoso`
-- Working branch: `feat/eitaa-web-capture` (PR #1)
+- Base branch: `feat/eitaa-web-capture`
+- Working branch: `feat/fast-send-multi-account` (fast send + multi-account panel;
+  switch back to the base branch to revert this whole update)
 - Server: `~/Mkwlsoso`, venv `.venv`, `DISPLAY=:99`, runs via systemd `mkwlsoso-bot`
 - The assistant CANNOT run live (sandbox has no Playwright/Telethon/network) — it
   only compiles + runs offline tests (`python -m direct.tests.test_direct`). The
@@ -88,6 +90,57 @@ python cli.py direct-send-file --account <a> [--to "<c>"] --file f.zip --caption
 python cli.py direct-import    --account <a> --phone "+98..." --first Name
 ```
 
+### Fast send + multi-account panel (branch `feat/fast-send-multi-account`)
+Built entirely by WIRING UP existing proven code — no new protocol work.
+
+New isolated modules (deleting `direct/` still reverts everything):
+- `direct/peers.py` — the peer store, now shared by the CLI and the bot. Same
+  `peers_<account>.json` format as before, plus an `id:<user_id>` alias.
+  `save_users()` / `targets()` / `resolve()` / `count()` / `forget()`.
+- `direct/sender.py` — the long-running form of `direct-send` / `direct-send-file`:
+  `DirectSender(account).send_text(peer, text)`, `upload_file()` once +
+  `send_uploaded_file(peer, caption)` per recipient, `import_contacts(batch)`.
+  Keep-alive per host, hosts taken from the account's own capture. Returns the
+  same dict shape as the browser bridge.
+
+**The unlock: `access_hash` was being thrown away twice.**
+A browser-free send needs `user_id` + `access_hash`. Both were already on the wire:
+- `contacts.importContacts` returns the matched users WITH their access_hash —
+  `contacts_bridge.js` reduced it to `has_hash: true/false`.
+- `appPeersManager.getInputPeerById` returns a real inputPeer — `RESOLVE_PEERS_JS`
+  only reported whether a hash existed.
+Both now return the value and it is persisted. So: build/collect contacts once with
+the bridge engine, then the direct engine can send to all of them with no browser.
+
+Wired up:
+- `bot/runner.py` `run_send()` now ROUTES on the engine (mirroring `run_contacts`):
+  `direct` → new `_send_job_direct` (browser-free, blocking calls in
+  `asyncio.to_thread`), `bridge` → the unchanged proven path, which now also
+  harvests peers.
+- `run_send_multi()` + `AggregateProgress`: several accounts send SIMULTANEOUSLY and
+  report into ONE live card with the COMBINED sent/total plus a per-account
+  breakdown; a supervisor posts one final summary.
+- `_contacts_job_direct` no longer hardcodes `bagher.eitaa.ir` and no longer blocks
+  the event loop — it uses `DirectSender.import_contacts` in a thread.
+
+Contact-build bug (raced through, built nothing, no reason given):
+- Root cause candidate confirmed to be diagnosable, not guessed: the server matches
+  nobody and returns NO error when the phone format is wrong. The first batch is now
+  probed in BOTH formats (`98…` and `+98…`), the raw counts are posted as a
+  **🔬 IMPORT PROBE** card, the winning format is used for the rest of the job, and
+  if neither matches anyone the job falls back to the proven one-by-one UI add flow
+  instead of reporting a silent zero. Rate limits abort rather than fall back.
+
+Panel changes (see `bot/README.md`):
+- Adding an account no longer asks for a name — the phone digits ARE the account
+  (`0930…`/`930…`/`+98930…` all map to `98…`); duplicates are refused.
+- The Accounts list shows ONLY the number, 10 per page with `◀ 1/3 ▶`.
+- 🗑 Delete Account (with confirm) removes the browser profile, saved peers and
+  captured session.
+- 🚀 Multi-Account Send: tick accounts (10 per page) → send from all at once.
+- The account panel shows a **Peers** count and warns when the direct engine has no
+  targets.
+
 ### bot/ (Telegram panel v2) — see `bot/README.md`
 - Engine selection in Settings (bridge/direct); Home shows engine + bot + server ping.
 - Accounts listed by phone; tap a number → per-account panel (Send / Build Contacts /
@@ -124,15 +177,27 @@ python cli.py direct-import    --account <a> --phone "+98..." --first Name
   Nothing to fix. txt/zip/pdf/images work.
 
 ## 6) Known limits / TODO (next steps)
-- Direct-engine **send-to-all contacts** is NOT built (needs a contact-peer sync,
-  e.g. parse imported users' access_hash or reverse `contacts.getContacts`). For
-  now the bot's SEND always uses the bridge fast-path; the engine setting governs
-  CONTACT BUILDING only.
+- ⚠️ Everything on `feat/fast-send-multi-account` is compiled + offline-tested but
+  **NOT yet live-tested**. First live runs to do, in order:
+  1. Build Contacts with the bridge engine → read the **🔬 IMPORT PROBE** card. It
+     tells us definitively whether the phone format was the contact-build bug.
+  2. Confirm a **🔑 PEERS SAVED** card appears and the account panel shows Peers > 0.
+  3. Switch the engine to `direct` and Send → this is the first browser-free
+     send-to-all.
+  4. Try Multi-Account Send with 2 accounts and check the single combined card.
+- The **direct** engine cannot harvest peers itself: `contacts.importedContacts`
+  ends with a `Vector<User>` whose row constructor is Eitaa-specific and unknown, so
+  `parse_import_result()` deliberately stops at the safe rows. Peer harvesting needs
+  one bridge-engine pass. Reversing that User row (from a real capture) would remove
+  the last reason to open a browser for contacts.
 - Confirm token1/token2 stability across browser restarts; ideally source the
   token from the session export (localStorage `token`) instead of the newest capture.
 - Verify multi-part (>512 KiB) file uploads live.
 - Optional: a direct MTProto login handshake (so `direct` needs no browser capture at all).
-- Bot v2 is compiled + offline-checked but NOT yet live-tested end-to-end by the user.
+- Still NOT built: resume/checkpoint for the bot's send job (`jobs/state.py` is
+  restart-safe but only wired to the CLI), recipient selection/dedupe, 2FA login,
+  scheduling, periodic batch cooldown in the panel, groups/channels and receiving
+  messages on the direct path.
 
 ## 7) Workflow notes
 - Confirm before brand-new directions; standing "بساز" to keep extending the direct

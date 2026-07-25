@@ -54,7 +54,21 @@ Every serializer in `eitaa_tl.py` reproduces the **real captured bytes byte-for-
 - `transport.py` — HTTPS POST (stdlib) + `wrap_eitaa()` / `unwrap_eitaa()` envelope.
 - `eitaa_tl.py` — method serializers, self-peer, file-send builder, `extract_context()`
   (pulls token1/token2/self-peer from the newest capture), `find_message_peer()`,
-  `classify_response()`.
+  `parse_import_result()`, `classify_response()`.
+- `peers.py` — **the peer store**. Owns `artifacts/sessions/peers_<account>.json`
+  (the format `direct-capture-peer` already wrote, plus an `id:<user_id>` alias per
+  entry). `save_users()` bulk-saves harvested `{user_id, access_hash}` rows,
+  `targets(account)` returns every sendable `(label, peer_bytes)`, `resolve()` looks
+  one up by name or id, `forget()` drops the file when an account is deleted. Both
+  the CLI and the Telegram bot use this one implementation.
+- `sender.py` — **the reusable sender**: the long-running form of the proven
+  `direct-send` / `direct-send-file` commands. `DirectSender(account)` loads the
+  session context, keeps ONE keep-alive connection per host, and exposes
+  `send_text(peer, text)`, `upload_file(path)` (once) + `send_uploaded_file(peer,
+  caption)` (per recipient, no re-upload), and `import_contacts(entries)`. Results
+  use the SAME dict shape as the browser bridge (`{ok, method, code, limit}`) so
+  callers can treat both engines identically. Hosts are read from the account's own
+  capture (API vs media) instead of being hardcoded.
 - `tl.py` — TL wire primitives.
 - `aes.py`, `crypto.py`, `mtproto.py`, `session.py`, `service.py`, `schema.py`, `dc.py`
   — the original encrypted-MTProto scaffolding, kept for a future direct **login**
@@ -86,9 +100,30 @@ python cli.py direct-send-file --account <acct> --to "<contact>" --file path.apk
 python cli.py direct-import    --account <acct> --phone "+98..." --first Name
 ```
 
-Sending to a contact needs its peer first (`direct-capture-peer` once); uploads are
-peer-independent, so files reuse the same self-upload path and only `sendMedia` routes
-to the chosen peer.
+Sending to a contact needs its peer first; uploads are peer-independent, so files
+reuse the same self-upload path and only `sendMedia` routes to the chosen peer.
+
+## Peers — the thing that unblocked browser-free sending
+A send needs the target's `user_id` **and** `access_hash` (the 20-byte
+`inputPeerUser`). Learning them one contact at a time with `direct-capture-peer`
+needs a browser per contact, which does not scale.
+
+The fix was not new protocol work — the data was already on the wire and being
+discarded in two places:
+- `contacts.importContacts` answers with the matched users **including their
+  access_hash**; `eitaa/contacts_bridge.js` reduced it to a boolean.
+- `appPeersManager.getInputPeerById` resolves a known contact to a real
+  `inputPeer`; the bridge-reach report only asked *whether* a hash existed.
+
+Both now return the value, and it is persisted through `peers.save_users()`.
+Practically: build (or collect) contacts once with the **bridge** engine, and from
+then on the **direct** engine can send to all of them with no browser at all.
+
+Note the direct engine can count imported contacts but does NOT read their
+access_hash: `contacts.importedContacts` ends with a `Vector<User>` whose row
+constructor is Eitaa-specific and unknown. Guessing it would produce
+silently-wrong peers, so `parse_import_result()` stops at the safe standard rows
+(`imported`, giving `imported_ids`) and peer harvesting is left to the bridge.
 
 ---
 
@@ -153,6 +188,18 @@ python cli.py direct-send-file --account test1 --to "علی" --file /tmp/t.apk -
 - **E. Sticky by source-port/TLS.** Unlikely, but if no cookie pins, the LB may use
   TLS session resumption — reuse one `ssl` context + connection (keep-alive already
   does this); if that were it, keep-alive would have fixed it (it didn't), so deprioritize.
+
+## Wired into the Telegram bot
+`bot/runner.py` now routes on the engine setting for **sending** as well, not only
+contact building:
+- `engine=direct` → `_send_job_direct`, which takes its targets from `peers.py` and
+  sends through `sender.py`. All blocking HTTPS runs in worker threads
+  (`asyncio.to_thread`) so the panel stays responsive.
+- `engine=bridge` → the unchanged, proven tweb path, which now also harvests peers
+  as a side effect.
+
+Everything is imported LAZILY from `bot/`, so deleting `direct/` still leaves the
+browser bot fully working.
 
 ## Status (live-verified on the server)
 - ✅ Transport + envelope proven (`direct-replay` returned Eitaa's DC config).
