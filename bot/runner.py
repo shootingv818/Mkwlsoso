@@ -1116,12 +1116,59 @@ class JobManager:
                 await live.set(cards.live_contacts(phone, prefix, 0, 0, total,
                                                    status="🟢 Searching", engine="direct"))
             done = 0
+            plus_prefix = True   # expand_range produces "+98..."
+
+            # PROBE FIRST, same as the bridge path: a wrong phone format makes the
+            # server match NOBODY and answer with no error, which is exactly the
+            # "raced through and built nothing" symptom. Try both formats on the
+            # first batch and post the raw counts.
+            probe = entries[:min(BATCH, total)]
+            tried: list[dict] = []
+            chosen: str | None = None
+            for plus in (True, False):
+                r = await asyncio.to_thread(sender.import_contacts, probe, plus)
+                fmt = "+98" if plus else "98"
+                if r.get("limit"):
+                    await report(cards.restriction_card(
+                        account, f"server: {r.get('code')}", added))
+                    chosen = None
+                    tried.append({"format": fmt, "batch": len(probe),
+                                  "code": r.get("code")})
+                    break
+                if not r.get("ok"):
+                    tried.append({"format": fmt, "batch": len(probe),
+                                  "code": r.get("code")})
+                    continue
+                imp = int(r.get("imported", 0))
+                tried.append({"format": fmt, "batch": len(probe), "imported": imp,
+                              "users": len(r.get("imported_ids") or []),
+                              "retry": 0, "parse_ok": r.get("parse_ok"),
+                              "cid": r.get("cid"), "head": r.get("head")})
+                if imp > 0:
+                    chosen = fmt
+                    plus_prefix = plus
+                    added += imp
+                    not_on += max(0, len(probe) - imp)
+                    done = len(probe)
+                    break
+            note = None
+            if chosen is None:
+                # No browser here, so there is no UI flow to fall back to. Keep
+                # scanning with the default format (the numbers may genuinely not
+                # be registered) but make the evidence visible either way.
+                note = ("Neither phone format matched anyone. Continuing with +98. "
+                        "If every batch stays at 0, either these numbers are not on "
+                        "Eitaa, or switch the engine to bridge and build there — the "
+                        "bridge path can fall back to the per-number add flow and "
+                        "also harvests peers.")
+            await report(cards.contacts_probe(account, tried, chosen, note=note))
+
             while done < total:
                 if job.stop:
                     break
                 batch = entries[done:done + BATCH]
                 # Blocking HTTPS in a worker thread so the panel stays responsive.
-                r = await asyncio.to_thread(sender.import_contacts, batch)
+                r = await asyncio.to_thread(sender.import_contacts, batch, plus_prefix)
                 if r.get("limit"):
                     await report(cards.restriction_card(
                         account, f"server: {r.get('code')}", added))
@@ -1132,6 +1179,17 @@ class JobManager:
                         "import_contacts", account, code="import_failed",
                         detail=str(r.get("code")), engine="direct",
                         phase="importContacts", trace_id=job.job_id))
+                elif not r.get("parse_ok", True):
+                    # The call succeeded but the reply was not importedContacts,
+                    # so "imported 0" would be a lie. Report it as an error.
+                    error += len(batch)
+                    cid = r.get("cid")
+                    await report(cards.error_card(
+                        "import_contacts", account, code="unexpected_reply",
+                        detail=f"reply cid={('0x%08x' % cid) if cid else '?'} "
+                               f"head={r.get('head')}",
+                        engine="direct", phase="parse_reply", trace_id=job.job_id))
+                    break
                 else:
                     imp = int(r.get("imported", 0))
                     added += imp

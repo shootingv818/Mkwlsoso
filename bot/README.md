@@ -97,6 +97,13 @@ create silently-wrong peers). When it imports contacts it says so with an
 engine to harvest them.
 
 ## Contact building — probe instead of a silent zero
+Both engines probe. The **bridge** path can fall back to the per-number UI add
+flow when nothing matches; the **direct** path has no browser to fall back to, so
+it keeps scanning with `+98` and says so in the card. The direct path also
+verifies the reply really was `contacts.importedContacts` — an unexpected reply
+constructor used to look identical to "imported 0" and is now reported as
+`unexpected_reply` with its cid + head.
+
 Contact building used to race through and report `Found: 0` with no reason. The
 cause is that the server matches **nobody** and returns no error when the phone
 format is not the one the build expects. So the first batch is now **probed in

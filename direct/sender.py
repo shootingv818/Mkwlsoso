@@ -267,19 +267,34 @@ class DirectSender:
         return res
 
     # ---- contacts (reuses the same envelope + classifier) ----
-    def import_contacts(self, entries) -> dict:
+    def import_contacts(self, entries, plus_prefix: bool = True) -> dict:
         """contacts.importContacts for a batch of {phone, first, last} dicts.
 
-        Returns {ok, imported, imported_ids, batch, code}. The imported COUNT
-        and the user_ids are trustworthy; the access_hash each peer needs is NOT
-        parsed here (Eitaa's User row constructor is unknown and guessing it
-        would produce silently-wrong peers). Peers are harvested through the
-        page bridge instead, where tweb has already parsed them.
+        Returns {ok, imported, imported_ids, batch, parse_ok, cid, head, code}.
+
+        `plus_prefix` selects the phone format on the wire ("+98..." vs "98...").
+        A wrong format makes the server match NOBODY and answer with no error at
+        all, so the caller probes both instead of reporting a silent zero.
+
+        `parse_ok` says whether the reply really was `contacts.importedContacts`.
+        Without it an unexpected reply constructor would also look like
+        "imported 0", which is a very different problem; `cid` + `head` are
+        included so it can be identified instead of guessed.
+
+        The imported COUNT and the user_ids are trustworthy; the access_hash each
+        peer needs is NOT parsed here (Eitaa's User row constructor is unknown
+        and guessing it would produce silently-wrong peers). Peers are harvested
+        through the page bridge instead, where tweb has already parsed them.
         """
-        trips = [(e.get("phone", ""), e.get("first", ""), e.get("last", ""))
+        def _fmt(phone: str) -> str:
+            digits = str(phone or "").lstrip("+")
+            return ("+" + digits) if plus_prefix else digits
+
+        trips = [(_fmt(e.get("phone", "")), e.get("first", ""), e.get("last", ""))
                  for e in entries]
         if not trips:
-            return {"ok": True, "imported": 0, "batch": 0, "imported_ids": []}
+            return {"ok": True, "imported": 0, "batch": 0, "imported_ids": [],
+                    "parse_ok": True}
         raw = wrap_eitaa(self.ctx["token1"], self.ctx["token2"],
                          E.import_contacts(trips))
         try:
@@ -300,4 +315,8 @@ class DirectSender:
         parsed = E.parse_import_result(body)
         return {"ok": True, "imported": int(parsed.get("imported", 0)),
                 "imported_ids": parsed.get("imported_ids") or [],
-                "batch": len(trips)}
+                "batch": len(trips),
+                "parse_ok": bool(parsed.get("ok")),
+                "cid": parsed.get("cid"),
+                "head": body[:32].hex(),
+                "phone_format": "+98" if plus_prefix else "98"}

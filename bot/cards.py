@@ -373,7 +373,7 @@ def paused_card(account: str, reason: str, sent_before: int) -> str:
 
 
 def contacts_probe(account: str, tried: list[dict], chosen: str | None,
-                   fallback: bool = False) -> str:
+                   fallback: bool = False, note: str | None = None) -> str:
     """Report EXACTLY what the server answered for the first import batch.
 
     Contact building used to report "0 found" with no explanation when the
@@ -385,16 +385,23 @@ def contacts_probe(account: str, tried: list[dict], chosen: str | None,
     """
     rows = []
     for t in tried:
+        label = f"Format {t.get('format', '?')}"
         if t.get("code"):
-            rows.append((f"Format {t.get('format', '?')}", f"error: {sanitize(t['code'], 90)}"))
-        else:
-            rows.append((
-                f"Format {t.get('format', '?')}",
-                f"imported={t.get('imported', 0)} users={t.get('users', 0)} "
-                f"retry={t.get('retry', 0)} of {t.get('batch', 0)}",
-            ))
-    footer = None
-    if chosen:
+            rows.append((label, f"error: {sanitize(t['code'], 90)}"))
+            continue
+        detail = (f"imported={t.get('imported', 0)} users={t.get('users', 0)} "
+                  f"retry={t.get('retry', 0)} of {t.get('batch', 0)}")
+        # An unexpected reply constructor also looks like "imported 0", so name it.
+        if t.get("parse_ok") is False:
+            cid = t.get("cid")
+            detail += f" | UNEXPECTED REPLY cid={('0x%08x' % cid) if cid else '?'}"
+            if t.get("head"):
+                detail += f" head={t['head'][:32]}"
+        rows.append((label, detail))
+    footer = note
+    if note:
+        pass
+    elif chosen:
         footer = f"Using phone format {chosen} for the rest of this job."
     elif fallback:
         footer = ("Neither phone format matched anyone, so the job switched to the "
