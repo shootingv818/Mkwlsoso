@@ -247,7 +247,9 @@ def kb_account_panel(acc: str):
          Button.inline("🔄 Refresh", b"pnl:refresh")],
     ]
     if busy:
-        rows.append([Button.inline("⏹ Stop", b"pnl:stop")])
+        # The label escalates: a second press force-stops.
+        label = "❌ Force Stop" if manager.account_stopping(acc) else "⏹ Stop"
+        rows.append([Button.inline(label, b"pnl:stop")])
     rows.append([Button.inline("🗑 Delete Account", f"acc:del:{acc}".encode())])
     rows.append([Button.inline("👤 Accounts", b"menu:accounts"),
                  Button.inline("⬅ Home", b"menu:home")])
@@ -285,7 +287,8 @@ def kb_multi(page: int = 0):
         rows.append(pager)
     if accounts:
         if manager.multi_jobs():
-            rows.append([Button.inline("⏹ Stop Run", b"multi:stop")])
+            label = "❌ Force Stop Run" if manager.multi_stopping() else "⏹ Stop Run"
+            rows.append([Button.inline(label, b"multi:stop")])
         else:
             reach = sum(contacts_store.count(a) for a in selected)
             rows.append([Button.inline(
@@ -381,7 +384,10 @@ def multi_text() -> str:
             for i, a in enumerate(selected, start=1))
 
     if running:
-        footer = "⏳ A run is already in progress. Use Stop Run to end it."
+        footer = ("🛑 Stopping… press Force Stop Run to cut it off immediately."
+                  if manager.multi_stopping()
+                  else "⏳ A run is in progress. Stop Run ends it after the message "
+                       "in flight; press it twice to force.")
     elif not accounts:
         footer = "No accounts yet. Add one first."
     elif not selected:
@@ -555,9 +561,14 @@ async def _handle_callback(event):
     if data == "multi:go":
         return await _start_multi_send(event)
     if data == "multi:stop":
-        n = manager.stop_multi()
-        await event.answer("Stopping after the current contact." if n
-                           else "No multi-account run is active.", alert=not n)
+        force = manager.multi_stopping()
+        n = manager.stop_multi(force=force)
+        if not n:
+            await event.answer("No multi-account run is active.", alert=True)
+        elif force:
+            await event.answer("Force-stopped the whole run.")
+        else:
+            await event.answer("Stopping now — press again to force.")
         return await event.edit(multi_text(), buttons=kb_multi(0))
 
     # ---- per-account panel actions (operate on active) ----
@@ -593,8 +604,16 @@ async def _handle_callback(event):
             buttons=kb_back())
     if data == "pnl:stop":
         if active:
-            manager.stop_account(active)
-            await event.answer("Stop requested.")
+            # First press: stop cleanly (every wait wakes at once, so this is
+            # immediate unless a message is mid-flight). Press again to kill it.
+            force = manager.account_stopping(active)
+            n = manager.stop_account(active, force=force)
+            if not n:
+                await event.answer("Nothing is running on this account.", alert=True)
+            elif force:
+                await event.answer("Force-stopped.")
+            else:
+                await event.answer("Stopping now — press again to force.")
         return await event.edit(account_panel_text(active), buttons=kb_account_panel(active))
 
     # ---- content ----

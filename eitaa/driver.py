@@ -145,11 +145,13 @@ class EitaaDriver:
         rows = await self._snapshot_chats()
         return [r["title"] for r in rows[:limit]]
 
-    async def collect_all_chats(self, max_scrolls: int = 60) -> list[dict]:
+    async def collect_all_chats(self, max_scrolls: int = 60,
+                                should_stop: Callable[[], bool] | None = None) -> list[dict]:
         """Scroll the chat list and collect all rendered chats (deduped).
 
         tweb virtualizes the list, so we scroll the container repeatedly and
-        accumulate rows until no new ones appear.
+        accumulate rows until no new ones appear. `should_stop` is polled between
+        scrolls so the walk can be interrupted.
         """
         seen: dict[str, dict] = {}
         # Find a scrollable chat-list container.
@@ -165,6 +167,9 @@ class EitaaDriver:
 
         stagnant = 0
         for _ in range(max_scrolls):
+            if should_stop is not None and should_stop():
+                print(f"[chats] collection interrupted at {len(seen)} chats", flush=True)
+                break
             for r in await self._snapshot_chats():
                 key = r.get("peer_id") or r.get("title")
                 if key and key not in seen:
@@ -262,8 +267,13 @@ class EitaaDriver:
         except Exception:  # noqa: BLE001
             return []
 
-    async def collect_all_contacts(self, max_scrolls: int = 120) -> list[dict]:
-        """Open the Contacts view and scroll-collect ALL contacts (deduped)."""
+    async def collect_all_contacts(self, max_scrolls: int = 120,
+                                   should_stop: Callable[[], bool] | None = None) -> list[dict]:
+        """Open the Contacts view and scroll-collect ALL contacts (deduped).
+
+        `should_stop` is polled between scrolls so a long collection can be
+        interrupted; whatever was gathered so far is returned.
+        """
         await self.open_contacts_view()
 
         # Find the contacts scroll container.
@@ -279,6 +289,10 @@ class EitaaDriver:
         seen: dict[str, dict] = {}
         stagnant = 0
         for _ in range(max_scrolls):
+            if should_stop is not None and should_stop():
+                print(f"[contacts] collection interrupted at {len(seen)} contacts",
+                      flush=True)
+                break
             for r in await self._snapshot_contacts(container_sel):
                 key = r.get("peer_id") or r.get("title")
                 if key and key not in seen:

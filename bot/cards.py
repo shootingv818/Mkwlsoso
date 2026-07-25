@@ -389,7 +389,7 @@ def account_panel(account: str, phone: str, contacts: int | None, pvs: int | Non
 
 
 def contacts_saved(phone: str, count: int, with_peer: int, elapsed: float,
-                   replaced: int | None = None) -> str:
+                   replaced: int | None = None, partial: bool = False) -> str:
     """Result of caching an account's contacts list."""
     pairs = [
         ("Phone     ", phone),
@@ -399,13 +399,18 @@ def contacts_saved(phone: str, count: int, with_peer: int, elapsed: float,
     ]
     if replaced is not None and replaced != count:
         pairs.insert(2, ("Previously", f"{replaced:,}"))
-    return card(
-        "📥 CONTACTS SAVED" if count else "📥 NO CONTACTS FOUND",
-        pairs,
-        footer=("Sends from this account now start immediately." if count else
-                "The contacts list came back empty. Open Eitaa's Contacts view once, "
-                "then try again."),
-    )
+    if partial:
+        title = "🛑 CONTACTS SAVED (stopped early)"
+        footer = ("Stopped before the list finished, so this is only part of it. "
+                  "Run 📥 Save Contacts again to complete it.")
+    elif count:
+        title = "📥 CONTACTS SAVED"
+        footer = "Sends from this account now start immediately."
+    else:
+        title = "📥 NO CONTACTS FOUND"
+        footer = ("The contacts list came back empty. Open Eitaa's Contacts view "
+                  "once, then try again.")
+    return card(title, pairs, footer=footer)
 
 
 def send_started(account: str, kind: str, targets: int, delay: float) -> str:

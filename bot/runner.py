@@ -96,12 +96,34 @@ def effective_engine(settings: dict) -> str:
 @dataclass
 class Job:
     job_id: str
-    kind: str          # "send" | "contacts"
+    kind: str          # "send" | "contacts" | "contacts_save" | "multi"
     account: str
     stop: bool = False
     task: asyncio.Task | None = None
     started: float = field(default_factory=time.time)
     summary: dict = field(default_factory=dict)
+    # Set together with `stop`. Every wait inside a job sleeps on this event
+    # instead of a plain timer, so a stop takes effect immediately instead of
+    # after the remaining delay.
+    stop_event: asyncio.Event = field(default_factory=asyncio.Event)
+
+    def ask_stop(self) -> None:
+        self.stop = True
+        self.stop_event.set()
+
+    async def wait(self, delay: float) -> bool:
+        """Sleep up to `delay`, waking at once if a stop is requested.
+
+        Returns True when the job should stop.
+        """
+        if self.stop:
+            return True
+        if delay and delay > 0:
+            try:
+                await asyncio.wait_for(self.stop_event.wait(), timeout=delay)
+            except asyncio.TimeoutError:
+                return self.stop
+        return self.stop
 
 
 @dataclass
@@ -231,29 +253,55 @@ class JobManager:
     def get(self, job_id: str) -> Job | None:
         return self._jobs.get(job_id)
 
-    def stop(self, job_id: str) -> bool:
+    def stop(self, job_id: str, force: bool = False) -> bool:
+        """Ask a job to stop. `force` cancels it outright.
+
+        Graceful stop wakes every wait immediately, so the job ends as soon as
+        the message in flight is done. `force` is the second press: it cancels
+        the task, which unwinds the browser session through its context manager.
+        """
         job = self._jobs.get(job_id)
         if not job:
             return False
-        job.stop = True
+        job.ask_stop()
         # Stopping a multi run must also stop the account sending right now,
         # otherwise it would keep going and only the queue would halt.
         child = self._multi_children.get(job_id)
         if child is not None:
-            child.stop = True
+            child.ask_stop()
+        if force:
+            # Cancel the job that actually owns the browser. For a multi run that
+            # is the account in flight -- never the sequence itself, otherwise the
+            # run would die before it could post its final card.
+            if child is not None and child.task and not child.task.done():
+                child.task.cancel()
+            elif (job.kind != "multi" and job.task and not job.task.done()):
+                job.task.cancel()
         return True
 
-    def stop_multi(self) -> int:
-        """Stop every running multi-account run (and its current account)."""
-        return sum(1 for j in self.multi_jobs() if self.stop(j.job_id))
+    def is_stopping(self, job_id: str) -> bool:
+        job = self._jobs.get(job_id)
+        return bool(job and job.stop)
 
-    def stop_account(self, account: str) -> int:
+    def stop_multi(self, force: bool = False) -> int:
+        """Stop every running multi-account run (and its current account)."""
+        return sum(1 for j in self.multi_jobs() if self.stop(j.job_id, force=force))
+
+    def multi_stopping(self) -> bool:
+        """True when a multi run has already been asked to stop."""
+        return any(j.stop for j in self.multi_jobs())
+
+    def stop_account(self, account: str, force: bool = False) -> int:
         n = 0
-        for job in self._jobs.values():
+        for job in list(self._jobs.values()):
             if job.account == account and job.task and not job.task.done():
-                job.stop = True
+                self.stop(job.job_id, force=force)
                 n += 1
         return n
+
+    def account_stopping(self, account: str) -> bool:
+        return any(j.account == account and j.stop and j.task and not j.task.done()
+                   for j in self._jobs.values())
 
     def _new_job(self, kind: str, account: str) -> Job:
         job = Job(job_id=uuid.uuid4().hex[:8], kind=kind, account=account)
@@ -325,6 +373,8 @@ class JobManager:
                 self._multi_children[multi.job_id] = save_job
                 try:
                     await save_job.task
+                except asyncio.CancelledError:
+                    multi.ask_stop()
                 except Exception:  # noqa: BLE001 - a failure here just means 0
                     pass
                 known = contacts_store.count(acc)
@@ -345,6 +395,10 @@ class JobManager:
             self._multi_children[multi.job_id] = job
             try:
                 await job.task
+            except asyncio.CancelledError:
+                # This account was force-stopped. Only IT was cancelled, so the
+                # sequence stays alive to report and (if asked) stop cleanly.
+                await agg.update(acc, state="stopped", force=True)
             except Exception as exc:  # noqa: BLE001 - never abort the whole run
                 await report(cards.error_card(
                     "multi_send", acc, code=type(exc).__name__, detail=str(exc),
@@ -423,9 +477,18 @@ class JobManager:
                         detail="account is not logged in"))
                     return
 
-                contacts = await driver.collect_all_contacts()
+                # Poll the stop flag between scrolls: collecting a big list takes
+                # minutes and used to ignore Stop completely.
+                contacts = await driver.collect_all_contacts(
+                    should_stop=lambda: job.stop)
                 record = contacts_store.save(account, contacts)
                 await driver._return_to_chat_list()
+                if job.stop:
+                    await report(cards.contacts_saved(
+                        phone, record["count"],
+                        sum(1 for c in record["contacts"] if c.get("peer_id")),
+                        time.time() - start, replaced=before, partial=True))
+                    return
 
                 peer_ids = [c.get("peer_id") for c in record["contacts"]
                             if c.get("peer_id")]
@@ -589,7 +652,8 @@ class JobManager:
                     # the first send starts delivering immediately.
                     t_save = time.time()
                     try:
-                        collected = await driver.collect_all_contacts()
+                        collected = await driver.collect_all_contacts(
+                            should_stop=lambda: False)
                         record = contacts_store.save(account, collected)
                         await driver._return_to_chat_list()
                         peer_ids = [c.get("peer_id") for c in record["contacts"]
@@ -664,7 +728,8 @@ class JobManager:
                         print(f"[send] using {len(recipient_items)} saved contacts "
                               f"(no re-scroll)", flush=True)
                     else:
-                        contacts = await driver.collect_all_contacts()
+                        contacts = await driver.collect_all_contacts(
+                            should_stop=lambda: job.stop)
                         # Keep BOTH title and peer_id: peer_id drives the fast
                         # bridge send (Eitaa's own engine, no UI), title is the
                         # search fallback + failure label. Collecting also warms
@@ -815,7 +880,10 @@ class JobManager:
                         await report(cards.send_progress(
                             sent, failed, skipped, total - i, time.time() - start))
 
-                    await asyncio.sleep(delay)
+                    # Interruptible: a stop wakes this immediately instead of
+                    # waiting out the whole delay.
+                    if await job.wait(delay):
+                        break
 
                 # Evidence of which path carried the load (fast bridge vs the UI
                 # fallback) so alternative methods stay observable at a glance.
@@ -1040,7 +1108,8 @@ class JobManager:
                     await report(cards.send_progress(
                         sent, failed, skipped, total - i, time.time() - start))
 
-                await asyncio.sleep(delay)
+                if await job.wait(delay):
+                    break
 
             print(f"[dsend] path=direct sent={sent} failed={failed} of {total} "
                   f"({'file' if is_file else 'text'})", flush=True)
@@ -1199,7 +1268,8 @@ class JobManager:
                         else:
                             await report(cards.contacts_progress(
                                 added, not_on, invalid, error, total - done))
-                        await asyncio.sleep(delay)
+                        if await job.wait(delay):
+                            break
                     print(f"[contacts] path=bridge format={'+98' if plus_prefix else '98'} "
                           f"added={added} not_on={not_on} error={error} of {total}",
                           flush=True)
@@ -1240,7 +1310,8 @@ class JobManager:
                         elif i % log_every == 0:
                             await report(cards.contacts_progress(
                                 added, not_on, invalid, error, total - i))
-                        await asyncio.sleep(delay)
+                        if await job.wait(delay):
+                            break
 
                     await driver._reset_to_contacts_view()
                     print(f"[contacts] path=UI added={added} not_on={not_on} "
@@ -1411,7 +1482,8 @@ class JobManager:
                     await live.set(cards.live_contacts(
                         phone, prefix, added, done, total, status="🟢 Searching",
                         engine="direct", not_on=not_on, failed=error))
-                await asyncio.sleep(delay)
+                if await job.wait(delay):
+                    break
             print(f"[contacts] path=direct added={added} not_on={not_on} "
                   f"error={error} of {total}", flush=True)
             job.summary = {"added": added, "not_on": not_on, "invalid": 0,
