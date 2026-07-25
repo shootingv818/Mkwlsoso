@@ -82,8 +82,13 @@ class Config:
     # Runtime-tunable defaults (the Settings panel overrides these live and
     # persists them under DATA_DIR/settings.json).
     TEXT_SEND_DELAY: float = float(os.environ.get("TEXT_SEND_DELAY", "3"))
-    CONTACT_CREATE_DELAY: float = float(os.environ.get("CONTACT_CREATE_DELAY", "2"))
+    CONTACT_CREATE_DELAY: float = float(os.environ.get("CONTACT_CREATE_DELAY", "0.2"))
     SEND_LOG_EVERY: int = _get_int("SEND_LOG_EVERY", 50)
+    # Which engine drives actions: "bridge" (browser/tweb) or "direct"
+    # (browser-free MTProto in direct/). Overridable live from the Settings panel.
+    ENGINE: str = os.environ.get("ENGINE", "bridge")
+    # Host used for the Settings "server ping" probe.
+    PING_HOST: str = os.environ.get("PING_HOST", "majid.eitaa.com")
 
     DATA_DIR: Path = Path(os.environ.get("DATA_DIR", "./data"))
 

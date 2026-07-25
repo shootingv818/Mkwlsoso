@@ -329,6 +329,25 @@ def extract_media_url(capture) -> str | None:
     return None
 
 
+IMPORTED_CONTACTS = 0x77D01C3B
+
+
+def parse_import_result(body: bytes) -> dict:
+    """Parse contacts.importedContacts#77d01c3b: the FIRST vector after the
+    constructor is `imported` (the numbers that ARE on Eitaa). Returns
+    {"ok": bool, "imported": int}."""
+    try:
+        r = tl.Reader(body)
+        cid = r.int(signed=False)
+        if cid != IMPORTED_CONTACTS:
+            return {"ok": False, "imported": 0, "cid": cid}
+        vec = r.int(signed=False)          # 0x1cb5c415
+        count = r.int(signed=False)
+        return {"ok": True, "imported": int(count)}
+    except Exception:  # noqa: BLE001
+        return {"ok": False, "imported": 0}
+
+
 def find_message_peer(capture, marker: str) -> bytes | None:
     """Find the 20-byte target peer of a sendMessage whose text contains
     `marker`. Used to learn a CONTACT's peer from a controlled browser send."""

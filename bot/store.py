@@ -22,6 +22,8 @@ def _defaults() -> dict[str, Any]:
             "text_send_delay": float(config.TEXT_SEND_DELAY),
             "contact_create_delay": float(config.CONTACT_CREATE_DELAY),
             "send_log_every": int(config.SEND_LOG_EVERY),
+            # "bridge" (browser/tweb) or "direct" (browser-free MTProto).
+            "engine": str(config.ENGINE),
         },
         # content to send: kind is "text" or "file".
         "content": {
@@ -32,6 +34,8 @@ def _defaults() -> dict[str, Any]:
             "caption": "",
         },
         "active_account": None,
+        # per-account metadata: name -> {"phone": str, "contacts": int, "pvs": int}
+        "accounts_meta": {},
     }
 
 
@@ -86,6 +90,41 @@ class Store:
     @property
     def send_log_every(self) -> int:
         return int(self._data["settings"].get("send_log_every", config.SEND_LOG_EVERY))
+
+    @property
+    def engine(self) -> str:
+        eng = str(self._data["settings"].get("engine", config.ENGINE))
+        return eng if eng in ("bridge", "direct") else "bridge"
+
+    def set_engine(self, engine: str) -> None:
+        self._data["settings"]["engine"] = "direct" if engine == "direct" else "bridge"
+        self.save()
+
+    def toggle_engine(self) -> str:
+        new = "direct" if self.engine == "bridge" else "bridge"
+        self.set_engine(new)
+        return new
+
+    # ---- per-account metadata (phone / contacts / pvs) ----
+    @property
+    def accounts_meta(self) -> dict[str, Any]:
+        return self._data.setdefault("accounts_meta", {})
+
+    def account_meta(self, name: str) -> dict[str, Any]:
+        return dict(self._data.setdefault("accounts_meta", {}).get(name, {}))
+
+    def set_account_meta(self, name: str, **fields: Any) -> None:
+        meta = self._data.setdefault("accounts_meta", {})
+        cur = dict(meta.get(name, {}))
+        for k, v in fields.items():
+            if v is not None:
+                cur[k] = v
+        meta[name] = cur
+        self.save()
+
+    def account_phone(self, name: str) -> str:
+        """The account's own phone (digits) if known, else the account name."""
+        return str(self._data.get("accounts_meta", {}).get(name, {}).get("phone") or name)
 
     # ---- content ----
     @property

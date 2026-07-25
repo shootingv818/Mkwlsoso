@@ -136,88 +136,29 @@ class JobManager:
         return job
 
     async def run_send(self, account: str, content: dict, settings: dict,
-                       report: Report, recipients: list[str] | None = None) -> Job:
+                       report: Report, recipients: list[str] | None = None,
+                       live=None, account_phone: str | None = None) -> Job:
         job = self._new_job("send", account)
         job.task = asyncio.create_task(
-            self._send_job(job, content, settings, report, recipients)
+            self._send_job(job, content, settings, report, recipients, live, account_phone)
         )
         return job
 
     async def run_contacts(self, account: str, prefix: str, count: int,
-                           settings: dict, report: Report) -> Job:
+                           settings: dict, report: Report, live=None,
+                           account_phone: str | None = None) -> Job:
         job = self._new_job("contacts", account)
-        job.task = asyncio.create_task(
-            self._contacts_job(job, prefix, count, settings, report)
-        )
+        engine = str(settings.get("engine", config.ENGINE))
+        phone = account_phone or account
+        if engine == "direct":
+            job.task = asyncio.create_task(
+                self._contacts_job_direct(job, prefix, count, settings, report, live, phone)
+            )
+        else:
+            job.task = asyncio.create_task(
+                self._contacts_job(job, prefix, count, settings, report, live, phone)
+            )
         return job
-
-    async def run_login(self, account: str, report: Report, novnc_url: str = "") -> bool:
-        """Start an interactive login for a (possibly new) account.
-
-        Opens a headed Eitaa Web session the owner completes on their noVNC
-        screen, then auto-detects success and saves the profile. Returns False
-        if the account is already busy with another job.
-        """
-        if account in self._busy:
-            return False
-        self._busy.add(account)
-        asyncio.create_task(self._login_job(account, report, novnc_url))
-        return True
-
-    async def _login_job(self, account: str, report: Report, novnc_url: str) -> None:
-        # Local imports keep this module importable without a browser present.
-        from capture.browser import open_session
-        from eitaa.driver import EitaaDriver
-        try:
-            # Headed so the owner can complete phone+code on the noVNC screen.
-            async with open_session(account, headed=True) as session:
-                await session.goto()
-                driver = EitaaDriver(session)
-                await driver.open()
-
-                if await driver.is_logged_in():
-                    await report(cards.card(
-                        "👤 ACCOUNT READY",
-                        [("Account", account), ("Status", "already logged in")],
-                        footer="This account is already logged in and ready to use."))
-                    return
-
-                hint = (f"Open noVNC: {novnc_url}" if novnc_url
-                        else "Open your noVNC screen (browser display :99)")
-                await report(cards.card(
-                    "👤 LOGIN STARTED",
-                    [("Account", account), ("Waiting", "up to 6 min")],
-                    footer=f"{hint} and log in (phone + code). I'll detect it and "
-                           f"save automatically. Never share your login code."))
-
-                deadline = time.time() + 360
-                ok = False
-                while time.time() < deadline:
-                    await asyncio.sleep(4)
-                    try:
-                        if await driver.is_logged_in():
-                            ok = True
-                            break
-                    except Exception:  # noqa: BLE001
-                        pass
-
-                if ok:
-                    # Let Eitaa Web persist its auth to the profile before close.
-                    await asyncio.sleep(2)
-                    await report(cards.card(
-                        "✅ ACCOUNT ADDED",
-                        [("Account", account)],
-                        footer="Login detected and saved. It now appears under Accounts."))
-                else:
-                    await report(cards.card(
-                        "⌛ LOGIN TIMEOUT",
-                        [("Account", account)],
-                        footer="No login detected in time. Tap Add Account to try again."))
-        except Exception as exc:  # noqa: BLE001
-            await report(cards.error_card(
-                "login", account, code=type(exc).__name__, detail=str(exc)))
-        finally:
-            self._busy.discard(account)
 
     # ---- bridge login (no noVNC: phone + code in Telegram) ----
     async def start_bridge_login(self, account: str, phone: str, report: Report) -> bool:
@@ -332,10 +273,23 @@ class JobManager:
                     logged = await driver.is_logged_in()
 
                 if logged:
-                    await report(cards.card(
-                        "✅ ACCOUNT ADDED",
-                        [("Account", account), ("Phone", intl)],
-                        footer="Logged in via the bridge (no noVNC). It now appears under Accounts."))
+                    # On-add stats: fetch contacts + chats and persist account meta.
+                    contacts = pvs = None
+                    try:
+                        s = await driver.bridge_stats()
+                        if s:
+                            contacts, pvs = s.get("contacts"), s.get("pvs")
+                    except Exception:  # noqa: BLE001
+                        pass
+                    phone_digits = re.sub(r"\D", "", intl)
+                    try:
+                        from bot.store import store as _store
+                        _store.set_account_meta(account, phone=phone_digits,
+                                                contacts=contacts, pvs=pvs)
+                        engine = _store.engine
+                    except Exception:  # noqa: BLE001
+                        engine = None
+                    await report(cards.account_added(account, phone_digits, contacts, pvs, engine))
                 else:
                     await report(cards.card(
                         "⚠️ LOGIN INCOMPLETE",
@@ -351,8 +305,13 @@ class JobManager:
 
     # ---- send job ----
     async def _send_job(self, job: Job, content: dict, settings: dict,
-                        report: Report, recipients: list[str] | None) -> None:
+                        report: Report, recipients: list[str] | None,
+                        live=None, account_phone: str | None = None) -> None:
         account = job.account
+        phone = account_phone or account
+        # Sending always uses the proven bridge fast-path; the engine SETTING
+        # governs contact-building. Label the send card accordingly (honest).
+        engine = "bridge"
         kind = "File" if content.get("kind") == "file" else "Text"
         delay = float(settings.get("text_send_delay", config.TEXT_SEND_DELAY))
         log_every = int(settings.get("send_log_every", config.SEND_LOG_EVERY))
@@ -387,7 +346,11 @@ class JobManager:
                     # so they use the proven UI flow unchanged.
                     recipient_items = [(name, None) for name in recipients]
                 total = len(recipient_items)
-                await report(cards.send_started(account, kind, total, delay))
+                if live is not None:
+                    await live.set(cards.live_send(phone, 0, 0, total, 0,
+                                                   status="🟢 Sending", engine=engine, kind=kind))
+                else:
+                    await report(cards.send_started(account, kind, total, delay))
 
                 # Pre-warm the right bridge ONCE.
                 file_bridge_ready = False
@@ -498,7 +461,11 @@ class JobManager:
                             account, f"{consecutive_failures} consecutive failures", sent))
                         break
 
-                    if i % log_every == 0:
+                    if live is not None:
+                        await live.set(cards.live_send(
+                            phone, sent, failed, total, time.time() - start,
+                            status="🟢 Sending", engine=engine, kind=kind))
+                    elif i % log_every == 0:
                         await report(cards.send_progress(
                             sent, failed, skipped, total - i, time.time() - start))
 
@@ -512,6 +479,11 @@ class JobManager:
                 job.summary = {"sent": sent, "failed": failed, "skipped": skipped,
                                "total": total, "via_bridge": via_bridge,
                                "via_fallback": via_fallback}
+                if live is not None:
+                    await live.set(cards.live_send(
+                        phone, sent, failed, total, time.time() - start,
+                        status="🛑 Stopped" if job.stop else "✅ Done",
+                        engine=engine, kind=kind), force=True)
                 await report(cards.send_finished(
                     account, kind, sent, failed, skipped, total,
                     time.time() - start, stopped=job.stop))
@@ -521,16 +493,23 @@ class JobManager:
         finally:
             self._busy.discard(account)
 
-    # ---- contacts job ----
+    # ---- contacts job (bridge / browser) ----
     async def _contacts_job(self, job: Job, prefix: str, count: int,
-                            settings: dict, report: Report) -> None:
+                            settings: dict, report: Report, live=None,
+                            account_phone: str | None = None) -> None:
         account = job.account
+        phone = account_phone or account
+        engine = str(settings.get("engine", config.ENGINE))
         delay = float(settings.get("contact_create_delay", config.CONTACT_CREATE_DELAY))
         log_every = int(settings.get("send_log_every", config.SEND_LOG_EVERY))
         entries, err = expand_range(prefix, count)
         if err:
-            await report(cards.error_card("contacts_range", account, code="bad_range", detail=err))
+            await report(cards.error_card("contacts_range", account, code="bad_range",
+                                          detail=err, engine=engine, phase="expand_range"))
             return
+        # The imported contact's display name is the ACCOUNT's OWN phone (per spec).
+        for e in entries:
+            e["first"] = phone
         self._busy.add(account)
         start = time.time()
         added = not_on = invalid = error = 0
@@ -543,7 +522,11 @@ class JobManager:
                     await report(cards.error_card("contacts", account, code="not_logged_in",
                                                   detail="account is not logged in"))
                     return
-                await report(cards.contacts_started(account, prefix, total, delay))
+                if live is not None:
+                    await live.set(cards.live_contacts(phone, prefix, 0, 0, total,
+                                                       status="🟢 Searching", engine=engine))
+                else:
+                    await report(cards.contacts_started(account, prefix, total, delay))
 
                 if await driver.ensure_contacts_bridge():
                     # FAST PATH: contacts.importContacts in batches. The server
@@ -574,8 +557,14 @@ class JobManager:
                                 "import_contacts", account, code="import_failed",
                                 detail=str(r.get("code")), trace_id=job.job_id))
                         done += len(batch)
-                        await report(cards.contacts_progress(
-                            added, not_on, invalid, error, total - done))
+                        if live is not None:
+                            await live.set(cards.live_contacts(
+                                phone, prefix, added, done, total,
+                                status="🟢 Searching", engine=engine,
+                                not_on=not_on, failed=error))
+                        else:
+                            await report(cards.contacts_progress(
+                                added, not_on, invalid, error, total - done))
                         await asyncio.sleep(delay)
                     print(f"[contacts] path=bridge added={added} not_on={not_on} "
                           f"error={error} of {total}", flush=True)
@@ -607,7 +596,12 @@ class JobManager:
                                 "add_contact", account, target=entry.get("phone"),
                                 code=type(exc).__name__, detail=str(exc), trace_id=job.job_id))
 
-                        if i % log_every == 0:
+                        if live is not None:
+                            await live.set(cards.live_contacts(
+                                phone, prefix, added, i, total,
+                                status="🟢 Searching", engine=engine,
+                                not_on=not_on, failed=error))
+                        elif i % log_every == 0:
                             await report(cards.contacts_progress(
                                 added, not_on, invalid, error, total - i))
                         await asyncio.sleep(delay)
@@ -618,12 +612,121 @@ class JobManager:
 
                 job.summary = {"added": added, "not_on": not_on, "invalid": invalid,
                                "error": error, "total": total}
+                if live is not None:
+                    await live.set(cards.live_contacts(
+                        phone, prefix, added, total if not job.stop else added + not_on + invalid + error,
+                        total, status="🛑 Stopped" if job.stop else "✅ Done",
+                        engine=engine, not_on=not_on, failed=error), force=True)
                 await report(cards.contacts_finished(
                     account, added, not_on, invalid, error, total,
                     time.time() - start, stopped=job.stop))
         except Exception as exc:  # noqa: BLE001
             await report(cards.error_card("contacts_job", account, code=type(exc).__name__,
-                                          detail=str(exc), trace_id=job.job_id))
+                                          detail=str(exc), trace_id=job.job_id, engine=engine,
+                                          phase="bridge_contacts"))
+        finally:
+            self._busy.discard(account)
+
+    # ---- contacts job (DIRECT / browser-free MTProto) ----
+    async def _contacts_job_direct(self, job: Job, prefix: str, count: int,
+                                   settings: dict, report: Report, live=None,
+                                   account_phone: str | None = None) -> None:
+        """Build contacts with NO browser: contacts.importContacts in batches
+        straight over HTTPS, using the account's captured session context."""
+        account = job.account
+        phone = account_phone or account
+        delay = float(settings.get("contact_create_delay", config.CONTACT_CREATE_DELAY))
+        entries, err = expand_range(prefix, count)
+        if err:
+            await report(cards.error_card("contacts_range", account, code="bad_range",
+                                          detail=err, engine="direct", phase="expand_range"))
+            return
+        for e in entries:
+            e["first"] = phone
+
+        # Load the browser-free session context from this account's newest capture.
+        try:
+            from direct import eitaa_tl as E
+            from direct.transport import HttpTransport, wrap_eitaa, unwrap_eitaa
+            import glob as _glob
+            import os as _os
+            cap_dir = config.ARTIFACTS_DIR / "sessions"
+            files = (_glob.glob(str(cap_dir / f"capall_{account}_*.json"))
+                     + _glob.glob(str(cap_dir / f"worker_tx_{account}_*.json")))
+            if not files:
+                await report(cards.error_card(
+                    "contacts_direct", account, code="no_session", engine="direct",
+                    phase="load_context",
+                    detail="no direct session capture for this account. Run a capture "
+                           "or switch the engine to bridge in Settings."))
+                return
+            import json as _json
+            cap = _json.loads(open(max(files, key=_os.path.getmtime), encoding="utf-8").read())
+            ctx = E.extract_context(cap)
+            endpoint = "https://bagher.eitaa.ir/eitaa/"
+        except Exception as exc:  # noqa: BLE001
+            await report(cards.error_card("contacts_direct", account, code=type(exc).__name__,
+                                          detail=str(exc), engine="direct", phase="load_context"))
+            return
+
+        self._busy.add(account)
+        start = time.time()
+        added = not_on = error = 0
+        total = len(entries)
+        BATCH = 100
+        try:
+            if live is not None:
+                await live.set(cards.live_contacts(phone, prefix, 0, 0, total,
+                                                   status="🟢 Searching", engine="direct"))
+            tx = HttpTransport(endpoint, timeout=30.0, cookies=None)
+            done = 0
+            while done < total:
+                if job.stop:
+                    break
+                batch = entries[done:done + BATCH]
+                trip = [(e["phone"], e["first"], e["last"]) for e in batch]
+                body = E.import_contacts(trip)
+                try:
+                    resp = tx.post(wrap_eitaa(ctx["token1"], ctx["token2"], body))
+                    rb = unwrap_eitaa(resp)["body"] if resp[:4] == bytes.fromhex("ed77be7a") else resp
+                    verdict = E.classify_response(rb)
+                    if not verdict["ok"]:
+                        error += len(batch)
+                        await report(cards.error_card(
+                            "import_contacts", account, code=str(verdict.get("code") or "err"),
+                            detail=str(verdict.get("message") or verdict.get("note")),
+                            engine="direct", phase="importContacts", trace_id=job.job_id))
+                    else:
+                        imp = E.parse_import_result(rb).get("imported", 0)
+                        added += imp
+                        not_on += max(0, len(batch) - imp)
+                except Exception as exc:  # noqa: BLE001
+                    error += len(batch)
+                    await report(cards.error_card(
+                        "import_contacts", account, code=type(exc).__name__, detail=str(exc),
+                        engine="direct", phase="post", trace_id=job.job_id))
+                done += len(batch)
+                if live is not None:
+                    await live.set(cards.live_contacts(
+                        phone, prefix, added, done, total, status="🟢 Searching",
+                        engine="direct", not_on=not_on, failed=error))
+                await asyncio.sleep(delay)
+            tx.close()
+            print(f"[contacts] path=direct added={added} not_on={not_on} "
+                  f"error={error} of {total}", flush=True)
+            job.summary = {"added": added, "not_on": not_on, "invalid": 0,
+                           "error": error, "total": total}
+            if live is not None:
+                await live.set(cards.live_contacts(
+                    phone, prefix, added, done, total,
+                    status="🛑 Stopped" if job.stop else "✅ Done",
+                    engine="direct", not_on=not_on, failed=error), force=True)
+            await report(cards.contacts_finished(
+                account, added, not_on, 0, error, total, time.time() - start, stopped=job.stop))
+        except Exception as exc:  # noqa: BLE001
+            await report(cards.error_card("contacts_direct_job", account, code=type(exc).__name__,
+                                          detail=str(exc), engine="direct", phase="loop",
+                                          trace_id=job.job_id))
         finally:
             self._busy.discard(account)
 

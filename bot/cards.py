@@ -76,14 +76,70 @@ def now_hms() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _pct(done: int, total: int) -> str:
+    if not total:
+        return "0%"
+    return f"{int(done * 100 / total)}%"
+
+
+def _live(title: str, phone: str, pairs: Iterable[tuple[str, object]], ts: str | None = None) -> str:
+    """Live-card shell: title, divider, 📱 phone, aligned rows, 🕒 time.
+    This is the card that gets EDITED IN PLACE while a job runs."""
+    lines = [title, DIVIDER, f"📱 {phone}", *_rows(pairs), f"🕒 {ts or now_hms()}"]
+    return "\n".join(lines)
+
+
+# ---- LIVE cards (edited in place while a job runs) ---------------------
+
+def live_contacts(phone: str, prefix: str, found: int, probed: int, total: int,
+                  status: str = "🟢 Searching", engine: str | None = None,
+                  not_on: int | None = None, failed: int | None = None) -> str:
+    return _live(
+        "🔎 Discover Friends by Prefix — Live",
+        phone,
+        [
+            ("Prefix ", prefix),
+            ("Engine ", engine),
+            ("Status ", status),
+            ("Found  ", f"{found} of {total} — {_pct(probed, total)}"),
+            ("Probed ", probed),
+            ("Off App", not_on),
+            ("Failed ", failed),
+        ],
+    )
+
+
+def live_send(phone: str, sent: int, failed: int, total: int, elapsed: float,
+              status: str = "🟢 Sending", engine: str | None = None,
+              kind: str | None = None) -> str:
+    return _live(
+        "📤 Send to Contacts — Live",
+        phone,
+        [
+            ("Engine ", engine),
+            ("Type   ", kind),
+            ("Status ", status),
+            ("Sent   ", f"{sent} of {total} — {_pct(sent, total)}"),
+            ("Failed ", failed),
+            ("Elapsed", fmt_duration(elapsed)),
+        ],
+    )
+
+
 # ---- ready-made cards --------------------------------------------------
 
-def panel_home(version: str, accounts: int, active: str | None) -> str:
+def panel_home(version: str, accounts: int, active: str | None,
+               engine: str | None = None, ping_ms: int | None = None,
+               bot_online: bool = True) -> str:
+    ping = f"{ping_ms} ms" if ping_ms is not None else "—"
     rows = _rows([
-        ("Status  ", "🟢 Online"),
-        ("Version ", version),
+        ("Bot    ", "🟢 Online" if bot_online else "🔴 Offline"),
+        ("Engine ", ("🌉 bridge (browser)" if engine == "bridge"
+                     else "⚡ direct (no browser)") if engine else None),
+        ("Server ", f"🛰 {ping}"),
+        ("Version", version),
         ("Accounts", accounts),
-        ("Active  ", active or "none"),
+        ("Active ", active or "none"),
     ])
     lines = [
         "🤖 EitaaManager",
@@ -94,6 +150,37 @@ def panel_home(version: str, accounts: int, active: str | None) -> str:
         "Choose an action.",
     ]
     return "\n".join(lines)
+
+
+def account_added(account: str, phone: str, contacts: int | None, pvs: int | None,
+                  engine: str | None = None) -> str:
+    return card(
+        "✅ ACCOUNT ADDED",
+        [
+            ("Account ", account),
+            ("Phone   ", phone),
+            ("Contacts", contacts if contacts is not None else "—"),
+            ("Chats   ", pvs if pvs is not None else "—"),
+            ("Engine  ", engine),
+            ("Time    ", now_hms()),
+        ],
+    )
+
+
+def account_panel(account: str, phone: str, contacts: int | None, pvs: int | None,
+                  engine: str | None, busy: bool) -> str:
+    return card(
+        "👤 ACCOUNT",
+        [
+            ("Account ", account),
+            ("Phone   ", phone),
+            ("Contacts", contacts if contacts is not None else "—"),
+            ("Chats   ", pvs if pvs is not None else "—"),
+            ("Engine  ", engine),
+            ("State   ", "⏳ busy" if busy else "🟢 idle"),
+        ],
+        footer="Send content or build contacts with this account.",
+    )
 
 
 def send_started(account: str, kind: str, targets: int, delay: float) -> str:
@@ -182,17 +269,20 @@ def contacts_finished(account: str, added: int, not_on: int, invalid: int,
 
 def error_card(where: str, account: str | None = None, target: str | None = None,
                code: str | None = None, detail: str | None = None,
-               trace_id: str | None = None) -> str:
+               trace_id: str | None = None, engine: str | None = None,
+               phase: str | None = None) -> str:
     return card(
         "⚠️ ERROR",
         [
-            ("Trace ", trace_id),
-            ("Where ", where),
+            ("Trace  ", trace_id),
+            ("Where  ", where),
+            ("Phase  ", phase),
+            ("Engine ", engine),
             ("Account", account),
-            ("Target", sanitize(target, 60) if target else None),
-            ("Code  ", code),
-            ("Detail", sanitize(detail, 400) if detail else None),
-            ("Time  ", now_hms()),
+            ("Target ", sanitize(target, 60) if target else None),
+            ("Code   ", code),
+            ("Detail ", sanitize(detail, 400) if detail else None),
+            ("Time   ", now_hms()),
         ],
     )
 
