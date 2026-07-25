@@ -773,9 +773,10 @@ def _resolve_target_peer(account: str, ctx: dict, to: str | None, label: str):
     return bytes.fromhex(entry["peer_hex"]), to
 
 
-def _direct_rpc(body: bytes, ctx: dict, url: str, label: str) -> int:
+def _direct_rpc(body: bytes, ctx: dict, url: str, label: str, tx=None) -> int:
     """Wrap a bare TL body in the Eitaa envelope, POST it browser-free, and
-    classify the response. Shared by direct-send / direct-import."""
+    classify the response. Shared by direct-send / direct-import / send-file.
+    Pass `tx` to reuse an existing (keep-alive) transport connection."""
     from direct.transport import HttpTransport, wrap_eitaa, unwrap_eitaa
     from direct import eitaa_tl as E
 
@@ -783,7 +784,7 @@ def _direct_rpc(body: bytes, ctx: dict, url: str, label: str) -> int:
     print(f"[{label}] request {len(raw)}B -> {url}")
     print(f"[{label}] body({len(body)}B)={body.hex()}")
     try:
-        resp = HttpTransport(url, timeout=30.0).post(raw)
+        resp = (tx or HttpTransport(url, timeout=30.0)).post(raw)
     except Exception as exc:  # noqa: BLE001
         print(f"[{label}] ✗ transport error: {exc}")
         return 3
@@ -858,34 +859,39 @@ def cmd_direct_send_file(account: str, file_path: str, to: str | None,
     mime = E.guess_mime(fp.name)
     plan = E.build_file_send(peer, data, fp.name, ctx["user_id"], caption=caption, mime=mime)
     endpoint = url or "https://majid.eitaa.com/eitaa/"
+    # ONE keep-alive connection for the WHOLE sequence so every saveFilePart and
+    # the final sendMedia land on the SAME load-balanced backend node.
     tx = HttpTransport(endpoint, timeout=60.0)
     print(f"[dfile] {fp.name}  {len(data)}B  mime={mime}  target={tgt}  parts={plan['total_parts']}")
 
-    # 1) upload every part
-    for i, part_body in enumerate(plan["parts"]):
-        raw = wrap_eitaa(ctx["token1"], ctx["token2"], part_body)
-        try:
-            resp = tx.post(raw)
-        except Exception as exc:  # noqa: BLE001
-            print(f"[dfile] ✗ part {i+1}/{plan['total_parts']} transport error: {exc}")
-            return 3
-        rb = resp
-        try:
-            if resp[:4] == bytes.fromhex("ed77be7a"):
-                rb = unwrap_eitaa(resp)["body"]
-        except Exception:  # noqa: BLE001
-            pass
-        # upload.saveFilePart returns boolTrue (997275b5 on wire = b5757299)
-        ok = rb[:4].hex() == "b5757299"
-        print(f"[dfile]   part {i+1}/{plan['total_parts']}: "
-              f"{'OK' if ok else 'resp ' + rb[:16].hex()}")
-        if not ok:
-            print(f"[dfile] ✗ upload rejected at part {i+1}: {rb[:48].hex()}")
-            return 4
+    try:
+        # 1) upload every part on the persistent connection
+        for i, part_body in enumerate(plan["parts"]):
+            raw = wrap_eitaa(ctx["token1"], ctx["token2"], part_body)
+            try:
+                resp = tx.post(raw)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[dfile] ✗ part {i+1}/{plan['total_parts']} transport error: {exc}")
+                return 3
+            rb = resp
+            try:
+                if resp[:4] == bytes.fromhex("ed77be7a"):
+                    rb = unwrap_eitaa(resp)["body"]
+            except Exception:  # noqa: BLE001
+                pass
+            # upload.saveFilePart returns boolTrue (997275b5 on wire = b5757299)
+            ok = rb[:4].hex() == "b5757299"
+            print(f"[dfile]   part {i+1}/{plan['total_parts']}: "
+                  f"{'OK' if ok else 'resp ' + rb[:16].hex()}")
+            if not ok:
+                print(f"[dfile] ✗ upload rejected at part {i+1}: {rb[:48].hex()}")
+                return 4
 
-    # 2) send the media
-    print("[dfile] all parts uploaded; sending media...")
-    return _direct_rpc(plan["send_media"], ctx, endpoint, "dfile")
+        # 2) send the media on the SAME connection
+        print("[dfile] all parts uploaded; sending media (same connection)...")
+        return _direct_rpc(plan["send_media"], ctx, endpoint, "dfile", tx=tx)
+    finally:
+        tx.close()
 
 
 async def cmd_direct_capture_peer(account: str, to: str) -> int:

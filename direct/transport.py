@@ -85,6 +85,17 @@ def unwrap_eitaa(raw: bytes) -> dict:
 
 
 class HttpTransport:
+    """HTTPS POST transport that REUSES one keep-alive connection.
+
+    Critical for multi-request flows (file upload -> sendMedia): Eitaa's shard
+    host is load-balanced across backend nodes, and an uploaded file part lives
+    on the LOCAL temp disk of the node that handled saveFilePart. A fresh TCP
+    connection per request may land on a different node, so sendMedia can't find
+    the part (observed: INTERNAL_SERVER_ERROR "part key: 0 filename: ..._<ip>").
+    A persistent keep-alive connection pins the whole sequence to one node,
+    exactly like the browser worker does.
+    """
+
     def __init__(self, url: str, timeout: float = 30.0) -> None:
         self.url = url
         self.timeout = timeout
@@ -93,36 +104,51 @@ class HttpTransport:
         self.port = p.port or (443 if p.scheme == "https" else 80)
         self.path = p.path or "/"
         self.secure = p.scheme != "http"
+        self._conn_obj: http.client.HTTPConnection | None = None
 
-    def _conn(self) -> http.client.HTTPConnection:
+    def _new_conn(self) -> http.client.HTTPConnection:
         if self.secure:
             ctx = ssl.create_default_context()
             return http.client.HTTPSConnection(
                 self.host, self.port, timeout=self.timeout, context=ctx)
         return http.client.HTTPConnection(self.host, self.port, timeout=self.timeout)
 
-    def post(self, payload: bytes) -> bytes:
-        """POST the raw MTProto payload; return the raw response bytes."""
-        conn = self._conn()
-        try:
-            headers = {
-                "Content-Type": "application/octet-stream",
-                "Content-Length": str(len(payload)),
-                "Connection": "keep-alive",
-            }
-            conn.request("POST", self.path, body=payload, headers=headers)
-            resp = conn.getresponse()
-            data = resp.read()
-            if resp.status != 200:
-                raise TransportError(f"HTTP {resp.status} {resp.reason} "
-                                     f"({len(data)} bytes)")
-            return data
-        except TransportError:
-            raise
-        except Exception as exc:  # noqa: BLE001
-            raise TransportError(f"transport POST failed: {exc}") from exc
-        finally:
+    def close(self) -> None:
+        if self._conn_obj is not None:
             try:
-                conn.close()
+                self._conn_obj.close()
             except Exception:  # noqa: BLE001
                 pass
+            self._conn_obj = None
+
+    def post(self, payload: bytes) -> bytes:
+        """POST the payload on the persistent connection; return raw response.
+
+        On a connection-level failure (stale keep-alive), reconnect once and
+        retry so a dropped idle socket doesn't abort a long upload.
+        """
+        headers = {
+            "Content-Type": "application/octet-stream",
+            "Content-Length": str(len(payload)),
+            "Connection": "keep-alive",
+        }
+        last_exc: Exception | None = None
+        for attempt in (1, 2):
+            if self._conn_obj is None:
+                self._conn_obj = self._new_conn()
+            conn = self._conn_obj
+            try:
+                conn.request("POST", self.path, body=payload, headers=headers)
+                resp = conn.getresponse()
+                data = resp.read()
+                if resp.status != 200:
+                    raise TransportError(f"HTTP {resp.status} {resp.reason} "
+                                         f"({len(data)} bytes)")
+                return data
+            except TransportError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                # likely a stale/closed keep-alive socket: drop it and retry once
+                last_exc = exc
+                self.close()
+        raise TransportError(f"transport POST failed: {last_exc}") from last_exc

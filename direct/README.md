@@ -92,13 +92,30 @@ to the chosen peer.
 
 ---
 
+## Load balancing gotcha (important for uploads)
+The shard host is load-balanced across backend nodes. An uploaded file part is
+stored on the **local temp disk of the node that handled `saveFilePart`**, and
+`sendMedia` must run on that **same node**, or the server fails with
+`INTERNAL_SERVER_ERROR "part key: 0 filename: ..._<internal_ip>"`. Fix:
+`transport.HttpTransport` keeps **one persistent keep-alive connection**, and
+`direct-send-file` reuses that single connection for every `saveFilePart` and
+the final `sendMedia` (same as the browser worker). Also: `file_id` MUST be
+positive (a negative id corrupts the server temp filename/path).
+
 ## Status
 - ✅ Transport + envelope proven live (`direct-replay` returned Eitaa's DC config).
-- ✅ Browser-free **send text** — live-confirmed (`updateShortSentMessage`).
+- ✅ Browser-free **send text** to self AND to a contact — live-confirmed (`updateShortSentMessage`).
 - ✅ Browser-free **import contact** — live-confirmed (`contacts.importedContacts`).
-- ✅ Browser-free **send file** (saveFilePart+sendMedia) — byte-exact serializers;
-  single-part path built, multi-part loop built. **Pending live test** for txt/zip/apk.
-- ✅ **send to a contact** via captured peer — built. **Pending live test.**
+- ✅ Browser-free **learn a contact peer** (`direct-capture-peer`) — live-confirmed.
+- 🔧 Browser-free **send file** (saveFilePart+sendMedia) — byte-exact serializers; first
+  live attempt hit the load-balancer node-affinity issue above; fixed via persistent
+  keep-alive connection + positive file_id. **Re-testing txt/zip/apk (self + contact).**
 - ⏳ TODO: confirm token stability across browser restarts and source token from the
-  session export (localStorage `token`) instead of the newest capture; direct login
-  handshake; larger/multi-part file verification.
+  session export (localStorage `token`) instead of the newest capture; verify
+  multi-part (>512 KiB) uploads; optional direct MTProto login handshake.
+
+## Honest error reporting
+`eitaa_tl.classify_response()` decodes Eitaa's own error wrapper
+`eitaa_error#c4b9f9bb (code:int, message:string)` and the standard rpc_error, so a
+failed call prints e.g. `error 400: PEER_ID_INVALID` / `error 500: INTERNAL_SERVER_ERROR...`
+instead of a false success.
