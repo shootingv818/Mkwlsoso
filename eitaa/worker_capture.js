@@ -43,9 +43,9 @@
         else if (typeof buf === "string") return { text: buf.slice(0, 120), len: buf.length };
         else if (buf && buf.byteLength != null) b = new Uint8Array(buf);
         else return null;
-        var h = "", n = Math.min(b.length, 96);
+        var h = "", n = Math.min(b.length, 256);
         for (var i = 0; i < n; i++) h += b[i].toString(16).padStart(2, "0");
-        return { hex: h, len: b.length };
+        return { hex: h, len: b.length, full: b.length <= 260 };
       } catch (e) { return null; }
     }
     function report(rec) { try { if (bc) bc.postMessage(rec); } catch (e) {} }

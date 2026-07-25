@@ -519,6 +519,44 @@ def _head_str(v) -> str:
     return v or ""
 
 
+def _decode_eitaa_envelope(hexstr: str):
+    """Decode Eitaa's transport framing from a captured request head.
+
+    Observed shape (all requests share it):
+        ed77be7a            4-byte constant magic
+        <1 byte>            length N of the ASCII routing token
+        <N ASCII bytes>     token, e.g. "9179.c756a2d10f.e41c4e_<userid>"
+        <rest>              the actual MTProto payload (auth_key_id | msg_key | enc)
+
+    Returns a human summary, or None if the head does not match.
+    """
+    if not hexstr or not isinstance(hexstr, str):
+        return None
+    hexstr = hexstr.strip().lower()
+    if not hexstr.startswith("ed77be7a"):
+        return None
+    try:
+        raw = bytes.fromhex(hexstr)
+    except ValueError:
+        return None
+    if len(raw) < 6:
+        return None
+    tok_len = raw[4]
+    token = raw[5:5 + tok_len]
+    after = raw[5 + tok_len:]
+    try:
+        token_txt = token.decode("ascii")
+    except UnicodeDecodeError:
+        token_txt = "<non-ascii token>"
+    have_full_token = len(token) == tok_len
+    akid = after[:8].hex() if len(after) >= 8 else after.hex()
+    return (
+        f"magic=ed77be7a tokenLen={tok_len} "
+        f"token={token_txt!r}{'' if have_full_token else ' (TRUNCATED)'} "
+        f"| after-token first8={akid}"
+    )
+
+
 async def cmd_direct_capture_worker(account: str) -> int:
     """Capture the EXACT bytes Eitaa's MTProto Worker sends on the wire.
 
@@ -585,8 +623,11 @@ async def cmd_direct_capture_worker(account: str) -> int:
                 is_img = res[:6] == "ffd8ff" or res[:8] == "89504e47"
                 tag = " [media]" if is_img else ""
                 print(f"[wcap] {k}{tag} {r.get('url')}")
-                print(f"[wcap]    req {r.get('reqLen', 0)}B head={req[:64]}")
-                print(f"[wcap]    res {r.get('resLen', 0)}B head={res[:64]}")
+                print(f"[wcap]    req {r.get('reqLen', 0)}B head={req}")
+                print(f"[wcap]    res {r.get('resLen', 0)}B head={res}")
+                dec = _decode_eitaa_envelope(req)
+                if dec:
+                    print(f"[wcap]    envelope: {dec}")
                 shown += 1
             if shown >= 25:
                 break
