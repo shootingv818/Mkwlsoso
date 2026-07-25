@@ -832,7 +832,7 @@ class JobManager:
                     trace_id=job.job_id,
                     detail="no saved peers for this account, so the browser-free "
                            "engine has nobody to send to. Open this account and tap "
-                           "'🔑 Harvest Peers' (reads your existing contacts once via "
+                           "'📥 Save Contacts' (reads your existing contacts once via "
                            "the browser), then send again. Or switch the engine to "
                            "bridge."))
                 if agg is not None:

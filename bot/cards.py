@@ -608,7 +608,8 @@ def multi_send_finished(accounts: list[dict], sent: int, failed: int, total: int
     lines.append(DIVIDER)
     if blocked:
         lines.append(f"🚧 {len(blocked)} account(s) sent NOTHING because they have no "
-                     "saved peers. Open each one and tap 'Harvest Peers', then send again.")
+                     "saved peers. Open each one and tap '📥 Save Contacts', then send "
+                     "again.")
     lines.append(f"🕒 {now_hms()}")
     return "\n".join(lines)
 
