@@ -1220,15 +1220,36 @@ class JobManager:
                     break
             note = None
             if chosen is None:
-                # No browser here, so there is no UI flow to fall back to. Keep
-                # scanning with the default format (the numbers may genuinely not
-                # be registered) but make the evidence visible either way.
-                note = ("Neither phone format matched anyone. Continuing with +98. "
-                        "If every batch stays at 0, either these numbers are not on "
-                        "Eitaa, or switch the engine to bridge and build there — the "
-                        "bridge path can fall back to the per-number add flow and "
-                        "also harvests peers.")
+                note = ("Neither phone format worked, so this job is handing over to "
+                        "the bridge (browser) path, which is proven. Nothing is lost.")
             await report(cards.contacts_probe(account, tried, chosen, note=note))
+
+            if chosen is None:
+                # LIVE FINDING (2026-07-25): Eitaa answers importContacts on the
+                # browser-free path with a 4-byte, payload-less reply
+                # cid=0xdc252379 -- not contacts.importedContacts, and not any
+                # standard Telegram constructor. Both phone formats got it, so the
+                # format was never the problem: this endpoint simply does not serve
+                # contact import off the browser path.
+                # Rather than leaving the owner with a dead engine, hand the whole
+                # job over to the bridge path, which is proven AND harvests peers.
+                try:
+                    await asyncio.to_thread(sender.close)
+                except Exception:  # noqa: BLE001
+                    pass
+                self._busy.discard(account)
+                print("[contacts] direct import unsupported "
+                      "(reply cid=0xdc252379) -> handing over to bridge", flush=True)
+                await report(cards.card(
+                    "🔄 SWITCHING TO BRIDGE",
+                    [("Account", phone), ("Reason ", "direct import not served")],
+                    footer="Building these contacts through the browser instead. This "
+                           "also harvests peers, so fast sending keeps working."))
+                bridge_settings = dict(settings)
+                bridge_settings["engine"] = "bridge"
+                await self._contacts_job(job, prefix, count, bridge_settings,
+                                         report, live, phone)
+                return
 
             while done < total:
                 if job.stop:

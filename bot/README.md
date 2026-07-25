@@ -77,7 +77,11 @@ are skipped and named in the queued card. One combined
   not only contact building:
   - **Send** → `messages.sendMessage` / `sendMedia` straight over HTTPS. A file
     is uploaded **once** and re-sent to every recipient with no re-upload.
-  - **Build Contacts** → `contacts.importContacts` in batches over HTTPS.
+  - **Build Contacts** → NOT served browser-free. Eitaa answers `importContacts`
+    off the browser path with a 4-byte reply `cid=0xdc252379` (settled live on
+    2026-07-25; both phone formats, so the format was never the cause). The job
+    detects this and **hands over to the bridge path automatically**, so contact
+    building works no matter which engine is selected.
   - Requires a session capture for the account, and **saved peers** for the
     targets. With neither, the job posts a clear error saying what to do rather
     than silently sending nothing.

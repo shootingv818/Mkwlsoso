@@ -159,6 +159,10 @@ Panel changes (see `bot/README.md`):
 - ✅ Browser-free **import contact** — `contacts.importedContacts`.
 - ✅ Browser-free **learn contact peer** (`direct-capture-peer`).
 - ✅ Browser-free **send file txt** and **zip**, to self AND to a contact — media result `0x74ae4240`.
+- ✅ **MULTI-PART upload verified LIVE** (2026-07-25): a 9,494,529 B zip went out as
+  **19 parts, uploaded ONCE**, to `fateme.eitaa.com`, then sent via `sendMedia`
+  (`[dsend] path=direct sent=1 failed=0 of 1 (file)`). This closes the old
+  ">512 KiB untested" TODO — the browser-free FILE path works at real size.
 - ✅ All offline unit tests (`python -m direct.tests.test_direct`).
 
 ## 5) Tests — FAILED / dead-ends (and why) — keep so we don't repeat them
@@ -175,6 +179,18 @@ Panel changes (see `bot/README.md`):
 - ⛔ **apk files** → `error 400: PEER_ID_INVALID`. Confirmed by the user this is an
   **Eitaa platform limitation** (the web app can't send .apk either). NOT our bug.
   Nothing to fix. txt/zip/pdf/images work.
+- ⛔ **`contacts.importContacts` on the browser-free path** → SETTLED 2026-07-25 with
+  a live probe. Eitaa answers with a **4-byte, payload-less reply, cid=0xdc252379**
+  — not `contacts.importedContacts`, and not any constructor in the Telegram schema
+  (searched; it is Eitaa-specific). **Both** phone formats (`+98…` and `98…`) got the
+  identical reply, so the phone format was never the cause: this endpoint simply does
+  not serve contact import off the browser path. Two earlier runs looked like
+  "0 contacts found" only because an unexpected reply was being counted as
+  "not on Eitaa".
+  DO NOT re-investigate. Contact building now auto-hands-over to the bridge path.
+  If it is ever worth another try, the only honest next step is to capture the
+  browser's OWN successful importContacts response (`direct-inspect-capture` on the
+  `contact` op) and compare it with this 4-byte reply.
 
 ## 6) Known limits / TODO (next steps)
 - ⚠️ Everything on `feat/fast-send-multi-account` is compiled + offline-tested but
@@ -192,7 +208,7 @@ Panel changes (see `bot/README.md`):
   the last reason to open a browser for contacts.
 - Confirm token1/token2 stability across browser restarts; ideally source the
   token from the session export (localStorage `token`) instead of the newest capture.
-- Verify multi-part (>512 KiB) file uploads live.
+- ~~Verify multi-part (>512 KiB) file uploads live.~~ DONE — 9.4 MB / 19 parts live.
 - Optional: a direct MTProto login handshake (so `direct` needs no browser capture at all).
 - Still NOT built: resume/checkpoint for the bot's send job (`jobs/state.py` is
   restart-safe but only wired to the CLI), recipient selection/dedupe, 2FA login,
