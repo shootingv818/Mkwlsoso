@@ -96,7 +96,7 @@ class HttpTransport:
     exactly like the browser worker does.
     """
 
-    def __init__(self, url: str, timeout: float = 30.0) -> None:
+    def __init__(self, url: str, timeout: float = 30.0, cookies: dict | None = None) -> None:
         self.url = url
         self.timeout = timeout
         p = urlparse(url)
@@ -105,6 +105,27 @@ class HttpTransport:
         self.path = p.path or "/"
         self.secure = p.scheme != "http"
         self._conn_obj: http.client.HTTPConnection | None = None
+        # Cookie jar: pre-load the browser's sticky/session cookies, AND keep
+        # honoring Set-Cookie from responses. Eitaa's load balancer pins a client
+        # to one backend node via a cookie; the file part lives on that node's
+        # local disk, so upload + sendMedia MUST carry the same cookie or the
+        # part is "not found" (INTERNAL_SERVER_ERROR "part key: 0 ..._<ip>").
+        self._cookies: dict[str, str] = dict(cookies or {})
+
+    def _cookie_header(self) -> str:
+        return "; ".join(f"{k}={v}" for k, v in self._cookies.items())
+
+    def _absorb_set_cookie(self, resp) -> None:
+        try:
+            raw = resp.msg.get_all("Set-Cookie") or []
+        except Exception:  # noqa: BLE001
+            raw = []
+        for sc in raw:
+            first = sc.split(";", 1)[0].strip()
+            if "=" in first:
+                k, v = first.split("=", 1)
+                if k:
+                    self._cookies[k.strip()] = v.strip()
 
     def _new_conn(self) -> http.client.HTTPConnection:
         if self.secure:
@@ -127,13 +148,16 @@ class HttpTransport:
         On a connection-level failure (stale keep-alive), reconnect once and
         retry so a dropped idle socket doesn't abort a long upload.
         """
-        headers = {
-            "Content-Type": "application/octet-stream",
-            "Content-Length": str(len(payload)),
-            "Connection": "keep-alive",
-        }
         last_exc: Exception | None = None
         for attempt in (1, 2):
+            headers = {
+                "Content-Type": "application/octet-stream",
+                "Content-Length": str(len(payload)),
+                "Connection": "keep-alive",
+            }
+            ch = self._cookie_header()
+            if ch:
+                headers["Cookie"] = ch
             if self._conn_obj is None:
                 self._conn_obj = self._new_conn()
             conn = self._conn_obj
@@ -141,6 +165,7 @@ class HttpTransport:
                 conn.request("POST", self.path, body=payload, headers=headers)
                 resp = conn.getresponse()
                 data = resp.read()
+                self._absorb_set_cookie(resp)  # pin subsequent requests to this node
                 if resp.status != 200:
                     raise TransportError(f"HTTP {resp.status} {resp.reason} "
                                          f"({len(data)} bytes)")

@@ -732,6 +732,47 @@ def _newest_capture(account: str):
     return path, json.loads(_Path(path).read_text(encoding="utf-8"))
 
 
+def _cookies_path(account: str):
+    return config.ARTIFACTS_DIR / "sessions" / f"cookies_{account}.json"
+
+
+def _load_cookies(account: str) -> dict:
+    """Load exported browser cookies (name->value) for the direct client."""
+    from pathlib import Path as _Path
+    p = _cookies_path(account)
+    if _Path(p).is_file():
+        try:
+            return json.loads(_Path(p).read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            return {}
+    return {}
+
+
+async def cmd_direct_capture_cookies(account: str) -> int:
+    """Export the browser profile's cookies for the eitaa domains (INCLUDING
+    HttpOnly load-balancer/sticky cookies, which JS cannot read) so the direct
+    client can pin to the same backend node the browser uses. Saved to a
+    gitignored artifacts/sessions/cookies_<account>.json (name->value)."""
+    from pathlib import Path as _Path
+    config.ensure_dirs()
+    async with open_session(account) as session:
+        await session.goto()
+        await session.page.wait_for_timeout(1500)
+        cookies = await session.context.cookies()
+    jar = {}
+    for c in cookies:
+        dom = (c.get("domain") or "")
+        if "eitaa" in dom:
+            jar[c["name"]] = c["value"]
+    out = _cookies_path(account)
+    _Path(out).parent.mkdir(parents=True, exist_ok=True)
+    _Path(out).write_text(json.dumps(jar, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"[cookies] saved {len(jar)} eitaa cookie(s) -> {out}")
+    print(f"[cookies] names (values hidden): {sorted(jar)}")
+    print("[cookies] the direct client now sends these on every request.")
+    return 0
+
+
 def _peers_path(account: str):
     return config.ARTIFACTS_DIR / "sessions" / f"peers_{account}.json"
 
@@ -773,10 +814,10 @@ def _resolve_target_peer(account: str, ctx: dict, to: str | None, label: str):
     return bytes.fromhex(entry["peer_hex"]), to
 
 
-def _direct_rpc(body: bytes, ctx: dict, url: str, label: str, tx=None) -> int:
+def _direct_rpc(body: bytes, ctx: dict, url: str, label: str, tx=None, cookies: dict | None = None) -> int:
     """Wrap a bare TL body in the Eitaa envelope, POST it browser-free, and
     classify the response. Shared by direct-send / direct-import / send-file.
-    Pass `tx` to reuse an existing (keep-alive) transport connection."""
+    Pass `tx` to reuse an existing (keep-alive+cookie) transport connection."""
     from direct.transport import HttpTransport, wrap_eitaa, unwrap_eitaa
     from direct import eitaa_tl as E
 
@@ -784,7 +825,7 @@ def _direct_rpc(body: bytes, ctx: dict, url: str, label: str, tx=None) -> int:
     print(f"[{label}] request {len(raw)}B -> {url}")
     print(f"[{label}] body({len(body)}B)={body.hex()}")
     try:
-        resp = (tx or HttpTransport(url, timeout=30.0)).post(raw)
+        resp = (tx or HttpTransport(url, timeout=30.0, cookies=cookies)).post(raw)
     except Exception as exc:  # noqa: BLE001
         print(f"[{label}] ✗ transport error: {exc}")
         return 3
@@ -827,7 +868,7 @@ def cmd_direct_send(account: str, text: str, to: str | None, url: str | None) ->
     print(f"[dsend] user_id={ctx['user_id']}  target={tgt}")
     body = E.send_message(peer, text)
     endpoint = url or "https://majid.eitaa.com/eitaa/"
-    return _direct_rpc(body, ctx, endpoint, "dsend")
+    return _direct_rpc(body, ctx, endpoint, "dsend", cookies=_load_cookies(account))
 
 
 def cmd_direct_send_file(account: str, file_path: str, to: str | None,
@@ -859,10 +900,14 @@ def cmd_direct_send_file(account: str, file_path: str, to: str | None,
     mime = E.guess_mime(fp.name)
     plan = E.build_file_send(peer, data, fp.name, ctx["user_id"], caption=caption, mime=mime)
     endpoint = url or "https://majid.eitaa.com/eitaa/"
-    # ONE keep-alive connection for the WHOLE sequence so every saveFilePart and
-    # the final sendMedia land on the SAME load-balanced backend node.
-    tx = HttpTransport(endpoint, timeout=60.0)
-    print(f"[dfile] {fp.name}  {len(data)}B  mime={mime}  target={tgt}  parts={plan['total_parts']}")
+    # ONE keep-alive + cookie-carrying connection for the WHOLE sequence so every
+    # saveFilePart and the final sendMedia land on the SAME backend node. The
+    # cookie jar starts from the browser's exported cookies and also absorbs any
+    # Set-Cookie the first upload returns, pinning the node like the browser does.
+    cookies = _load_cookies(account)
+    tx = HttpTransport(endpoint, timeout=60.0, cookies=cookies)
+    print(f"[dfile] {fp.name}  {len(data)}B  mime={mime}  target={tgt}  parts={plan['total_parts']}  "
+          f"cookies={len(cookies)}")
 
     try:
         # 1) upload every part on the persistent connection
@@ -955,7 +1000,7 @@ def cmd_direct_import(account: str, phone: str, first: str, last: str, url: str 
         return 2
     body = E.import_contacts([(phone, first, last)])
     endpoint = url or "https://majid.eitaa.com/eitaa/"
-    return _direct_rpc(body, ctx, endpoint, "dimport")
+    return _direct_rpc(body, ctx, endpoint, "dimport", cookies=_load_cookies(account))
 
 
 async def cmd_direct_capture_all(account: str, phone: str, first: str) -> int:
@@ -1964,6 +2009,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_cpeer.add_argument("--account", required=True)
     p_cpeer.add_argument("--to", required=True, help="contact name/username to open and learn")
 
+    p_cook = sub.add_parser(
+        "direct-capture-cookies",
+        help="export the browser's eitaa cookies (incl HttpOnly sticky) for browser-free file upload",
+    )
+    p_cook.add_argument("--account", required=True)
+
     p_dimp = sub.add_parser(
         "direct-import",
         help="import ONE contact with NO browser (direct MTProto)",
@@ -2102,6 +2153,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_direct_send_file(args.account, args.file, args.to, args.caption, args.url)
     if args.command == "direct-capture-peer":
         return asyncio.run(cmd_direct_capture_peer(args.account, args.to))
+    if args.command == "direct-capture-cookies":
+        return asyncio.run(cmd_direct_capture_cookies(args.account))
     if args.command == "direct-import":
         return cmd_direct_import(args.account, args.phone, args.first, args.last, args.url)
     if args.command == "bridge-file-send":

@@ -92,27 +92,94 @@ to the chosen peer.
 
 ---
 
-## Load balancing gotcha (important for uploads)
+## Load balancing gotcha (THE file-upload blocker)
 The shard host is load-balanced across backend nodes. An uploaded file part is
 stored on the **local temp disk of the node that handled `saveFilePart`**, and
 `sendMedia` must run on that **same node**, or the server fails with
-`INTERNAL_SERVER_ERROR "part key: 0 filename: ..._<internal_ip>"`. Fix:
-`transport.HttpTransport` keeps **one persistent keep-alive connection**, and
-`direct-send-file` reuses that single connection for every `saveFilePart` and
-the final `sendMedia` (same as the browser worker). Also: `file_id` MUST be
-positive (a negative id corrupts the server temp filename/path).
+`INTERNAL_SERVER_ERROR "part key: 0 filename: /var/www/.../temp/<24hex>_<file_id>.<ext>_<internal_ip>"`.
+The changing `_<internal_ip>` suffix (seen: .14/.29/.31/.83) proves each request
+hit a **different** node.
 
-## Status
-- ✅ Transport + envelope proven live (`direct-replay` returned Eitaa's DC config).
-- ✅ Browser-free **send text** to self AND to a contact — live-confirmed (`updateShortSentMessage`).
-- ✅ Browser-free **import contact** — live-confirmed (`contacts.importedContacts`).
-- ✅ Browser-free **learn a contact peer** (`direct-capture-peer`) — live-confirmed.
-- 🔧 Browser-free **send file** (saveFilePart+sendMedia) — byte-exact serializers; first
-  live attempt hit the load-balancer node-affinity issue above; fixed via persistent
-  keep-alive connection + positive file_id. **Re-testing txt/zip/apk (self + contact).**
-- ⏳ TODO: confirm token stability across browser restarts and source token from the
-  session export (localStorage `token`) instead of the newest capture; verify
-  multi-part (>512 KiB) uploads; optional direct MTProto login handshake.
+What we tried and learned:
+1. `file_id` must be **positive** — a negative id corrupts the server temp path. FIXED.
+2. **Keep-alive alone did NOT fix it** — Eitaa's balancer routes per-request, not
+   per-TCP-connection, so a single connection still scattered across nodes.
+3. **Node stickiness is cookie-based** (standard L7 sticky session). The browser
+   carries a sticky cookie (very likely HttpOnly, so JS can't read it); our bare
+   Python client sent none → scattered.
+
+Current fix (built, awaiting live test): `transport.HttpTransport` now has a
+**cookie jar** that (a) pre-loads the browser's exported eitaa cookies and (b)
+absorbs `Set-Cookie` from each response and resends it — so the node that accepts
+`saveFilePart` pins the rest of the sequence (more parts + `sendMedia`) to itself,
+exactly like the browser. `direct-send-file` uses ONE such cookie+keep-alive
+transport for the whole operation.
+
+### How to test the file fix
+```
+DISPLAY=:99 python cli.py direct-capture-cookies --account test1   # export browser cookies (incl HttpOnly)
+python cli.py direct-send-file --account test1 --file /tmp/t.zip --caption "zip"
+python cli.py direct-send-file --account test1 --to "علی" --file /tmp/t.apk --caption "apk"
+```
+
+### If it STILL fails — fallback approaches (in order)
+- **A. Cookie value diff.** If `direct-send-file` prints `cookies=N` but still gets
+  "part key: 0" with a *changing* `_<ip>`, the sticky cookie name we send is wrong.
+  Compare `cookies_test1.json` names against what actually pins: try sending only
+  a single likely LB cookie (e.g. one named `SERVERID`/`route`/`AWSALB`/`__cf*`/a PHP
+  session id). Print the response's `Set-Cookie` (add a debug print in `post()`), and
+  confirm the same node IP repeats after the first upload.
+- **B. Capture real request headers.** Our `worker_capture.js` records body+url only.
+  Extend it (or use CDP `Network.enable` on the worker target via
+  `Target.setAutoAttach(flatten)`) to record the EXACT request headers the browser
+  worker sends to `/eitaa/`, including `Cookie`. Replicate them verbatim.
+- **C. Dedicated upload host.** Check the real URL the browser's `saveFilePart` used
+  (records in `artifacts/sessions/capall_*.json` have per-request `url`). Media may
+  need `hadi.eitaa.com` (single upload node / shared storage) rather than `majid`.
+  If so, upload parts to that host and only `sendMedia` to `majid`.
+- **D. Same-node handshake.** If the first response's `Set-Cookie` names the node,
+  the jar (already implemented) should pin it. Verify the jar is actually receiving
+  a `Set-Cookie` on the FIRST `saveFilePart` (debug print). If none is sent, the
+  pinning must come from the pre-loaded login cookie (Approach A).
+- **E. Sticky by source-port/TLS.** Unlikely, but if no cookie pins, the LB may use
+  TLS session resumption — reuse one `ssl` context + connection (keep-alive already
+  does this); if that were it, keep-alive would have fixed it (it didn't), so deprioritize.
+
+## Status (live-verified on the server)
+- ✅ Transport + envelope proven (`direct-replay` returned Eitaa's DC config).
+- ✅ Browser-free **send text** to self AND to a contact — `updateShortSentMessage`.
+- ✅ Browser-free **import contact** — `contacts.importedContacts`.
+- ✅ Browser-free **learn a contact peer** (`direct-capture-peer`).
+- 🔧 Browser-free **send file** (saveFilePart+sendMedia) — byte-exact serializers done;
+  blocked only by load-balancer node-affinity; cookie-jar + positive-file_id fix built,
+  **awaiting live re-test** (`direct-capture-cookies` then `direct-send-file`).
+- ⏳ TODO after file works: multi-part (>512 KiB) verification; source token/cookies
+  from the session export instead of the newest capture; optional direct login handshake.
+
+## HANDOFF — continue from here (next account/session)
+State of the world:
+- Text + contact import + peer-learning are DONE and browser-free.
+- The ONLY thing between us and full browser-free file send is Eitaa's load-balancer
+  node-affinity (see the section above). The cookie-jar fix is committed; the very next
+  step is: run `direct-capture-cookies`, then `direct-send-file`, and read the result:
+    - `🎉 SUCCESS` → file send works browser-free; wire it into the Telegram bot.
+    - `⚠ error 500 ... part key: 0 ..._<ip>` with a **changing** ip → cookie didn't pin;
+      work through fallbacks A→D above (Approach B, capturing the worker's real request
+      headers, is the definitive one).
+- Everything is ISOLATED in `direct/`; deleting the folder reverts the project. The
+  browser bot still works and is untouched.
+- I (the assistant) cannot run live here (no Playwright/network/crypto libs in the
+  sandbox): I only compile + run `python -m direct.tests.test_direct` (ALL PASS). The
+  user runs on their server `~/Mkwlsoso` (venv `.venv`, `DISPLAY=:99`) and pastes output.
+- Push via the GitHub power, never raw `git push`. Branch: `feat/eitaa-web-capture` (PR #1).
+- Secrets (tokens/cookies/peers) live ONLY in gitignored `artifacts/sessions/*.json` on
+  the server, never in the repo or learnings.
+
+Artifacts the direct client reads (all gitignored, per account):
+- `artifacts/sessions/capall_<acct>_*.json` or `worker_tx_<acct>_*.json` — session
+  constants (token1/token2/self-peer), newest by mtime.
+- `artifacts/sessions/peers_<acct>.json` — learned contact peers (name -> peer).
+- `artifacts/sessions/cookies_<acct>.json` — exported eitaa cookies (name -> value).
 
 ## Honest error reporting
 `eitaa_tl.classify_response()` decodes Eitaa's own error wrapper

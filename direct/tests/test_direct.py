@@ -302,12 +302,38 @@ def test_eitaa_methods():
     _check("build_file_send multi part", big["total_parts"] == 2 and len(big["parts"]) == 2)
 
 
+def test_transport_cookiejar():
+    # The cookie jar pins the load-balanced backend node: it sends preloaded
+    # cookies AND absorbs Set-Cookie from responses so upload+sendMedia stick.
+    from direct.transport import HttpTransport
+
+    class _Msg:
+        def __init__(self, sc): self._sc = sc
+        def get_all(self, name):
+            return self._sc if name == "Set-Cookie" else None
+
+    class _Resp:
+        def __init__(self, sc): self.msg = _Msg(sc)
+
+    t = HttpTransport("https://majid.eitaa.com/eitaa/", cookies={"a": "1"})
+    _check("cookie header preloaded", t._cookie_header() == "a=1")
+    t._absorb_set_cookie(_Resp(["SERVERID=nodeA; path=/; HttpOnly", "x=y; Secure"]))
+    _check("absorbed SERVERID", t._cookies.get("SERVERID") == "nodeA")
+    _check("absorbed x", t._cookies.get("x") == "y")
+    _check("cookie header merged", "SERVERID=nodeA" in t._cookie_header()
+           and "a=1" in t._cookie_header())
+    # no Set-Cookie -> jar unchanged
+    before = dict(t._cookies)
+    t._absorb_set_cookie(_Resp([]))
+    _check("no set-cookie keeps jar", t._cookies == before)
+
+
 def main():
     print("== direct client offline tests ==")
     for fn in (test_aes_nist, test_ige_roundtrip, test_crypto_helpers,
                test_mtproto_envelope, test_tl_roundtrip, test_session_loader,
                test_service_parser, test_schema_wrap, test_transport_url,
-               test_eitaa_envelope, test_eitaa_methods):
+               test_eitaa_envelope, test_eitaa_methods, test_transport_cookiejar):
         print(f"[{fn.__name__}]")
         fn()
     print("\nALL DIRECT TESTS PASSED")
