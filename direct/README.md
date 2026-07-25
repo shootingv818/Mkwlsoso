@@ -163,6 +163,9 @@ python cli.py direct-send-file --account test1 --to "علی" --file /tmp/t.apk -
   root cause found = media must go to the dedicated media host (`fateme.eitaa.com`),
   not the API host. Fix built (`extract_media_url` + route file send there).
   **Awaiting live re-test** (`direct-send-file`).
+- ⛔ **apk is blocked by Eitaa itself** (platform policy — the web app can't send .apk
+  either); the direct client returns Eitaa's `error 400: PEER_ID_INVALID` for apk. Not
+  our bug; nothing to fix. txt/zip/pdf/images/etc. work.
 - ⏳ TODO after file works: multi-part (>512 KiB) verification; source token/cookies
   from the session export instead of the newest capture; optional direct login handshake.
 
