@@ -223,7 +223,9 @@ def build_file_send(peer: bytes, file_bytes: bytes, file_name: str,
     if mime is None:
         mime = guess_mime(file_name)
     if file_id is None:
-        file_id = int.from_bytes(os.urandom(8), "little", signed=True)
+        # tweb uses a POSITIVE file_id; a negative one breaks the server's temp
+        # filename/path (observed: INTERNAL_SERVER_ERROR "filename: /var/www/...").
+        file_id = int.from_bytes(os.urandom(8), "little") & 0x7FFFFFFFFFFFFFFF
     total = len(file_bytes)
     total_parts = max(1, (total + part_size - 1) // part_size)
 
@@ -333,23 +335,36 @@ def find_message_peer(capture, marker: str) -> bytes | None:
 
 # --- response classification -----------------------------------------------
 RPC_ERROR = 0x2144CA19
+# Eitaa's own error wrapper: eitaa_error#c4b9f9bb code:int message:string
+# (e.g. code=500 "INTERNAL_SERVER_ERROR...", code=400 "RETRY_LIMIT10").
+EITAA_ERROR = 0xC4B9F9BB
 
 
 def classify_response(body: bytes) -> dict:
-    """Best-effort read of a response body's leading constructor.
+    """Read a response body's leading constructor and decide ok/not-ok.
 
-    Returns {cid, ok, note}. `ok` is False for an obvious rpc_error or a
-    recognizable error phrase; True otherwise. Full parsing of the Updates
-    result is done by the caller when needed.
+    Returns {cid, ok, note, code?, message?}. Decodes Eitaa's eitaa_error and
+    the standard rpc_error so failures are reported HONESTLY.
     """
     if len(body) < 4:
         return {"cid": None, "ok": False, "note": "empty/short response"}
     cid = int.from_bytes(body[:4], "little", signed=False)
+
+    if cid in (EITAA_ERROR, RPC_ERROR):
+        try:
+            r = tl.Reader(body)
+            r.int(signed=False)          # ctor
+            code = r.int(signed=True)    # error code
+            msg = r.bytes().decode("utf-8", "replace")
+            return {"cid": cid, "ok": False, "code": code, "message": msg,
+                    "note": f"error {code}: {msg}"}
+        except Exception:  # noqa: BLE001
+            return {"cid": cid, "ok": False, "note": "error (undecodable)"}
+
+    # last-resort phrase scan for wrappers we haven't modelled
     text = body.decode("latin-1", "ignore")
-    for phrase in ("FLOOD_WAIT", "RETRY_LIMIT", "PEER_ID_INVALID",
-                   "AUTH_KEY", "SESSION", "USER_DEACTIVATED"):
+    for phrase in ("FLOOD_WAIT", "RETRY_LIMIT", "INTERNAL_SERVER_ERROR",
+                   "PEER_ID_INVALID", "AUTH_KEY", "USER_DEACTIVATED", "FILE_"):
         if phrase in text:
             return {"cid": cid, "ok": False, "note": f"error phrase: {phrase}"}
-    if cid == RPC_ERROR:
-        return {"cid": cid, "ok": False, "note": "rpc_error"}
     return {"cid": cid, "ok": True, "note": f"result ctor 0x{cid:08x}"}

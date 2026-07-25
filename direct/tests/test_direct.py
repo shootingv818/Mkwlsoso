@@ -267,6 +267,12 @@ def test_eitaa_methods():
     _check("rpc_error classified not ok", ok["ok"] is False)
     ok = E.classify_response(bytes.fromhex("01e015909abcdef0"))
     _check("normal ctor classified ok", ok["ok"] is True)
+    # Eitaa's own error wrapper must be decoded (code + message), not passed as ok
+    eerr = E.classify_response(bytes.fromhex("bbf9b9c490010000") + bytes([0x0d]) + b"RETRY_LIMIT10\x00\x00")
+    _check("eitaa_error decoded not ok", eerr["ok"] is False and eerr["code"] == 400
+           and eerr["message"] == "RETRY_LIMIT10")
+    _check("build_file_send uses positive file_id",
+           E.build_file_send(peer, b"x" * 5, "a.txt", 1)["file_id"] > 0)
 
     # --- file send: saveFilePart(+eitaa trailer) and sendMedia byte-exact ---
     data = b"mkwlsoso capture-all file test MKWLTX1784938813\n"
