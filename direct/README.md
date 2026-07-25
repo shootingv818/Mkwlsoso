@@ -108,19 +108,28 @@ What we tried and learned:
    carries a sticky cookie (very likely HttpOnly, so JS can't read it); our bare
    Python client sent none → scattered.
 
-Current fix (built, awaiting live test): `transport.HttpTransport` now has a
-**cookie jar** that (a) pre-loads the browser's exported eitaa cookies and (b)
-absorbs `Set-Cookie` from each response and resends it — so the node that accepts
-`saveFilePart` pins the rest of the sequence (more parts + `sendMedia`) to itself,
-exactly like the browser. `direct-send-file` uses ONE such cookie+keep-alive
-transport for the whole operation.
+### ACTUAL ROOT CAUSE (found via `direct-inspect-capture`)
+There are **no cookies** at all (`direct-capture-cookies` returned 0). The real
+reason: **media uses a DEDICATED media host, not the API host.** The browser's
+`upload.saveFilePart` AND `messages.sendMedia` both went to **`fateme.eitaa.com`**,
+while text/contacts went to `bagher.eitaa.ir`. We were POSTing media to
+`majid.eitaa.com` (a regular API host with multiple nodes + local temp files) →
+"part key: 0". The media host keeps upload + sendMedia on the same storage.
+
+Fix (built, awaiting live test): `eitaa_tl.extract_media_url(capture)` pulls the
+exact host the browser used for saveFilePart/sendMedia out of the capture, and
+`direct-send-file` POSTs there (fallback `fateme.eitaa.com`, then `majid`). The
+cookie jar + keep-alive stay in the transport as belt-and-suspenders.
+
+Use `python cli.py direct-inspect-capture --account <acct>` (READ-ONLY) to see
+the host + TL method of every captured request — this is how the media host was found.
 
 ### How to test the file fix
 ```
-DISPLAY=:99 python cli.py direct-capture-cookies --account test1   # export browser cookies (incl HttpOnly)
 python cli.py direct-send-file --account test1 --file /tmp/t.zip --caption "zip"
 python cli.py direct-send-file --account test1 --to "علی" --file /tmp/t.apk --caption "apk"
 ```
+(`direct-capture-cookies` is optional now — media host is the real fix.)
 
 ### If it STILL fails — fallback approaches (in order)
 - **A. Cookie value diff.** If `direct-send-file` prints `cookies=N` but still gets
@@ -151,8 +160,9 @@ python cli.py direct-send-file --account test1 --to "علی" --file /tmp/t.apk -
 - ✅ Browser-free **import contact** — `contacts.importedContacts`.
 - ✅ Browser-free **learn a contact peer** (`direct-capture-peer`).
 - 🔧 Browser-free **send file** (saveFilePart+sendMedia) — byte-exact serializers done;
-  blocked only by load-balancer node-affinity; cookie-jar + positive-file_id fix built,
-  **awaiting live re-test** (`direct-capture-cookies` then `direct-send-file`).
+  root cause found = media must go to the dedicated media host (`fateme.eitaa.com`),
+  not the API host. Fix built (`extract_media_url` + route file send there).
+  **Awaiting live re-test** (`direct-send-file`).
 - ⏳ TODO after file works: multi-part (>512 KiB) verification; source token/cookies
   from the session export instead of the newest capture; optional direct login handshake.
 

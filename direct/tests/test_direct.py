@@ -294,6 +294,18 @@ def test_eitaa_methods():
 
     plan = E.build_file_send(peer, data, "note.txt", 50267193, caption="hi")
     _check("build_file_send single part", plan["total_parts"] == 1 and len(plan["parts"]) == 1)
+
+    # media host extraction: a sendMedia request in a capture reveals the media host
+    from direct.transport import wrap_eitaa as _wrap
+    mediabody = E.send_media(peer, E.input_media_uploaded_document(
+        E.input_file(1, 1, "document.txt", ""), "text/plain", "a.txt"), random_id=1)
+    mraw = _wrap("9179.x_1", "y__web", mediabody)
+    cap = {"file": [
+        {"kind": "fetch", "url": "https://bagher.eitaa.ir/eitaa/", "reqLen": 10, "reqHead": "ed77be7a00"},
+        {"kind": "fetch", "url": "https://fateme.eitaa.com/eitaa/", "reqLen": len(mraw), "reqHead": mraw.hex()},
+    ]}
+    _check("extract_media_url finds media host",
+           E.extract_media_url(cap) == "https://fateme.eitaa.com/eitaa/")
     _check("build_file_send mime txt", E.guess_mime("a.txt") == "text/plain")
     _check("build_file_send mime zip", E.guess_mime("a.zip") == "application/zip")
     _check("build_file_send mime apk",

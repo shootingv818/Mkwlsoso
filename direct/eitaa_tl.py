@@ -305,6 +305,30 @@ def extract_context(capture) -> dict:
     return result
 
 
+def extract_media_url(capture) -> str | None:
+    """Return the exact endpoint URL the browser used for MEDIA (saveFilePart /
+    sendMedia). CONFIRMED: media does NOT go to the regular API host (majid /
+    bagher) but to a dedicated media host (e.g. fateme.eitaa.com); uploading a
+    file part there + sending media there keeps them on the SAME storage, which
+    is why the browser works and our majid attempts failed with 'part key: 0'."""
+    targets = {SAVE_FILE_PART, SEND_MEDIA}
+    for rec in _iter_records(capture):
+        if rec.get("kind") not in ("fetch", "xhr"):
+            continue
+        head = _head_hex(rec)
+        if not head.startswith("ed77be7a"):
+            continue
+        try:
+            body = unwrap_eitaa(bytes.fromhex(head))["body"]
+        except Exception:  # noqa: BLE001
+            continue
+        if len(body) >= 4 and int.from_bytes(body[:4], "little", signed=False) in targets:
+            url = rec.get("url")
+            if url:
+                return url
+    return None
+
+
 def find_message_peer(capture, marker: str) -> bytes | None:
     """Find the 20-byte target peer of a sendMessage whose text contains
     `marker`. Used to learn a CONTACT's peer from a controlled browser send."""

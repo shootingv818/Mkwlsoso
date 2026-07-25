@@ -961,7 +961,10 @@ def cmd_direct_send_file(account: str, file_path: str, to: str | None,
     data = fp.read_bytes()
     mime = E.guess_mime(fp.name)
     plan = E.build_file_send(peer, data, fp.name, ctx["user_id"], caption=caption, mime=mime)
-    endpoint = url or "https://majid.eitaa.com/eitaa/"
+    # MEDIA must go to the dedicated media host the browser used (e.g.
+    # fateme.eitaa.com), NOT the regular API host. Extract it from the capture;
+    # fall back to fateme, then majid.
+    endpoint = url or E.extract_media_url(cap) or "https://fateme.eitaa.com/eitaa/"
     # ONE keep-alive + cookie-carrying connection for the WHOLE sequence so every
     # saveFilePart and the final sendMedia land on the SAME backend node. The
     # cookie jar starts from the browser's exported cookies and also absorbs any
