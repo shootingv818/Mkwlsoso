@@ -272,18 +272,24 @@ def kb_multi(page: int = 0):
     shown, page, pages = _page_slice(accounts, page)
     rows = []
     for acc in shown:
-        mark = "☑" if acc in selected else "☐"
+        # Ticked accounts show their position, because the order is the send order.
+        if acc in selected:
+            mark = f"{selected.index(acc) + 1}️⃣"
+        else:
+            mark = "☐"
         n = contacts_store.count(acc)
-        label = f"{mark} {store.account_phone(acc)} · {n:,}" if n else \
-                f"{mark} {store.account_phone(acc)} · —"
+        label = f"{mark} {store.account_phone(acc)} · " + (f"{n:,}" if n else "—")
         rows.append([Button.inline(label, f"multi:tog:{page}:{acc}".encode())])
     pager = _pager_row("multi:open:", page, pages)
     if pager:
         rows.append(pager)
     if accounts:
-        reach = sum(contacts_store.count(a) for a in selected)
-        rows.append([Button.inline(
-            f"🚀 Send · {len(selected)} acct · {reach:,} contacts", b"multi:go")])
+        if manager.multi_jobs():
+            rows.append([Button.inline("⏹ Stop Run", b"multi:stop")])
+        else:
+            reach = sum(contacts_store.count(a) for a in selected)
+            rows.append([Button.inline(
+                f"🚀 Send · {len(selected)} acct · {reach:,} contacts", b"multi:go")])
         rows.append([Button.inline("☑ All", f"multi:all:{page}".encode()),
                      Button.inline("🧹 Clear", f"multi:clear:{page}".encode())])
     rows.append([Button.inline("⬅ Home", b"menu:home")])
@@ -353,30 +359,42 @@ def accounts_text() -> str:
 
 
 def multi_text() -> str:
-    """The Multi Send section: pick accounts, see the combined reach up front."""
+    """The Multi Send section: pick accounts, see the order and combined reach."""
     accounts = list_accounts()
     selected = store.prune_selected(accounts)
     reach = sum(contacts_store.count(a) for a in selected)
     unsaved = [a for a in selected if not contacts_store.count(a)]
+    running = manager.multi_jobs()
 
     pairs = [
         ("Accounts", f"{len(selected)} of {len(accounts)} ticked"),
-        ("Reach   ", f"{reach:,} contacts" if reach else "0 — nothing saved yet"),
+        ("Reach   ", f"{reach:,} contacts" if reach else "—"),
         ("Content ", store.content_summary()),
         ("Delay   ", f"{store.text_send_delay:g}s between messages"),
     ]
-    if not accounts:
+    # The tick order IS the send order, so show it.
+    body = None
+    if selected:
+        body = "Order:\n" + "\n".join(
+            f"{i}. {store.account_phone(a)} · "
+            + (f"{contacts_store.count(a):,}" if contacts_store.count(a) else "reads first")
+            for i, a in enumerate(selected, start=1))
+
+    if running:
+        footer = "⏳ A run is already in progress. Use Stop Run to end it."
+    elif not accounts:
         footer = "No accounts yet. Add one first."
     elif not selected:
-        footer = "Tick the accounts you want to send from (10 per page)."
-    elif unsaved:
-        footer = (f"⚠️ {len(unsaved)} ticked account(s) have no saved contacts, so "
-                  "their list gets collected when the send starts (slow, but it "
-                  "works). Tap 📥 Save Contacts on each to avoid the wait.")
+        footer = ("Tick accounts in the order you want them used — the first one "
+                  "ticked sends first.")
     else:
-        footer = (f"Ready: {len(selected)} accounts → {reach:,} contacts, all running "
-                  "at once into ONE live card.")
-    return cards.card("🚀 MULTI SEND", pairs, footer=footer)
+        footer = (f"{len(selected)} account(s) run ONE AFTER ANOTHER into a single "
+                  "live card. When one finishes, stops, or its session fails, the "
+                  "next begins.")
+        if unsaved:
+            footer += (f"\n📥 {len(unsaved)} of them have no saved contacts yet; their "
+                       "list is read automatically before sending starts.")
+    return cards.card("🚀 MULTI SEND", pairs, footer=footer, body=body)
 
 
 def peer_count(acc: str) -> int | None:
@@ -536,6 +554,11 @@ async def _handle_callback(event):
         return await event.edit(multi_text(), buttons=kb_multi(page))
     if data == "multi:go":
         return await _start_multi_send(event)
+    if data == "multi:stop":
+        n = manager.stop_multi()
+        await event.answer("Stopping after the current contact." if n
+                           else "No multi-account run is active.", alert=not n)
+        return await event.edit(multi_text(), buttons=kb_multi(0))
 
     # ---- per-account panel actions (operate on active) ----
     if data == "pnl:refresh":
@@ -686,30 +709,35 @@ async def _start_multi_send(event):
                 "on each first.", alert=True)
 
     live = LiveCard(config.report_to())
+    # Selection ORDER matters: the first account ticked sends first.
     pairs = [(a, store.account_phone(a)) for a in free]
     reach = sum(contacts_store.count(a) for a in free)
-    jobs = await manager.run_send_multi(pairs, dict(store.content),
-                                        dict(store.settings), report, live=live)
-    await event.answer(f"Started on {len(jobs)} account(s).")
-    notes = []
+    await manager.run_send_multi(pairs, dict(store.content),
+                                 dict(store.settings), report, live=live)
+    await event.answer(f"Queued {len(pairs)} account(s).")
+    notes = ["Accounts run ONE AT A TIME in the order below. When one finishes "
+             "(or stops, or its session fails) the next one starts."]
     if busy:
         notes.append("Skipped (already busy): "
                      + ", ".join(store.account_phone(a) for a in busy))
     unsaved = [a for a in free if not contacts_store.count(a)]
     if unsaved:
-        notes.append(f"⏳ {len(unsaved)} account(s) have no saved contacts, so their "
-                     "list is being collected first (this takes a few minutes).")
+        notes.append(f"📥 {len(unsaved)} account(s) have no saved contacts yet, so "
+                     "their list is read first. A queue card with the grand total "
+                     "follows.")
     if no_peers:
         notes.append(f"🚧 {len(no_peers)} account(s) have no saved peers and will send "
                      "nothing: " + ", ".join(store.account_phone(a) for a in no_peers))
-    notes.append("One live card will follow and update in place.")
+    order = "\n".join(f"{i}. {p}" for i, (_, p) in enumerate(pairs, start=1))
     await event.edit(
         cards.card("🚀 MULTI SEND QUEUED",
-                   [("Accounts", len(jobs)),
-                    ("Reach   ", f"{reach:,} contacts" if reach else "collecting…"),
+                   [("Accounts", len(pairs)),
+                    ("Reach   ", f"{reach:,} contacts" if reach else "reading…"),
                     ("Content ", store.content_summary())],
+                   body="Order:\n" + order,
                    footer="\n".join(notes)),
-        buttons=[[Button.inline("⬅ Home", b"menu:home")]])
+        buttons=[[Button.inline("⏹ Stop Run", b"multi:stop")],
+                 [Button.inline("⬅ Home", b"menu:home")]])
 
 
 @bot.on(events.NewMessage)

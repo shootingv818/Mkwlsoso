@@ -151,32 +151,40 @@ class AggregateProgress:
     def _status(self) -> str:
         rows = self.breakdown()
         states = [r["state"] for r in rows]
+        if "preparing" in states:
+            return "📥 Reading contacts"
         if "running" in states:
             return "🟢 Sending"
-        if "limited" in states:
-            return "🚫 Limited"
-        if "stopped" in states:
-            return "🛑 Stopped"
+        # Only once nothing is in flight can the run be summarized. This check
+        # comes BEFORE the limited/stopped ones so a finished run that merely
+        # contained a limited account is not reported as "Limited".
         if states and set(states) <= {"done", "failed", "no_targets",
                                       "stopped", "limited"}:
             # Never claim a green "Done" when accounts could not send at all --
             # that made 7 of 8 accounts failing look like a 100% success.
-            no_targets = states.count("no_targets")
-            failed = states.count("failed")
-            if no_targets or failed:
-                parts = []
-                if no_targets:
-                    parts.append(f"{no_targets} with no peers")
-                if failed:
-                    parts.append(f"{failed} failed")
+            parts = []
+            for count, word in ((states.count("no_targets"), "with no peers"),
+                                (states.count("failed"), "failed"),
+                                (states.count("limited"), "limited"),
+                                (states.count("stopped"), "stopped")):
+                if count:
+                    parts.append(f"{count} {word}")
+            if parts:
                 return "⚠️ Done — " + ", ".join(parts)
             return "✅ Done"
+        if "limited" in states:
+            return "🚫 Limited"
+        if "stopped" in states:
+            return "🛑 Stopped"
         return "⏳ Starting"
 
     def render(self) -> str:
         sent, failed, total = self.totals()
+        # "Now" means an account is actually working right now; once the run is
+        # over it would otherwise keep naming the last account forever.
+        busy = any(r["state"] in ("running", "preparing") for r in self.breakdown())
         return cards.live_send_multi(
-            self.breakdown(), self.current, sent, failed, total,
+            self.breakdown(), self.current if busy else None, sent, failed, total,
             time.time() - self.start, status=self._status(),
             engine=self.engine, kind=self.kind,
         )
@@ -207,6 +215,8 @@ class JobManager:
         self._jobs: dict[str, Job] = {}
         self._busy: set[str] = set()
         self._logins: dict[str, LoginState] = {}
+        # multi-run job id -> the per-account job it is currently waiting on.
+        self._multi_children: dict[str, Job] = {}
 
     def is_busy(self, account: str) -> bool:
         return account in self._busy
@@ -214,15 +224,28 @@ class JobManager:
     def active_jobs(self) -> list[Job]:
         return [j for j in self._jobs.values() if j.task and not j.task.done()]
 
+    def multi_jobs(self) -> list[Job]:
+        """Running multi-account runs (kind "multi")."""
+        return [j for j in self.active_jobs() if j.kind == "multi"]
+
     def get(self, job_id: str) -> Job | None:
         return self._jobs.get(job_id)
 
     def stop(self, job_id: str) -> bool:
         job = self._jobs.get(job_id)
-        if job:
-            job.stop = True
-            return True
-        return False
+        if not job:
+            return False
+        job.stop = True
+        # Stopping a multi run must also stop the account sending right now,
+        # otherwise it would keep going and only the queue would halt.
+        child = self._multi_children.get(job_id)
+        if child is not None:
+            child.stop = True
+        return True
+
+    def stop_multi(self) -> int:
+        """Stop every running multi-account run (and its current account)."""
+        return sum(1 for j in self.multi_jobs() if self.stop(j.job_id))
 
     def stop_account(self, account: str) -> int:
         n = 0
@@ -262,42 +285,96 @@ class JobManager:
         return job
 
     async def run_send_multi(self, accounts: list[tuple[str, str]], content: dict,
-                             settings: dict, report: Report, live=None) -> list[Job]:
-        """Send from SEVERAL accounts at the same time, into ONE live card.
+                             settings: dict, report: Report, live=None) -> Job:
+        """Send from several accounts ONE AFTER ANOTHER, in the order given.
 
-        `accounts` is [(account, phone)]. Accounts already running a job are
-        skipped (one job per account stays enforced). Every job reports into a
-        shared AggregateProgress, and a supervisor posts the final summary once
-        they have all finished.
+        `accounts` is [(account, phone)] in the order the owner ticked them, so
+        the first account ticked is the first to send. An account runs until it
+        finishes, is stopped, or fails for ANY reason (expired session, limit,
+        crash) -- then the run moves on to the next one. Nothing runs in
+        parallel, so only one browser is open at a time.
+
+        Returns the single "multi" job that represents the whole run; stopping it
+        stops the account currently sending and skips the rest.
         """
-        free = [(a, p) for a, p in accounts if not self.is_busy(a)]
-        if not free:
-            return []
+        multi = self._new_job("multi", "*")
+        multi.task = asyncio.create_task(
+            self._multi_send_sequence(multi, list(accounts), content, settings,
+                                      report, live))
+        return multi
+
+    async def _multi_send_sequence(self, multi: Job, accounts: list[tuple[str, str]],
+                                   content: dict, settings: dict, report: Report,
+                                   live=None) -> None:
         kind = "File" if content.get("kind") == "file" else "Text"
         engine = effective_engine(settings)
-        agg = AggregateProgress(live, free, kind=kind, engine=engine)
-        if live is not None:
-            await live.set(agg.render(), force=True)
-        jobs: list[Job] = []
-        for acc, phone in free:
-            jobs.append(await self.run_send(
-                acc, content, settings, report, live=None,
-                account_phone=phone, agg=agg))
-        asyncio.create_task(self._multi_send_supervisor(agg, jobs, report, kind, engine))
-        return jobs
+        agg = AggregateProgress(live, accounts, kind=kind, engine=engine)
+        start = time.time()
 
-    async def _multi_send_supervisor(self, agg: AggregateProgress, jobs: list[Job],
-                                     report: Report, kind: str, engine: str) -> None:
-        """Wait for every account's job, then post one combined summary."""
-        tasks = [j.task for j in jobs if j.task is not None]
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+        # ---- PHASE 1: know the reach before sending anything ----------------
+        # Every account's contacts are counted up front (collected first if this
+        # account has none saved yet), so the card can show a real grand total
+        # instead of a number that grows as the run goes.
+        for acc, phone in accounts:
+            if multi.stop:
+                break
+            known = contacts_store.count(acc)
+            if not known:
+                await agg.update(acc, state="preparing", force=True)
+                save_job = await self.run_save_contacts(acc, report, phone)
+                self._multi_children[multi.job_id] = save_job
+                try:
+                    await save_job.task
+                except Exception:  # noqa: BLE001 - a failure here just means 0
+                    pass
+                known = contacts_store.count(acc)
+            await agg.update(acc, total=known, state="pending", force=True)
+
+        _, _, grand_total = agg.totals()
+        await report(cards.multi_ready(agg.breakdown(), grand_total, kind=kind))
+
+        # ---- PHASE 2: send, one account at a time, in order -----------------
+        order = 0
+        for acc, phone in accounts:
+            if multi.stop:
+                break
+            order += 1
+            await agg.update(acc, state="running", force=True)
+            job = await self.run_send(acc, content, settings, report, live=None,
+                                      account_phone=phone, agg=agg)
+            self._multi_children[multi.job_id] = job
+            try:
+                await job.task
+            except Exception as exc:  # noqa: BLE001 - never abort the whole run
+                await report(cards.error_card(
+                    "multi_send", acc, code=type(exc).__name__, detail=str(exc),
+                    phase="account_job", trace_id=multi.job_id))
+
+            # Whatever happened, record an outcome for this account and move on.
+            row = agg.rows.get(acc, {})
+            summary = job.summary or {}
+            if row.get("state") not in ("done", "stopped", "limited", "failed",
+                                        "no_targets"):
+                # The job returned without reporting (e.g. it was not logged in),
+                # so mark it failed rather than leaving it looking pending.
+                await agg.update(acc, state="failed", force=True)
+                row = agg.rows.get(acc, {})
+            await report(cards.multi_account_done(
+                phone, order, len(accounts), row.get("state", "failed"),
+                int(summary.get("sent", row.get("sent", 0)) or 0),
+                int(summary.get("failed", row.get("failed", 0)) or 0),
+                int(row.get("total", 0) or 0),
+                next_phone=(accounts[order][1] if order < len(accounts)
+                            and not multi.stop else None)))
+
+        self._multi_children.pop(multi.job_id, None)
         await agg.finish()
         sent, failed, total = agg.totals()
-        stopped = any(j.stop for j in jobs)
+        multi.summary = {"sent": sent, "failed": failed, "total": total,
+                         "accounts": len(accounts)}
         await report(cards.multi_send_finished(
-            agg.breakdown(), sent, failed, total, time.time() - agg.start,
-            kind=kind, engine=engine, stopped=stopped))
+            agg.breakdown(), sent, failed, total, time.time() - start,
+            kind=kind, engine=engine, stopped=multi.stop))
 
     async def _send_progress(self, live, agg: AggregateProgress | None,
                              account: str, phone: str, *, sent: int, failed: int,
@@ -505,6 +582,27 @@ class JobManager:
                             contacts, pvs = s.get("contacts"), s.get("pvs")
                     except Exception:  # noqa: BLE001
                         pass
+
+                    # Save the contacts list RIGHT NOW, while the browser is
+                    # already open and logged in. This is the slow part, so doing
+                    # it here means the owner never has to trigger it by hand and
+                    # the first send starts delivering immediately.
+                    t_save = time.time()
+                    try:
+                        collected = await driver.collect_all_contacts()
+                        record = contacts_store.save(account, collected)
+                        await driver._return_to_chat_list()
+                        peer_ids = [c.get("peer_id") for c in record["contacts"]
+                                    if c.get("peer_id")]
+                        await self._harvest_peers(driver, account, report, peer_ids)
+                        await report(cards.contacts_saved(
+                            re.sub(r"\D", "", intl), record["count"],
+                            len(peer_ids), time.time() - t_save))
+                    except Exception as exc:  # noqa: BLE001 - login still succeeded
+                        await report(cards.error_card(
+                            "save_contacts", account, code=type(exc).__name__,
+                            detail=str(exc), phase="on_add",
+                            trace_id="login"))
                     phone_digits = re.sub(r"\D", "", intl)
                     try:
                         from bot.store import store as _store

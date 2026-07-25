@@ -55,7 +55,9 @@ def card(title: str, pairs: Iterable[tuple[str, object]] | None = None,
     """Build a card. `pairs` are key/value rows; `body`/`footer` are free text."""
     lines = [title, DIVIDER]
     if body:
-        lines.append(sanitize(body, 800))
+        # Sanitize line BY line: sanitize() collapses all whitespace, which would
+        # otherwise flatten a multi-line body (e.g. a numbered queue) into one row.
+        lines.extend(sanitize(ln, 300) for ln in str(body).splitlines())
     rows = _rows(pairs or [])
     if rows:
         lines.extend(rows)
@@ -165,6 +167,18 @@ _STATE_MARK = {
     "failed": "⚠️",
     "limited": "🚫",
     "no_targets": "🚧",
+    "preparing": "📥",
+}
+
+_STATE_WORD = {
+    "done": "finished",
+    "stopped": "stopped",
+    "failed": "failed",
+    "limited": "hit a limit",
+    "no_targets": "had no targets",
+    "preparing": "reading contacts",
+    "running": "sending",
+    "pending": "waiting",
 }
 
 
@@ -216,16 +230,66 @@ def live_send_multi(accounts: list[dict], current: str | None, sent: int,
     ]
     if accounts:
         lines.append(DIVIDER)
+        # Numbered, because the run is sequential: 1 finishes, then 2, then 3.
         width = max(len(str(a.get("phone", ""))) for a in accounts)
-        for a in accounts:
+        for i, a in enumerate(accounts, start=1):
             state = str(a.get("state", "pending"))
             mark = _STATE_MARK.get(state, "•")
             phone = str(a.get("phone", "")).ljust(width)
-            row = f"{mark} {phone} · {a.get('sent', 0)}/{a.get('total', 0)}"
+            row = f"{i}. {mark} {phone} · {a.get('sent', 0)}/{a.get('total', 0)}"
             if a.get("failed"):
                 row += f" · ✗{a['failed']}"
             lines.append(row)
     lines.append(f"🕒 {now_hms()}")
+    return "\n".join(lines)
+
+
+def multi_ready(accounts: list[dict], total: int, kind: str | None = None) -> str:
+    """Posted once the reach of every ticked account is known, before sending.
+
+    This is the "sum it up first" card: each account's contact count and the
+    grand total, in the exact order they will be used.
+    """
+    lines = ["🧾 MULTI SEND — QUEUE READY", DIVIDER]
+    width = max((len(str(a.get("phone", ""))) for a in accounts), default=0)
+    for i, a in enumerate(accounts, start=1):
+        phone = str(a.get("phone", "")).ljust(width)
+        n = int(a.get("total", 0) or 0)
+        lines.append(f"{i}. {phone} · {n:,} contacts" + ("" if n else "  ⚠️ none"))
+    lines += [
+        DIVIDER,
+        *_rows([
+            ("Accounts", len(accounts)),
+            ("Type    ", kind),
+            ("TOTAL   ", f"{total:,} messages to send"),
+        ]),
+        DIVIDER,
+        f"Starting with #1. Each account runs to the end (or until it stops or "
+        f"fails), then the next one begins.",
+        f"🕒 {now_hms()}",
+    ]
+    return "\n".join(lines)
+
+
+def multi_account_done(phone: str, order: int, of: int, state: str, sent: int,
+                       failed: int, total: int, next_phone: str | None = None) -> str:
+    """Per-account result inside a sequential multi run, plus what comes next."""
+    mark = _STATE_MARK.get(state, "•")
+    word = _STATE_WORD.get(state, state)
+    lines = [
+        f"{mark} ACCOUNT {order}/{of} {word.upper()}",
+        DIVIDER,
+        f"📱 {phone}",
+        bar(sent + failed, total),
+        *_rows([
+            ("Sent  ", f"✅ {sent} of {total}"),
+            ("Failed", f"✗ {failed}" if failed else None),
+        ]),
+        DIVIDER,
+        (f"➡️ Moving on to account {order + 1}/{of}: {next_phone}"
+         if next_phone else "No accounts left in the queue."),
+        f"🕒 {now_hms()}",
+    ]
     return "\n".join(lines)
 
 
@@ -575,13 +639,15 @@ def multi_send_finished(accounts: list[dict], sent: int, failed: int, total: int
                         engine: str | None = None, stopped: bool = False) -> str:
     """Final summary of a multi-account send (combined + per account)."""
     blocked = [a for a in accounts if str(a.get("state")) == "no_targets"]
+    bad = [a for a in accounts
+           if str(a.get("state")) in ("no_targets", "failed", "limited")]
     if stopped:
-        title = "🛑 MULTI-ACCOUNT SEND STOPPED"
-    elif blocked:
-        # Honest title: some accounts never sent anything.
-        title = "⚠️ MULTI-ACCOUNT SEND FINISHED (partly blocked)"
+        title = "🛑 MULTI SEND STOPPED"
+    elif bad:
+        # Honest title: some accounts did not deliver everything.
+        title = f"⚠️ MULTI SEND FINISHED — {len(bad)} of {len(accounts)} had problems"
     else:
-        title = "✅ MULTI-ACCOUNT SEND FINISHED"
+        title = "✅ MULTI SEND FINISHED"
     lines = [
         title,
         DIVIDER,
@@ -596,14 +662,15 @@ def multi_send_finished(accounts: list[dict], sent: int, failed: int, total: int
     ]
     if accounts:
         lines.append(DIVIDER)
-        for a in accounts:
+        for i, a in enumerate(accounts, start=1):
             state = str(a.get("state", "done"))
             mark = _STATE_MARK.get(state, "•")
-            row = f"{mark} {a.get('phone', '')} · {a.get('sent', 0)}/{a.get('total', 0)}"
+            row = (f"{i}. {mark} {a.get('phone', '')} · "
+                   f"{a.get('sent', 0)}/{a.get('total', 0)}")
             if a.get("failed"):
                 row += f" · ✗{a['failed']}"
-            if state == "no_targets":
-                row += " · no peers"
+            if state in ("no_targets", "failed", "limited", "stopped"):
+                row += f" · {_STATE_WORD.get(state, state)}"
             lines.append(row)
     lines.append(DIVIDER)
     if blocked:
