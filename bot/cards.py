@@ -134,7 +134,25 @@ _STATE_MARK = {
     "stopped": "🛑",
     "failed": "⚠️",
     "limited": "🚫",
+    "no_targets": "🚧",
 }
+
+
+def _account_tally(accounts: list[dict]) -> str:
+    """`8 · ✅1 🚧7` — so accounts that could not send are never hidden behind a
+    combined percentage."""
+    states = [str(a.get("state", "pending")) for a in accounts]
+    ok = sum(1 for s in states if s in ("done", "running", "stopped"))
+    blocked = states.count("no_targets")
+    failed = states.count("failed") + states.count("limited")
+    out = str(len(accounts))
+    if ok:
+        out += f" · ✅{ok}"
+    if blocked:
+        out += f" · 🚧{blocked} no peers"
+    if failed:
+        out += f" · ⚠️{failed}"
+    return out
 
 
 def live_send_multi(accounts: list[dict], current: str | None, sent: int,
@@ -152,7 +170,7 @@ def live_send_multi(accounts: list[dict], current: str | None, sent: int,
                 "state": "pending|running|done|stopped|failed|limited"}]
     """
     head = _rows([
-        ("Accounts", len(accounts)),
+        ("Accounts", _account_tally(accounts)),
         ("Current ", current or "—"),
         ("Engine  ", engine),
         ("Type    ", kind),
@@ -446,11 +464,19 @@ def multi_send_finished(accounts: list[dict], sent: int, failed: int, total: int
                         elapsed: float, kind: str | None = None,
                         engine: str | None = None, stopped: bool = False) -> str:
     """Final summary of a multi-account send (combined + per account)."""
+    blocked = [a for a in accounts if str(a.get("state")) == "no_targets"]
+    if stopped:
+        title = "🛑 MULTI-ACCOUNT SEND STOPPED"
+    elif blocked:
+        # Honest title: some accounts never sent anything.
+        title = "⚠️ MULTI-ACCOUNT SEND FINISHED (partly blocked)"
+    else:
+        title = "✅ MULTI-ACCOUNT SEND FINISHED"
     lines = [
-        "🛑 MULTI-ACCOUNT SEND STOPPED" if stopped else "✅ MULTI-ACCOUNT SEND FINISHED",
+        title,
         DIVIDER,
         *_rows([
-            ("Accounts", len(accounts)),
+            ("Accounts", _account_tally(accounts)),
             ("Engine  ", engine),
             ("Type    ", kind),
             ("Sent    ", f"{sent} of {total}"),
@@ -461,10 +487,39 @@ def multi_send_finished(accounts: list[dict], sent: int, failed: int, total: int
     if accounts:
         lines.append(DIVIDER)
         for a in accounts:
-            mark = _STATE_MARK.get(str(a.get("state", "done")), "•")
-            lines.append(f"{mark} {a.get('phone', '')} · "
-                         f"{a.get('sent', 0)}/{a.get('total', 0)}"
-                         + (f" · ✗{a['failed']}" if a.get("failed") else ""))
+            state = str(a.get("state", "done"))
+            mark = _STATE_MARK.get(state, "•")
+            row = f"{mark} {a.get('phone', '')} · {a.get('sent', 0)}/{a.get('total', 0)}"
+            if a.get("failed"):
+                row += f" · ✗{a['failed']}"
+            if state == "no_targets":
+                row += " · no peers"
+            lines.append(row)
     lines.append(DIVIDER)
+    if blocked:
+        lines.append(f"🚧 {len(blocked)} account(s) sent NOTHING because they have no "
+                     "saved peers. Open each one and tap 'Harvest Peers', then send again.")
     lines.append(f"🕒 {now_hms()}")
     return "\n".join(lines)
+
+
+
+def harvest_finished(phone: str, contacts: int, with_id: int, new_peers: int,
+                     total_peers: int, elapsed: float) -> str:
+    """Result of reading existing contacts to make them fast-sendable."""
+    footer = ("This account can now be used with the fast (no-browser) engine."
+              if total_peers else
+              "No peers could be resolved. Eitaa's peer cache may not be warm yet — "
+              "open the app's Contacts list once and try again, or use the bridge engine.")
+    return card(
+        "🔑 HARVEST FINISHED",
+        [
+            ("Phone       ", phone),
+            ("Contacts    ", contacts),
+            ("With peer id", with_id),
+            ("New peers   ", new_peers),
+            ("Total peers ", total_peers),
+            ("Time        ", fmt_duration(elapsed)),
+        ],
+        footer=footer,
+    )

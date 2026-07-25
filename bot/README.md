@@ -24,6 +24,9 @@ Tapping a number opens that account's panel directly (it becomes active — no
 separate tick step):
 - 📤 **Send** — broadcast the stored content to ALL contacts
 - ➕ **Build Contacts** — build contacts from a prefix
+- 🔑 **Harvest Peers** — read this account's EXISTING contacts once through the
+  browser and save their peers, which is what makes the fast (no-browser) engine
+  usable on an account whose contacts were added earlier
 - 🔄 **Refresh** — recompute contacts + chats
 - ⏹ **Stop** (when a job is running)
 - 🗑 **Delete Account** — asks to confirm, then removes the account's browser

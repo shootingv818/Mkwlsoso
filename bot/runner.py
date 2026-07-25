@@ -134,14 +134,27 @@ class AggregateProgress:
                 sum(r["total"] for r in rows))
 
     def _status(self) -> str:
-        states = {r["state"] for r in self.breakdown()}
-        if states & {"running"}:
+        rows = self.breakdown()
+        states = [r["state"] for r in rows]
+        if "running" in states:
             return "🟢 Sending"
-        if states & {"limited"}:
+        if "limited" in states:
             return "🚫 Limited"
-        if states & {"stopped"}:
+        if "stopped" in states:
             return "🛑 Stopped"
-        if states and states <= {"done", "failed", "stopped", "limited"}:
+        if states and set(states) <= {"done", "failed", "no_targets",
+                                      "stopped", "limited"}:
+            # Never claim a green "Done" when accounts could not send at all --
+            # that made 7 of 8 accounts failing look like a 100% success.
+            no_targets = states.count("no_targets")
+            failed = states.count("failed")
+            if no_targets or failed:
+                parts = []
+                if no_targets:
+                    parts.append(f"{no_targets} with no peers")
+                if failed:
+                    parts.append(f"{failed} failed")
+                return "⚠️ Done — " + ", ".join(parts)
             return "✅ Done"
         return "⏳ Starting"
 
@@ -288,6 +301,58 @@ class JobManager:
             await live.set(cards.live_send(phone, sent, failed, total, elapsed,
                                            status=status, engine=engine, kind=kind),
                            force=force)
+
+    async def run_harvest(self, account: str, report: Report,
+                          account_phone: str | None = None) -> Job:
+        """Read the account's EXISTING contacts once and save their peers.
+
+        This is the one-tap way to make the browser-free engine usable on an
+        account that already has contacts: it opens the browser, collects the
+        contacts list (which also warms tweb's peer cache) and asks Eitaa's own
+        peer manager for each access_hash. Reuses the exact pieces the bridge
+        send job already used.
+        """
+        job = self._new_job("harvest", account)
+        job.task = asyncio.create_task(
+            self._harvest_job(job, report, account_phone or account))
+        return job
+
+    async def _harvest_job(self, job: Job, report: Report, phone: str) -> None:
+        account = job.account
+        self._busy.add(account)
+        start = time.time()
+        try:
+            async with open_session(account) as session:
+                driver = EitaaDriver(session)
+                await driver.open()
+                if not await driver.is_logged_in():
+                    await report(cards.error_card(
+                        "harvest", account, code="not_logged_in",
+                        detail="account is not logged in"))
+                    return
+
+                contacts = await driver.collect_all_contacts()
+                await driver._return_to_chat_list()
+                peer_ids = [c.get("peer_id") for c in contacts if c.get("peer_id")]
+                new = await self._harvest_peers(driver, account, report, peer_ids)
+
+                total = 0
+                try:
+                    from direct import peers as peer_store
+                    total = peer_store.count(account)
+                except Exception:  # noqa: BLE001
+                    pass
+                job.summary = {"contacts": len(contacts), "peers_new": new,
+                               "peers_total": total}
+                await report(cards.harvest_finished(
+                    phone, len(contacts), len(peer_ids), new, total,
+                    time.time() - start))
+        except Exception as exc:  # noqa: BLE001
+            await report(cards.error_card("harvest", account, code=type(exc).__name__,
+                                          detail=str(exc), phase="harvest",
+                                          trace_id=job.job_id))
+        finally:
+            self._busy.discard(account)
 
     async def run_contacts(self, account: str, prefix: str, count: int,
                            settings: dict, report: Report, live=None,
@@ -753,11 +818,13 @@ class JobManager:
                 await report(cards.error_card(
                     where, account, code="no_peers", engine=engine, phase="targets",
                     trace_id=job.job_id,
-                    detail="no saved peers for this account. Build contacts (or run a "
-                           "send once with the bridge engine) so peers get harvested, "
-                           "or switch the engine to bridge."))
+                    detail="no saved peers for this account, so the browser-free "
+                           "engine has nobody to send to. Open this account and tap "
+                           "'🔑 Harvest Peers' (reads your existing contacts once via "
+                           "the browser), then send again. Or switch the engine to "
+                           "bridge."))
                 if agg is not None:
-                    await agg.update(account, state="failed", force=True)
+                    await agg.update(account, state="no_targets", force=True)
                 return
 
             try:

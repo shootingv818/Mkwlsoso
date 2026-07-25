@@ -230,7 +230,8 @@ def kb_account_panel(acc: str):
     rows = [
         [Button.inline("📤 Send", b"pnl:send"),
          Button.inline("➕ Build Contacts", b"pnl:contacts")],
-        [Button.inline("🔄 Refresh", b"pnl:refresh")],
+        [Button.inline("🔑 Harvest Peers", b"pnl:harvest"),
+         Button.inline("🔄 Refresh", b"pnl:refresh")],
     ]
     if busy:
         rows.append([Button.inline("⏹ Stop", b"pnl:stop")])
@@ -323,14 +324,16 @@ def multi_text() -> str:
         ("Engine  ", store.engine),
         ("Content ", store.content_summary()),
     ]
+    footer = ("Tick the accounts, then press Send. They run at the same time and "
+              "report into ONE live card with the combined totals.")
     if store.engine == "direct":
         pairs.append(("Peers   ", peers_total))
-    return cards.card(
-        "🚀 MULTI-ACCOUNT SEND",
-        pairs,
-        footer="Tick the accounts, then press Send. They run at the same time and "
-               "report into ONE live card with the combined totals.",
-    )
+        blocked = [a for a in selected if not (peer_count(a) or 0)]
+        if blocked:
+            footer = (f"🚧 {len(blocked)} ticked account(s) have NO saved peers and would "
+                      "send nothing with the fast engine. Open each and tap "
+                      "'Harvest Peers' first.\n\n" + footer)
+    return cards.card("🚀 MULTI-ACCOUNT SEND", pairs, footer=footer)
 
 
 def peer_count(acc: str) -> int | None:
@@ -491,6 +494,20 @@ async def _handle_callback(event):
         if not active:
             return await event.answer("No active account.", alert=True)
         return await _refresh_account(event, active)
+    if data == "pnl:harvest":
+        if not active:
+            return await event.answer("Select an account first.", alert=True)
+        if manager.is_busy(active):
+            return await event.answer("Account already has a running job.", alert=True)
+        await manager.run_harvest(active, report, store.account_phone(active))
+        await event.answer("Harvesting peers…")
+        return await event.edit(
+            cards.card("🔑 HARVEST PEERS",
+                       [("Account", store.account_phone(active))],
+                       footer="Reading this account's existing contacts once through the "
+                              "browser to save their peers. A 🔑 HARVEST FINISHED card "
+                              "will follow. After that the fast engine can reach them."),
+            buttons=kb_back())
     if data == "pnl:send":
         return await _start_send(event)
     if data == "pnl:contacts":
@@ -610,15 +627,31 @@ async def _start_multi_send(event):
     if not free:
         return await event.answer("All selected accounts already have a running job.",
                                   alert=True)
+    # With the fast engine, an account without saved peers can send NOTHING.
+    # Say so BEFORE starting instead of letting it show up as 0/0 at the end.
+    no_peers = []
+    if store.engine == "direct":
+        no_peers = [a for a in free if not (peer_count(a) or 0)]
+        if len(no_peers) == len(free):
+            return await event.answer(
+                "None of the selected accounts have saved peers. Open each one and tap "
+                "'Harvest Peers' first, or switch the engine to bridge.", alert=True)
+
     live = LiveCard(config.report_to())
     pairs = [(a, store.account_phone(a)) for a in free]
     jobs = await manager.run_send_multi(pairs, dict(store.content),
                                         dict(store.settings), report, live=live)
     await event.answer(f"Started on {len(jobs)} account(s).")
-    footer = None
+    notes = []
     if busy:
-        footer = ("Skipped (already busy): "
-                  + ", ".join(store.account_phone(a) for a in busy))
+        notes.append("Skipped (already busy): "
+                     + ", ".join(store.account_phone(a) for a in busy))
+    if no_peers:
+        notes.append(f"🚧 {len(no_peers)} of {len(free)} selected account(s) have NO "
+                     "saved peers and will send nothing: "
+                     + ", ".join(store.account_phone(a) for a in no_peers)
+                     + ". Tap 'Harvest Peers' on each.")
+    footer = "\n".join(notes) if notes else None
     await event.edit(
         cards.card("🚀 MULTI-ACCOUNT SEND QUEUED",
                    [("Accounts", len(jobs)),
