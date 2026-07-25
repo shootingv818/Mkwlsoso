@@ -846,6 +846,68 @@ def _direct_rpc(body: bytes, ctx: dict, url: str, label: str, tx=None, cookies: 
     return 4
 
 
+def cmd_direct_inspect_capture(account: str) -> int:
+    """READ-ONLY: print, for every /eitaa/ request in the newest capture, the
+    exact HOST + the TL method (body constructor). This reveals whether the
+    browser uploaded file parts (saveFilePart) to a DIFFERENT host than majid
+    (e.g. the media node hadi.eitaa.com) and where sendMedia went -- the key to
+    the file-upload node-affinity problem. Sends nothing."""
+    from urllib.parse import urlparse as _up
+    from direct.transport import unwrap_eitaa
+    ctor_names = {
+        0x520C3870: "messages.sendMessage",
+        0x3491EBA9: "messages.sendMedia",
+        0x2C800BE5: "contacts.importContacts",
+        0xB304A621: "upload.saveFilePart",
+        0x2C0EB7A6: "upload.saveBigFilePart?",
+        0x1CB5C415: "(vector)",
+        0x6B18F9C4: "(config-ish)",
+    }
+    path, cap = _newest_capture(account)
+    if not cap:
+        print(f"[inspect] no capture for '{account}'.")
+        return 1
+    print(f"[inspect] capture: {path}")
+
+    def _one(label, recs):
+        print(f"\n[inspect] === {label} ===")
+        for i, r in enumerate(recs):
+            if r.get("kind") not in ("fetch", "xhr"):
+                continue
+            url = r.get("url") or ""
+            if "/eitaa/" not in url and "eitaa" not in url:
+                continue
+            host = _up(url).hostname or url
+            head = r.get("reqHead")
+            head = head.get("hex") if isinstance(head, dict) else head
+            head = head or ""
+            name = ""
+            if head.startswith("ed77be7a"):
+                try:
+                    body = unwrap_eitaa(bytes.fromhex(head))["body"]
+                    if len(body) >= 4:
+                        cid = int.from_bytes(body[:4], "little", signed=False)
+                        name = ctor_names.get(cid, f"ctor 0x{cid:08x}")
+                except Exception:  # noqa: BLE001
+                    name = "(unparsed)"
+            resh = r.get("resHead")
+            resh = resh.get("hex") if isinstance(resh, dict) else resh
+            is_img = (resh or "")[:6] == "ffd8ff"
+            print(f"[inspect]  #{i:<2} {r.get('reqLen'):>5}B  host={host:<20} "
+                  f"{'[img]' if is_img else name}")
+
+    if isinstance(cap, dict):
+        for label in ("text", "file", "contact"):
+            if label in cap:
+                _one(label, cap[label])
+    else:
+        _one("all", cap)
+    print("\n[inspect] Look at the 'file' op: which host did upload.saveFilePart use,")
+    print("[inspect] and which host did messages.sendMedia use? If they differ (or")
+    print("[inspect] upload used hadi.eitaa.com), that's the fix -> upload to that host.")
+    return 0
+
+
 def cmd_direct_send(account: str, text: str, to: str | None, url: str | None) -> int:
     """Send a TEXT message with NO browser (direct MTProto).
     Default target is Saved Messages; --to NAME targets a saved contact peer.
@@ -2015,6 +2077,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_cook.add_argument("--account", required=True)
 
+    p_inspcap = sub.add_parser(
+        "direct-inspect-capture",
+        help="READ-ONLY: show host + TL method for every request in the newest capture (find upload host)",
+    )
+    p_inspcap.add_argument("--account", required=True)
+
     p_dimp = sub.add_parser(
         "direct-import",
         help="import ONE contact with NO browser (direct MTProto)",
@@ -2155,6 +2223,8 @@ def main(argv: list[str] | None = None) -> int:
         return asyncio.run(cmd_direct_capture_peer(args.account, args.to))
     if args.command == "direct-capture-cookies":
         return asyncio.run(cmd_direct_capture_cookies(args.account))
+    if args.command == "direct-inspect-capture":
+        return cmd_direct_inspect_capture(args.account)
     if args.command == "direct-import":
         return cmd_direct_import(args.account, args.phone, args.first, args.last, args.url)
     if args.command == "bridge-file-send":
