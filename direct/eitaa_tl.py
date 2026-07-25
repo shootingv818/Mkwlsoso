@@ -105,13 +105,34 @@ def import_contacts(contacts: Iterable[tuple[str, str, str]],
 
 
 def save_file_part(file_id: int, file_part: int, data: bytes) -> bytes:
-    """upload.saveFilePart#b304a621."""
+    """upload.saveFilePart#b304a621 (pure Telegram TL)."""
     return (
         tl.int_bytes(SAVE_FILE_PART, signed=False)
         + tl.long_bytes(file_id, signed=True)
         + tl.int_bytes(file_part, signed=True)
         + tl.bytes_bytes(data)
     )
+
+
+# Eitaa appends 24 bytes of upload metadata after the standard saveFilePart TL
+# (confirmed from capture): flag(=3), a custom upload-peer ctor 0x59511722 +
+# self user_id:long, the total file size:int, and a trailing int(0). Upload is
+# peer-independent (route happens later in sendMedia), so this stays "self".
+EITAA_UPLOAD_PEER = 0x59511722
+EITAA_UPLOAD_FLAG = 3
+
+
+def save_file_part_eitaa(file_id: int, file_part: int, data: bytes,
+                         self_user_id: int, total_size: int) -> bytes:
+    """upload.saveFilePart as Eitaa's worker actually sends it (with trailer)."""
+    trailer = (
+        tl.int_bytes(EITAA_UPLOAD_FLAG, signed=False)
+        + tl.int_bytes(EITAA_UPLOAD_PEER, signed=False)
+        + tl.long_bytes(self_user_id, signed=False)
+        + tl.int_bytes(total_size, signed=True)
+        + tl.int_bytes(0, signed=False)
+    )
+    return save_file_part(file_id, file_part, data) + trailer
 
 
 def input_file(file_id: int, parts: int, name: str, md5: str = "") -> bytes:
@@ -165,6 +186,57 @@ def send_media(peer: bytes, media: bytes, message: str = "",
     if flags & 0x08:  # entities present -> empty vector
         body += tl.int_bytes(tl._VECTOR_ID, signed=False) + tl.int_bytes(0, signed=False)
     return body
+
+
+# --- high-level file send ---------------------------------------------------
+UPLOAD_PART_SIZE = 512 * 1024  # 512 KiB, standard Telegram upload chunk
+
+# minimal, explicit MIME map for the extensions the user cares about; anything
+# else falls back to a generic binary type.
+_MIME = {
+    "txt": "text/plain",
+    "zip": "application/zip",
+    "apk": "application/vnd.android.package-archive",
+    "pdf": "application/pdf",
+    "jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
+    "mp4": "video/mp4", "mp3": "audio/mpeg",
+}
+
+
+def guess_mime(file_name: str) -> str:
+    ext = file_name.rsplit(".", 1)[-1].lower() if "." in file_name else ""
+    return _MIME.get(ext, "application/octet-stream")
+
+
+def build_file_send(peer: bytes, file_bytes: bytes, file_name: str,
+                    self_user_id: int, caption: str = "", mime: str | None = None,
+                    file_id: int | None = None, random_id: int | None = None,
+                    part_size: int = UPLOAD_PART_SIZE) -> dict:
+    """Prepare a complete browser-free file send.
+
+    Returns {file_id, parts, total_parts, send_media} where `parts` is the list
+    of upload.saveFilePart bodies to POST in order, and `send_media` is the
+    messages.sendMedia body to POST afterwards. inputFile.name follows tweb's
+    observed pattern ("document.<mime-subtype>"); the real name rides in the
+    documentAttributeFilename attribute.
+    """
+    if mime is None:
+        mime = guess_mime(file_name)
+    if file_id is None:
+        file_id = int.from_bytes(os.urandom(8), "little", signed=True)
+    total = len(file_bytes)
+    total_parts = max(1, (total + part_size - 1) // part_size)
+
+    parts = []
+    for i in range(total_parts):
+        chunk = file_bytes[i * part_size:(i + 1) * part_size]
+        parts.append(save_file_part_eitaa(file_id, i, chunk, self_user_id, total))
+
+    subtype = mime.split("/")[-1]
+    in_file = input_file(file_id, total_parts, f"document.{subtype}", "")
+    media = input_media_uploaded_document(in_file, mime, file_name)
+    send = send_media(peer, media, message=caption, random_id=random_id)
+    return {"file_id": file_id, "parts": parts, "total_parts": total_parts, "send_media": send}
 
 
 # --- session-constant extraction from a real capture ------------------------
@@ -229,6 +301,34 @@ def extract_context(capture) -> dict:
         result["user_id"] = r.long(signed=False)
         result["access_hash"] = r.long(signed=False)
     return result
+
+
+def find_message_peer(capture, marker: str) -> bytes | None:
+    """Find the 20-byte target peer of a sendMessage whose text contains
+    `marker`. Used to learn a CONTACT's peer from a controlled browser send."""
+    want = marker.encode("utf-8")
+    sm = tl.int_bytes(SEND_MESSAGE, signed=False)
+    for rec in _iter_records(capture):
+        if rec.get("kind") not in ("fetch", "xhr"):
+            continue
+        head = _head_hex(rec)
+        if not head.startswith("ed77be7a"):
+            continue
+        raw = bytes.fromhex(head)
+        req_len = int(rec.get("reqLen") or 0)
+        if req_len and len(raw) < req_len:
+            continue
+        try:
+            body = unwrap_eitaa(raw)["body"]
+        except Exception:  # noqa: BLE001
+            continue
+        if not body.startswith(sm) or want not in body:
+            continue
+        r = tl.Reader(body)
+        r.int(signed=False)  # ctor
+        r.int(signed=False)  # flags
+        return r.read(20)
+    return None
 
 
 # --- response classification -----------------------------------------------

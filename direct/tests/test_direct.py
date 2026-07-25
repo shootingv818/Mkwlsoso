@@ -268,6 +268,33 @@ def test_eitaa_methods():
     ok = E.classify_response(bytes.fromhex("01e015909abcdef0"))
     _check("normal ctor classified ok", ok["ok"] is True)
 
+    # --- file send: saveFilePart(+eitaa trailer) and sendMedia byte-exact ---
+    data = b"mkwlsoso capture-all file test MKWLTX1784938813\n"
+    real_sfp_full = ("21a604b342e01f3b6b1d120000000000306d6b776c736f736f20636170747572652d61"
+                     "6c6c2066696c652074657374204d4b574c5458313738343933383831330a000000"
+                     "03000000221751593904ff02000000003000000000000000")
+    built = E.save_file_part_eitaa(0x00121D6B3B1FE042, 0, data, 50267193, len(data))
+    _check("saveFilePart+eitaa trailer reproduces capture", built.hex() == real_sfp_full)
+
+    real_media = ("a9eb9134880000004ca5e8dd3904ff0200000000ec7a9c4400000000c1c6385b10000000"
+                  "7ff22ff542e01f3b6b1d1200010000000e646f63756d656e742e706c61696e0000000000"
+                  "0a746578742f706c61696e0015c4b51c01000000680059151a6d6b776c5f636170616c6c"
+                  "5f313738343933383832342e7478740014636170204d4b574c5458313738343933383831"
+                  "33000000cb1bdda850082e0015c4b51c00000000")
+    in_file = E.input_file(0x00121D6B3B1FE042, 1, "document.plain", "")
+    media = E.input_media_uploaded_document(in_file, "text/plain", "mkwl_capall_1784938824.txt")
+    sm = E.send_media(peer, media, message="cap MKWLTX1784938813", random_id=0x002E0850A8DD1BCB)
+    _check("sendMedia reproduces capture", sm.hex() == real_media)
+
+    plan = E.build_file_send(peer, data, "note.txt", 50267193, caption="hi")
+    _check("build_file_send single part", plan["total_parts"] == 1 and len(plan["parts"]) == 1)
+    _check("build_file_send mime txt", E.guess_mime("a.txt") == "text/plain")
+    _check("build_file_send mime zip", E.guess_mime("a.zip") == "application/zip")
+    _check("build_file_send mime apk",
+           E.guess_mime("a.apk") == "application/vnd.android.package-archive")
+    big = E.build_file_send(peer, b"x" * (E.UPLOAD_PART_SIZE + 10), "b.zip", 50267193)
+    _check("build_file_send multi part", big["total_parts"] == 2 and len(big["parts"]) == 2)
+
 
 def main():
     print("== direct client offline tests ==")

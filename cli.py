@@ -732,6 +732,47 @@ def _newest_capture(account: str):
     return path, json.loads(_Path(path).read_text(encoding="utf-8"))
 
 
+def _peers_path(account: str):
+    return config.ARTIFACTS_DIR / "sessions" / f"peers_{account}.json"
+
+
+def _load_peers(account: str) -> dict:
+    from pathlib import Path as _Path
+    p = _peers_path(account)
+    if _Path(p).is_file():
+        try:
+            return json.loads(_Path(p).read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            return {}
+    return {}
+
+
+def _save_peer(account: str, name: str, peer: bytes, user_id: int, access_hash: int) -> None:
+    from pathlib import Path as _Path
+    peers = _load_peers(account)
+    peers[name] = {"peer_hex": peer.hex(), "user_id": user_id, "access_hash": access_hash}
+    p = _peers_path(account)
+    _Path(p).parent.mkdir(parents=True, exist_ok=True)
+    _Path(p).write_text(json.dumps(peers, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _resolve_target_peer(account: str, ctx: dict, to: str | None, label: str):
+    """Return (peer_bytes, human_label) for a send target.
+    to=None -> Saved Messages (self); otherwise a saved contact peer.
+    """
+    if not to or to.lower() in ("self", "saved", "me"):
+        return ctx.get("self_peer"), "Saved Messages"
+    peers = _load_peers(account)
+    entry = peers.get(to)
+    if not entry:
+        print(f"[{label}] no saved peer for '{to}'. capture it first:")
+        print(f"[{label}]   DISPLAY=:99 python cli.py direct-capture-peer --account {account} --to \"{to}\"")
+        if peers:
+            print(f"[{label}] known contacts: {list(peers)}")
+        return None, to
+    return bytes.fromhex(entry["peer_hex"]), to
+
+
 def _direct_rpc(body: bytes, ctx: dict, url: str, label: str) -> int:
     """Wrap a bare TL body in the Eitaa envelope, POST it browser-free, and
     classify the response. Shared by direct-send / direct-import."""
@@ -763,8 +804,10 @@ def _direct_rpc(body: bytes, ctx: dict, url: str, label: str) -> int:
     return 4
 
 
-def cmd_direct_send(account: str, text: str, url: str | None) -> int:
-    """Send a TEXT message to Saved Messages with NO browser (direct MTProto)."""
+def cmd_direct_send(account: str, text: str, to: str | None, url: str | None) -> int:
+    """Send a TEXT message with NO browser (direct MTProto).
+    Default target is Saved Messages; --to NAME targets a saved contact peer.
+    """
     from direct import eitaa_tl as E
     path, cap = _newest_capture(account)
     if not cap:
@@ -777,13 +820,118 @@ def cmd_direct_send(account: str, text: str, url: str | None) -> int:
     except Exception as exc:  # noqa: BLE001
         print(f"[dsend] cannot extract session context: {exc}")
         return 2
-    if not ctx.get("self_peer"):
-        print("[dsend] self peer not found in capture (need a request that targets Saved Messages).")
+    peer, tgt = _resolve_target_peer(account, ctx, to, "dsend")
+    if not peer:
         return 2
-    print(f"[dsend] user_id={ctx['user_id']}  token2={ctx['token2']}")
-    body = E.send_message(ctx["self_peer"], text)
+    print(f"[dsend] user_id={ctx['user_id']}  target={tgt}")
+    body = E.send_message(peer, text)
     endpoint = url or "https://majid.eitaa.com/eitaa/"
     return _direct_rpc(body, ctx, endpoint, "dsend")
+
+
+def cmd_direct_send_file(account: str, file_path: str, to: str | None,
+                         caption: str, url: str | None) -> int:
+    """Upload + send a FILE (any type incl txt/zip/apk) with NO browser."""
+    from pathlib import Path as _Path
+    from direct import eitaa_tl as E
+    from direct.transport import HttpTransport, wrap_eitaa, unwrap_eitaa
+
+    fp = _Path(file_path)
+    if not fp.is_file():
+        print(f"[dfile] file not found: {file_path}")
+        return 1
+    path, cap = _newest_capture(account)
+    if not cap:
+        print(f"[dfile] no capture for '{account}'. run direct-capture-all first.")
+        return 1
+    print(f"[dfile] session context from: {path}")
+    try:
+        ctx = E.extract_context(cap)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[dfile] cannot extract session context: {exc}")
+        return 2
+    peer, tgt = _resolve_target_peer(account, ctx, to, "dfile")
+    if not peer:
+        return 2
+
+    data = fp.read_bytes()
+    mime = E.guess_mime(fp.name)
+    plan = E.build_file_send(peer, data, fp.name, ctx["user_id"], caption=caption, mime=mime)
+    endpoint = url or "https://majid.eitaa.com/eitaa/"
+    tx = HttpTransport(endpoint, timeout=60.0)
+    print(f"[dfile] {fp.name}  {len(data)}B  mime={mime}  target={tgt}  parts={plan['total_parts']}")
+
+    # 1) upload every part
+    for i, part_body in enumerate(plan["parts"]):
+        raw = wrap_eitaa(ctx["token1"], ctx["token2"], part_body)
+        try:
+            resp = tx.post(raw)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[dfile] ✗ part {i+1}/{plan['total_parts']} transport error: {exc}")
+            return 3
+        rb = resp
+        try:
+            if resp[:4] == bytes.fromhex("ed77be7a"):
+                rb = unwrap_eitaa(resp)["body"]
+        except Exception:  # noqa: BLE001
+            pass
+        # upload.saveFilePart returns boolTrue (997275b5 on wire = b5757299)
+        ok = rb[:4].hex() == "b5757299"
+        print(f"[dfile]   part {i+1}/{plan['total_parts']}: "
+              f"{'OK' if ok else 'resp ' + rb[:16].hex()}")
+        if not ok:
+            print(f"[dfile] ✗ upload rejected at part {i+1}: {rb[:48].hex()}")
+            return 4
+
+    # 2) send the media
+    print("[dfile] all parts uploaded; sending media...")
+    return _direct_rpc(plan["send_media"], ctx, endpoint, "dfile")
+
+
+async def cmd_direct_capture_peer(account: str, to: str) -> int:
+    """Learn a CONTACT's peer for browser-free sends: send a marker text to the
+    contact via the browser ONCE, capture the sendMessage, extract + save the
+    20-byte peer to peers_<account>.json. Afterwards direct-send/--send-file can
+    target this contact with NO browser.
+    """
+    import time as _time
+    from pathlib import Path as _Path
+    from direct import eitaa_tl as E
+    config.ensure_dirs()
+
+    init_js = _Path("eitaa/worker_capture.js")
+    if not init_js.is_file():
+        print(f"[cpeer] missing {init_js}")
+        return 1
+
+    async with open_session(account, init_script_path=str(init_js)) as session:
+        await session.goto()
+        driver = EitaaDriver(session)
+        await driver.open()
+        if not await driver.is_logged_in():
+            print("[cpeer] not logged in.")
+            return 2
+        await driver.dump_worker_requests()
+        marker = f"MKWLPEER{int(_time.time())}"
+        print(f"[cpeer] sending marker to '{to}' to learn its peer...")
+        res = await driver.send_text(to, marker)
+        print(f"[cpeer] send result: ok={getattr(res, 'ok', '?')} detail={getattr(res, 'detail', '')}")
+        await session.page.wait_for_timeout(3500)
+        recs = await driver.dump_worker_requests()
+
+    peer = E.find_message_peer({"x": recs}, marker)
+    if not peer:
+        print("[cpeer] could not find the sendMessage peer in the capture.")
+        print("[cpeer] make sure the contact name/username opened a real chat.")
+        return 3
+    r = __import__("direct.tl", fromlist=["Reader"]).Reader(peer)
+    r.int(signed=False)
+    uid = r.long(signed=False)
+    ah = r.long(signed=False)
+    _save_peer(account, to, peer, uid, ah)
+    print(f"[cpeer] ✓ saved peer for '{to}': user_id={uid} peer={peer.hex()}")
+    print(f"[cpeer] now: python cli.py direct-send --account {account} --to \"{to}\" --text hi")
+    return 0
 
 
 def cmd_direct_import(account: str, phone: str, first: str, last: str, url: str | None) -> int:
@@ -1786,11 +1934,29 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_dsend = sub.add_parser(
         "direct-send",
-        help="send a TEXT to Saved Messages with NO browser (direct MTProto, uses newest capture's session)",
+        help="send a TEXT with NO browser (direct MTProto); default Saved Messages, --to for a contact",
     )
     p_dsend.add_argument("--account", required=True)
-    p_dsend.add_argument("--text", required=True, help="message text to send to your own Saved Messages")
+    p_dsend.add_argument("--text", required=True, help="message text")
+    p_dsend.add_argument("--to", default=None, help="saved contact name (default: your Saved Messages)")
     p_dsend.add_argument("--url", default=None, help="override the shard URL (default: majid.eitaa.com)")
+
+    p_dfile = sub.add_parser(
+        "direct-send-file",
+        help="upload+send a FILE (txt/zip/apk/...) with NO browser (direct MTProto)",
+    )
+    p_dfile.add_argument("--account", required=True)
+    p_dfile.add_argument("--file", required=True, help="path to the file to send")
+    p_dfile.add_argument("--to", default=None, help="saved contact name (default: your Saved Messages)")
+    p_dfile.add_argument("--caption", default="", help="optional caption")
+    p_dfile.add_argument("--url", default=None, help="override the shard URL")
+
+    p_cpeer = sub.add_parser(
+        "direct-capture-peer",
+        help="learn a contact's peer (one browser send) so you can then send to them with NO browser",
+    )
+    p_cpeer.add_argument("--account", required=True)
+    p_cpeer.add_argument("--to", required=True, help="contact name/username to open and learn")
 
     p_dimp = sub.add_parser(
         "direct-import",
@@ -1925,7 +2091,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "direct-replay":
         return cmd_direct_replay(args.account, args.index)
     if args.command == "direct-send":
-        return cmd_direct_send(args.account, args.text, args.url)
+        return cmd_direct_send(args.account, args.text, args.to, args.url)
+    if args.command == "direct-send-file":
+        return cmd_direct_send_file(args.account, args.file, args.to, args.caption, args.url)
+    if args.command == "direct-capture-peer":
+        return asyncio.run(cmd_direct_capture_peer(args.account, args.to))
     if args.command == "direct-import":
         return cmd_direct_import(args.account, args.phone, args.first, args.last, args.url)
     if args.command == "bridge-file-send":
