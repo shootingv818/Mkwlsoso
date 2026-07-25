@@ -79,6 +79,20 @@ def _is_limit(detail: str) -> bool:
     return any(pat in low for pat in _LIMIT_PATTERNS)
 
 
+def effective_engine(settings: dict) -> str:
+    """The engine a job may actually use.
+
+    The panel is bridge-only, so "direct" is refused unless MKWL_ENABLE_DIRECT=1.
+    This is the single place every job asks, so a stale `engine: "direct"` left in
+    a saved settings file (or passed in by a caller) can never route work to the
+    browser-free engine behind the owner's back.
+    """
+    engine = str((settings or {}).get("engine", config.ENGINE))
+    if engine == "direct" and not config.ENABLE_DIRECT:
+        return "bridge"
+    return engine if engine in ("bridge", "direct") else "bridge"
+
+
 @dataclass
 class Job:
     job_id: str
@@ -234,7 +248,7 @@ class JobManager:
         Routing mirrors run_contacts, which already dispatched on the engine.
         """
         job = self._new_job("send", account)
-        engine = str(settings.get("engine", config.ENGINE))
+        engine = effective_engine(settings)
         if engine == "direct":
             job.task = asyncio.create_task(
                 self._send_job_direct(job, content, settings, report,
@@ -260,7 +274,7 @@ class JobManager:
         if not free:
             return []
         kind = "File" if content.get("kind") == "file" else "Text"
-        engine = str(settings.get("engine", config.ENGINE))
+        engine = effective_engine(settings)
         agg = AggregateProgress(live, free, kind=kind, engine=engine)
         if live is not None:
             await live.set(agg.render(), force=True)
@@ -358,7 +372,7 @@ class JobManager:
                            settings: dict, report: Report, live=None,
                            account_phone: str | None = None) -> Job:
         job = self._new_job("contacts", account)
-        engine = str(settings.get("engine", config.ENGINE))
+        engine = effective_engine(settings)
         phone = account_phone or account
         if engine == "direct":
             job.task = asyncio.create_task(
@@ -964,7 +978,7 @@ class JobManager:
                             account_phone: str | None = None) -> None:
         account = job.account
         phone = account_phone or account
-        engine = str(settings.get("engine", config.ENGINE))
+        engine = effective_engine(settings)
         delay = float(settings.get("contact_create_delay", config.CONTACT_CREATE_DELAY))
         log_every = int(settings.get("send_log_every", config.SEND_LOG_EVERY))
         entries, err = expand_range(prefix, count)

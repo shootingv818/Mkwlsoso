@@ -75,7 +75,17 @@ class Store:
     # ---- settings ----
     @property
     def settings(self) -> dict[str, Any]:
-        return self._data["settings"]
+        """A COPY of the settings, with `engine` already resolved.
+
+        Jobs receive this dict and read `settings["engine"]` from it, so the
+        effective engine has to be baked in here -- otherwise a stale stored
+        "direct" would still route jobs to the browser-free engine even though
+        the panel is bridge-only. The stored value itself is left untouched so
+        MKWL_ENABLE_DIRECT=1 restores the previous choice.
+        """
+        out = dict(self._data["settings"])
+        out["engine"] = self.engine
+        return out
 
     def set_setting(self, key: str, value: Any) -> None:
         self._data["settings"][key] = value
