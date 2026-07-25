@@ -229,12 +229,52 @@ def test_eitaa_envelope():
         _check("wrap reproduces real bytes", wrap_eitaa(p["token1"], p["token2"], p["body"]) == raw)
 
 
+def test_eitaa_methods():
+    # Serializers must reproduce REAL captured method bodies byte-for-byte.
+    from direct import eitaa_tl as E
+    from direct.transport import wrap_eitaa
+
+    peer = E.input_peer_self(50267193, 0x00000000449C7AEC)
+    _check("self peer is 20 bytes", len(peer) == 20)
+
+    real_sm = ("70380c52800000004ca5e8dd3904ff0200000000ec7a9c4400000000104d4b574c"
+               "545831373834393338383133000000bc0e582f47989200")
+    built = E.send_message(peer, "MKWLTX1784938813", random_id=0x009298472F580EBC)
+    _check("sendMessage reproduces capture", built.hex() == real_sm)
+
+    real_ic = ("e50b802c15c4b51c01000000f4b792f30000000000000000102b393820393030203030"
+               "302030303030000000084d6b776c5465737400000000000000")
+    built = E.import_contacts([("+98 900 000 0000", "MkwlTest", "")])
+    _check("importContacts reproduces capture", built.hex() == real_ic)
+
+    real_sfp = ("21a604b342e01f3b6b1d120000000000306d6b776c736f736f20636170747572652d61"
+                "6c6c2066696c652074657374204d4b574c5458313738343933383831330a000000")
+    built = E.save_file_part(0x00121D6B3B1FE042, 0,
+                             b"mkwlsoso capture-all file test MKWLTX1784938813\n")
+    _check("upload.saveFilePart reproduces capture", built.hex() == real_sfp)
+
+    # context extraction from a realistically-wrapped request
+    raw = wrap_eitaa("9179.c756a2d10f.e41c4e_50267193", "mrtpgmi2y9fm222__web", real_sm and built)  # noqa
+    raw = wrap_eitaa("9179.c756a2d10f.e41c4e_50267193", "mrtpgmi2y9fm222__web",
+                     E.send_message(peer, "x", random_id=1))
+    ctx = E.extract_context({"text": [{"kind": "fetch", "reqLen": len(raw), "reqHead": raw.hex()}]})
+    _check("extract token1", ctx["token1"].startswith("9179."))
+    _check("extract token2", ctx["token2"].endswith("__web"))
+    _check("extract self peer", ctx["self_peer"] == peer)
+    _check("extract user_id", ctx["user_id"] == 50267193)
+
+    ok = E.classify_response(bytes.fromhex("19ca4421") + b"\x00" * 8)  # rpc_error on wire (LE)
+    _check("rpc_error classified not ok", ok["ok"] is False)
+    ok = E.classify_response(bytes.fromhex("01e015909abcdef0"))
+    _check("normal ctor classified ok", ok["ok"] is True)
+
+
 def main():
     print("== direct client offline tests ==")
     for fn in (test_aes_nist, test_ige_roundtrip, test_crypto_helpers,
                test_mtproto_envelope, test_tl_roundtrip, test_session_loader,
                test_service_parser, test_schema_wrap, test_transport_url,
-               test_eitaa_envelope):
+               test_eitaa_envelope, test_eitaa_methods):
         print(f"[{fn.__name__}]")
         fn()
     print("\nALL DIRECT TESTS PASSED")

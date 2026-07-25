@@ -715,6 +715,93 @@ def _print_op_capture(label: str, recs: list) -> list:
     return [t[1] for t in api]
 
 
+def _newest_capture(account: str):
+    """Return (path, loaded_json) for the newest capall_/worker_tx_ capture."""
+    import glob as _glob
+    from pathlib import Path as _Path
+    cap_dir = config.ARTIFACTS_DIR / "sessions"
+    files = sorted(
+        _glob.glob(str(cap_dir / f"capall_{account}_*.json"))
+        + _glob.glob(str(cap_dir / f"worker_tx_{account}_*.json"))
+    )
+    if not files:
+        return None, None
+    path = files[-1]
+    return path, json.loads(_Path(path).read_text(encoding="utf-8"))
+
+
+def _direct_rpc(body: bytes, ctx: dict, url: str, label: str) -> int:
+    """Wrap a bare TL body in the Eitaa envelope, POST it browser-free, and
+    classify the response. Shared by direct-send / direct-import."""
+    from direct.transport import HttpTransport, wrap_eitaa, unwrap_eitaa
+    from direct import eitaa_tl as E
+
+    raw = wrap_eitaa(ctx["token1"], ctx["token2"], body)
+    print(f"[{label}] request {len(raw)}B -> {url}")
+    print(f"[{label}] body({len(body)}B)={body.hex()}")
+    try:
+        resp = HttpTransport(url, timeout=30.0).post(raw)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[{label}] ✗ transport error: {exc}")
+        return 3
+    # Eitaa responses come back wrapped in the same envelope shape.
+    resp_body = resp
+    try:
+        if resp[:4] == bytes.fromhex("ed77be7a"):
+            resp_body = unwrap_eitaa(resp)["body"]
+    except Exception:  # noqa: BLE001
+        pass
+    print(f"[{label}] ✓ HTTP 200, response {len(resp)}B  head={resp[:64].hex()}")
+    verdict = E.classify_response(resp_body)
+    if verdict["ok"]:
+        print(f"[{label}] 🎉 SUCCESS — {verdict['note']} (browser-free path works)")
+        return 0
+    print(f"[{label}] ⚠ server did not accept it — {verdict['note']}")
+    print(f"[{label}] paste this response head to me: {resp_body[:80].hex()}")
+    return 4
+
+
+def cmd_direct_send(account: str, text: str, url: str | None) -> int:
+    """Send a TEXT message to Saved Messages with NO browser (direct MTProto)."""
+    from direct import eitaa_tl as E
+    path, cap = _newest_capture(account)
+    if not cap:
+        print(f"[dsend] no capture for '{account}'. first run:")
+        print(f"[dsend]   DISPLAY=:99 python cli.py direct-capture-all --account {account}")
+        return 1
+    print(f"[dsend] session context from: {path}")
+    try:
+        ctx = E.extract_context(cap)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[dsend] cannot extract session context: {exc}")
+        return 2
+    if not ctx.get("self_peer"):
+        print("[dsend] self peer not found in capture (need a request that targets Saved Messages).")
+        return 2
+    print(f"[dsend] user_id={ctx['user_id']}  token2={ctx['token2']}")
+    body = E.send_message(ctx["self_peer"], text)
+    endpoint = url or "https://majid.eitaa.com/eitaa/"
+    return _direct_rpc(body, ctx, endpoint, "dsend")
+
+
+def cmd_direct_import(account: str, phone: str, first: str, last: str, url: str | None) -> int:
+    """Import ONE contact with NO browser (direct MTProto)."""
+    from direct import eitaa_tl as E
+    path, cap = _newest_capture(account)
+    if not cap:
+        print(f"[dimport] no capture for '{account}'. first run direct-capture-all.")
+        return 1
+    print(f"[dimport] session context from: {path}")
+    try:
+        ctx = E.extract_context(cap)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[dimport] cannot extract session context: {exc}")
+        return 2
+    body = E.import_contacts([(phone, first, last)])
+    endpoint = url or "https://majid.eitaa.com/eitaa/"
+    return _direct_rpc(body, ctx, endpoint, "dimport")
+
+
 async def cmd_direct_capture_all(account: str, phone: str, first: str) -> int:
     """Capture the wire bytes for ALL current bot operations in ONE browser run:
     send text, send file (document), and add/import a contact.
@@ -1695,6 +1782,24 @@ def build_parser() -> argparse.ArgumentParser:
     p_drep.add_argument("--index", type=int, default=None,
                         help="replay a specific record index (default: auto-pick the smallest API request)")
 
+    p_dsend = sub.add_parser(
+        "direct-send",
+        help="send a TEXT to Saved Messages with NO browser (direct MTProto, uses newest capture's session)",
+    )
+    p_dsend.add_argument("--account", required=True)
+    p_dsend.add_argument("--text", required=True, help="message text to send to your own Saved Messages")
+    p_dsend.add_argument("--url", default=None, help="override the shard URL (default: majid.eitaa.com)")
+
+    p_dimp = sub.add_parser(
+        "direct-import",
+        help="import ONE contact with NO browser (direct MTProto)",
+    )
+    p_dimp.add_argument("--account", required=True)
+    p_dimp.add_argument("--phone", required=True, help="phone number to import (use a test number)")
+    p_dimp.add_argument("--first", default="Test", help="first name")
+    p_dimp.add_argument("--last", default="", help="last name")
+    p_dimp.add_argument("--url", default=None, help="override the shard URL")
+
     p_fsend = sub.add_parser(
         "bridge-file-send",
         help="end-to-end test the production file path (upload once + reuse) to Saved Messages",
@@ -1817,6 +1922,10 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_direct_probe(args.session, args.account, args.url)
     if args.command == "direct-replay":
         return cmd_direct_replay(args.account, args.index)
+    if args.command == "direct-send":
+        return cmd_direct_send(args.account, args.text, args.url)
+    if args.command == "direct-import":
+        return cmd_direct_import(args.account, args.phone, args.first, args.last, args.url)
     if args.command == "bridge-file-send":
         return asyncio.run(cmd_bridge_file_send(args.account, args.peer, args.file))
     if args.command == "bridge-login":
