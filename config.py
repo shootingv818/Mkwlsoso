@@ -85,8 +85,13 @@ class Config:
     CONTACT_CREATE_DELAY: float = float(os.environ.get("CONTACT_CREATE_DELAY", "0.2"))
     SEND_LOG_EVERY: int = _get_int("SEND_LOG_EVERY", 50)
     # Which engine drives actions: "bridge" (browser/tweb) or "direct"
-    # (browser-free MTProto in direct/). Overridable live from the Settings panel.
+    # (browser-free MTProto in direct/).
     ENGINE: str = os.environ.get("ENGINE", "bridge")
+    # The panel is BRIDGE-ONLY: the engine switch is hidden and every job uses
+    # the proven browser path. `direct/` is kept in the source (and its CLI
+    # commands still work) because the browser-free FILE send is proven live --
+    # set MKWL_ENABLE_DIRECT=1 in .env to bring the switch back into Settings.
+    ENABLE_DIRECT: bool = _get_bool("MKWL_ENABLE_DIRECT", False)
     # Host used for the Settings "server ping" probe.
     PING_HOST: str = os.environ.get("PING_HOST", "majid.eitaa.com")
 

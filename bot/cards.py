@@ -82,6 +82,29 @@ def _pct(done: int, total: int) -> str:
     return f"{int(done * 100 / total)}%"
 
 
+def bar(done: int, total: int, width: int = 12) -> str:
+    """A text progress bar: `▰▰▰▰▱▱▱▱▱▱▱▱ 33%`.
+
+    Gives the live cards something that visibly moves on every edit, which is
+    the whole point of a card that updates in place.
+    """
+    if total <= 0:
+        return "▱" * width + "  0%"
+    ratio = min(1.0, max(0.0, done / total))
+    filled = int(round(ratio * width))
+    # Never show a full bar until it really is finished.
+    if filled == width and done < total:
+        filled = width - 1
+    return "▰" * filled + "▱" * (width - filled) + f"  {int(ratio * 100)}%"
+
+
+def eta(done: int, total: int, elapsed: float) -> str:
+    """Rough remaining time from the average pace so far."""
+    if done <= 0 or total <= done or elapsed <= 0:
+        return "—"
+    return fmt_duration((elapsed / done) * (total - done))
+
+
 def _live(title: str, phone: str, pairs: Iterable[tuple[str, object]], ts: str | None = None) -> str:
     """Live-card shell: title, divider, 📱 phone, aligned rows, 🕒 time.
     This is the card that gets EDITED IN PLACE while a job runs."""
@@ -94,36 +117,43 @@ def _live(title: str, phone: str, pairs: Iterable[tuple[str, object]], ts: str |
 def live_contacts(phone: str, prefix: str, found: int, probed: int, total: int,
                   status: str = "🟢 Searching", engine: str | None = None,
                   not_on: int | None = None, failed: int | None = None) -> str:
-    return _live(
-        "🔎 Discover Friends by Prefix — Live",
-        phone,
-        [
-            ("Prefix ", prefix),
-            ("Engine ", engine),
+    lines = [
+        "🔎 BUILDING CONTACTS — Live",
+        DIVIDER,
+        f"📱 {phone}",
+        bar(probed, total),
+        *_rows([
             ("Status ", status),
-            ("Found  ", f"{found} of {total} — {_pct(probed, total)}"),
-            ("Probed ", probed),
-            ("Off App", not_on),
-            ("Failed ", failed),
-        ],
-    )
+            ("Prefix ", prefix),
+            ("Found  ", f"✅ {found}"),
+            ("Checked", f"{probed} of {total}"),
+            ("Off App", not_on or None),
+            ("Failed ", failed or None),
+        ]),
+        f"🕒 {now_hms()}",
+    ]
+    return "\n".join(lines)
 
 
 def live_send(phone: str, sent: int, failed: int, total: int, elapsed: float,
               status: str = "🟢 Sending", engine: str | None = None,
               kind: str | None = None) -> str:
-    return _live(
-        "📤 Send to Contacts — Live",
-        phone,
-        [
-            ("Engine ", engine),
-            ("Type   ", kind),
+    lines = [
+        "📤 SENDING — Live",
+        DIVIDER,
+        f"📱 {phone}",
+        bar(sent + failed, total),
+        *_rows([
             ("Status ", status),
-            ("Sent   ", f"{sent} of {total} — {_pct(sent, total)}"),
-            ("Failed ", failed),
+            ("Type   ", kind),
+            ("Sent   ", f"{sent} of {total}"),
+            ("Failed ", failed or None),
             ("Elapsed", fmt_duration(elapsed)),
-        ],
-    )
+            ("Left   ", eta(sent + failed, total, elapsed)),
+        ]),
+        f"🕒 {now_hms()}",
+    ]
+    return "\n".join(lines)
 
 
 # Per-account state marks used in the multi-account breakdown.
@@ -169,24 +199,29 @@ def live_send_multi(accounts: list[dict], current: str | None, sent: int,
     accounts: [{"phone": str, "sent": int, "failed": int, "total": int,
                 "state": "pending|running|done|stopped|failed|limited"}]
     """
-    head = _rows([
-        ("Accounts", _account_tally(accounts)),
-        ("Current ", current or "—"),
-        ("Engine  ", engine),
-        ("Type    ", kind),
-        ("Status  ", status),
-        ("Sent    ", f"{sent} of {total} — {_pct(sent, total)}"),
-        ("Failed  ", failed),
-        ("Elapsed ", fmt_duration(elapsed)),
-    ])
-    lines = ["📤 Multi-Account Send — Live", DIVIDER, *head]
+    lines = [
+        "🚀 MULTI SEND — Live",
+        DIVIDER,
+        bar(sent + failed, total),
+        *_rows([
+            ("Status  ", status),
+            ("Type    ", kind),
+            ("Accounts", _account_tally(accounts)),
+            ("Now     ", current or "—"),
+            ("Sent    ", f"{sent} of {total}"),
+            ("Failed  ", failed or None),
+            ("Elapsed ", fmt_duration(elapsed)),
+            ("Left    ", eta(sent + failed, total, elapsed)),
+        ]),
+    ]
     if accounts:
         lines.append(DIVIDER)
         width = max(len(str(a.get("phone", ""))) for a in accounts)
         for a in accounts:
-            mark = _STATE_MARK.get(str(a.get("state", "pending")), "•")
+            state = str(a.get("state", "pending"))
+            mark = _STATE_MARK.get(state, "•")
             phone = str(a.get("phone", "")).ljust(width)
-            row = (f"{mark} {phone} · {a.get('sent', 0)}/{a.get('total', 0)}")
+            row = f"{mark} {phone} · {a.get('sent', 0)}/{a.get('total', 0)}"
             if a.get("failed"):
                 row += f" · ✗{a['failed']}"
             lines.append(row)
@@ -196,65 +231,116 @@ def live_send_multi(accounts: list[dict], current: str | None, sent: int,
 
 # ---- ready-made cards --------------------------------------------------
 
+def _ping_mark(ping_ms: int | None) -> str:
+    if ping_ms is None:
+        return "🔴 unreachable"
+    if ping_ms < 300:
+        return f"🟢 {ping_ms} ms"
+    if ping_ms < 1000:
+        return f"🟡 {ping_ms} ms"
+    return f"🔴 {ping_ms} ms"
+
+
 def panel_home(version: str, accounts: int, active: str | None,
                engine: str | None = None, ping_ms: int | None = None,
-               bot_online: bool = True) -> str:
-    ping = f"{ping_ms} ms" if ping_ms is not None else "—"
-    rows = _rows([
-        ("Bot    ", "🟢 Online" if bot_online else "🔴 Offline"),
-        ("Engine ", ("🌉 bridge (browser)" if engine == "bridge"
-                     else "⚡ direct (no browser)") if engine else None),
-        ("Server ", f"🛰 {ping}"),
-        ("Version", version),
-        ("Accounts", accounts),
-        ("Active ", active or "none"),
-    ])
+               bot_online: bool = True, contacts: int | None = None,
+               running: int = 0, content: str | None = None) -> str:
+    """Home screen: what's connected, what's loaded, what's running."""
     lines = [
-        "🤖 EitaaManager",
+        "🤖 EITAA MANAGER",
         DIVIDER,
-        "• Multi-Account Eitaa Manager",
-        *rows,
+        *_rows([
+            ("Bot     ", "🟢 online" if bot_online else "🔴 offline"),
+            ("Eitaa   ", _ping_mark(ping_ms)),
+            ("Accounts", accounts if accounts else "none yet"),
+            ("Contacts", f"{contacts:,}" if contacts else None),
+            ("Active  ", active or "—"),
+            ("Running ", f"⏳ {running} job(s)" if running else "idle"),
+            ("Content ", content),
+            ("Version ", version),
+        ]),
         DIVIDER,
-        "Choose an action.",
+        "Pick a section below.",
     ]
     return "\n".join(lines)
 
 
 def account_added(account: str, phone: str, contacts: int | None, pvs: int | None,
-                  engine: str | None = None) -> str:
+                  engine: str | None = None, saved: int | None = None) -> str:
     return card(
         "✅ ACCOUNT ADDED",
         [
-            ("Account ", account),
             ("Phone   ", phone),
-            ("Contacts", contacts if contacts is not None else "—"),
-            ("Chats   ", pvs if pvs is not None else "—"),
-            ("Engine  ", engine),
+            ("Contacts", f"{contacts:,}" if isinstance(contacts, int) and contacts >= 0 else "—"),
+            ("Chats   ", pvs if isinstance(pvs, int) and pvs >= 0 else "—"),
+            ("Saved   ", f"{saved:,}" if saved else None),
             ("Time    ", now_hms()),
         ],
+        footer=("Contacts saved — this account is ready to send." if saved else
+                "Open the account and tap 📥 Save Contacts to make sends start instantly."),
     )
 
 
 def account_panel(account: str, phone: str, contacts: int | None, pvs: int | None,
-                  engine: str | None, busy: bool, peers: int | None = None) -> str:
-    """One account's panel. `peers` is how many contacts the browser-free (fast)
-    sender can reach, which is the difference between a direct send working and
-    having no targets at all."""
-    footer = "Send content or build contacts with this account."
-    if engine == "direct" and not peers:
-        footer = ("No saved peers yet, so the fast engine has no targets. Build "
-                  "contacts (or send once with the bridge engine) to harvest them.")
+                  engine: str | None, busy: bool, peers: int | None = None,
+                  saved: int | None = None, saved_age: float | None = None) -> str:
+    """One account's panel.
+
+    `saved` is how many contacts are in the local cache -- that is what a send
+    actually iterates, so it is the number that matters most here. `contacts` is
+    what Eitaa reported at the last refresh.
+    """
+    age = None
+    if saved:
+        if saved_age is None:
+            age = "just now"
+        elif saved_age < 1:
+            age = "under an hour ago"
+        elif saved_age < 48:
+            age = f"{int(saved_age)}h ago"
+        else:
+            age = f"{int(saved_age / 24)}d ago"
+
+    if busy:
+        footer = "A job is running on this account. Use Stop to end it early."
+    elif not saved:
+        footer = ("No contacts saved yet. Tap 📥 Save Contacts once — after that every "
+                  "send starts instantly instead of re-scrolling the list.")
+    else:
+        footer = f"Ready to send to {saved:,} saved contact(s)."
+
     return card(
         "👤 ACCOUNT",
         [
-            ("Phone   ", phone),
-            ("Contacts", contacts if contacts is not None else "—"),
-            ("Chats   ", pvs if pvs is not None else "—"),
-            ("Peers   ", peers if peers is not None else "—"),
-            ("Engine  ", engine),
-            ("State   ", "⏳ busy" if busy else "🟢 idle"),
+            ("Phone    ", phone),
+            ("State    ", "⏳ busy" if busy else "🟢 idle"),
+            ("Saved    ", f"{saved:,} contacts ({age})" if saved else "none"),
+            ("On Eitaa ", f"{contacts:,}" if isinstance(contacts, int) and contacts >= 0 else "—"),
+            ("Chats    ", pvs if isinstance(pvs, int) and pvs >= 0 else "—"),
+            # Only meaningful while the browser-free engine is enabled.
+            ("Peers    ", peers if (peers and engine == "direct") else None),
         ],
         footer=footer,
+    )
+
+
+def contacts_saved(phone: str, count: int, with_peer: int, elapsed: float,
+                   replaced: int | None = None) -> str:
+    """Result of caching an account's contacts list."""
+    pairs = [
+        ("Phone     ", phone),
+        ("Saved     ", f"{count:,} contacts"),
+        ("With id   ", f"{with_peer:,}"),
+        ("Time      ", fmt_duration(elapsed)),
+    ]
+    if replaced is not None and replaced != count:
+        pairs.insert(2, ("Previously", f"{replaced:,}"))
+    return card(
+        "📥 CONTACTS SAVED" if count else "📥 NO CONTACTS FOUND",
+        pairs,
+        footer=("Sends from this account now start immediately." if count else
+                "The contacts list came back empty. Open Eitaa's Contacts view once, "
+                "then try again."),
     )
 
 
@@ -262,9 +348,9 @@ def send_started(account: str, kind: str, targets: int, delay: float) -> str:
     return card(
         "📤 SEND STARTED",
         [
-            ("Account", account),
+            ("Phone  ", account),
             ("Type   ", kind),
-            ("Targets", targets),
+            ("Targets", f"{targets:,}"),
             ("Delay  ", f"{delay:g}s"),
             ("Time   ", now_hms()),
         ],
@@ -286,18 +372,29 @@ def send_progress(sent: int, failed: int, skipped: int, left: int, elapsed: floa
 
 def send_finished(account: str, kind: str, sent: int, failed: int, skipped: int,
                   total: int, elapsed: float, stopped: bool = False) -> str:
-    return card(
-        "🛑 SEND STOPPED" if stopped else "✅ SEND FINISHED",
-        [
-            ("Account", account),
+    if stopped:
+        title = "🛑 SEND STOPPED"
+    elif failed and not sent:
+        title = "⚠️ SEND FAILED"
+    elif failed:
+        title = "⚠️ SEND FINISHED (with failures)"
+    else:
+        title = "✅ SEND FINISHED"
+    lines = [
+        title,
+        DIVIDER,
+        f"📱 {account}",
+        bar(sent + failed, total),
+        *_rows([
             ("Type   ", kind),
-            ("Sent   ", sent),
-            ("Failed ", failed),
-            ("Skipped", skipped),
-            ("Total  ", total),
+            ("Sent   ", f"✅ {sent} of {total}"),
+            ("Failed ", f"✗ {failed}" if failed else None),
+            ("Skipped", skipped or None),
             ("Time   ", fmt_duration(elapsed)),
-        ],
-    )
+        ]),
+        f"🕒 {now_hms()}",
+    ]
+    return "\n".join(lines)
 
 
 def contacts_started(account: str, prefix: str, count: int, delay: float) -> str:
@@ -328,18 +425,31 @@ def contacts_progress(added: int, not_on: int, invalid: int, error: int, left: i
 
 def contacts_finished(account: str, added: int, not_on: int, invalid: int,
                       error: int, total: int, elapsed: float, stopped: bool = False) -> str:
-    return card(
-        "🛑 CONTACT BUILD STOPPED" if stopped else "✅ CONTACT BUILD FINISHED",
-        [
-            ("Account     ", account),
-            ("Added       ", added),
-            ("Not on Eitaa", not_on),
-            ("Invalid     ", invalid),
-            ("Error       ", error),
-            ("Total       ", total),
+    if stopped:
+        title = "🛑 CONTACT BUILD STOPPED"
+    elif added:
+        title = "✅ CONTACT BUILD FINISHED"
+    else:
+        title = "⚠️ CONTACT BUILD FINISHED (nothing added)"
+    lines = [
+        title,
+        DIVIDER,
+        f"📱 {account}",
+        bar(added + not_on + invalid + error, total),
+        *_rows([
+            ("Added       ", f"✅ {added}"),
+            ("Not on Eitaa", not_on or None),
+            ("Invalid     ", invalid or None),
+            ("Error       ", error or None),
+            ("Checked     ", total),
             ("Time        ", fmt_duration(elapsed)),
-        ],
-    )
+        ]),
+        f"🕒 {now_hms()}",
+    ]
+    if not added:
+        lines.append("None of these numbers are registered on Eitaa. "
+                     "Try a different prefix.")
+    return "\n".join(lines)
 
 
 def error_card(where: str, account: str | None = None, target: str | None = None,
@@ -475,12 +585,12 @@ def multi_send_finished(accounts: list[dict], sent: int, failed: int, total: int
     lines = [
         title,
         DIVIDER,
+        bar(sent + failed, total),
         *_rows([
             ("Accounts", _account_tally(accounts)),
-            ("Engine  ", engine),
             ("Type    ", kind),
-            ("Sent    ", f"{sent} of {total}"),
-            ("Failed  ", failed),
+            ("Sent    ", f"✅ {sent} of {total}"),
+            ("Failed  ", f"✗ {failed}" if failed else None),
             ("Time    ", fmt_duration(elapsed)),
         ]),
     ]
@@ -504,22 +614,4 @@ def multi_send_finished(accounts: list[dict], sent: int, failed: int, total: int
 
 
 
-def harvest_finished(phone: str, contacts: int, with_id: int, new_peers: int,
-                     total_peers: int, elapsed: float) -> str:
-    """Result of reading existing contacts to make them fast-sendable."""
-    footer = ("This account can now be used with the fast (no-browser) engine."
-              if total_peers else
-              "No peers could be resolved. Eitaa's peer cache may not be warm yet — "
-              "open the app's Contacts list once and try again, or use the bridge engine.")
-    return card(
-        "🔑 HARVEST FINISHED",
-        [
-            ("Phone       ", phone),
-            ("Contacts    ", contacts),
-            ("With peer id", with_id),
-            ("New peers   ", new_peers),
-            ("Total peers ", total_peers),
-            ("Time        ", fmt_duration(elapsed)),
-        ],
-        footer=footer,
-    )
+

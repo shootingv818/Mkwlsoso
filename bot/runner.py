@@ -22,6 +22,7 @@ from config import config
 from capture.browser import open_session
 from eitaa.driver import EitaaDriver, SendResult
 from bot import cards
+from bot import contacts_store
 
 Report = Callable[[str], Awaitable[None]]
 
@@ -302,55 +303,54 @@ class JobManager:
                                            status=status, engine=engine, kind=kind),
                            force=force)
 
-    async def run_harvest(self, account: str, report: Report,
-                          account_phone: str | None = None) -> Job:
-        """Read the account's EXISTING contacts once and save their peers.
+    async def run_save_contacts(self, account: str, report: Report,
+                                account_phone: str | None = None) -> Job:
+        """Collect the account's contacts ONCE and cache them.
 
-        This is the one-tap way to make the browser-free engine usable on an
-        account that already has contacts: it opens the browser, collects the
-        contacts list (which also warms tweb's peer cache) and asks Eitaa's own
-        peer manager for each access_hash. Reuses the exact pieces the bridge
-        send job already used.
+        This is the slow part of any send (Eitaa's contact list is virtualized,
+        so it has to be scrolled). Doing it here means every later send starts
+        delivering immediately. Peers are harvested in the same pass, so the
+        browser-free sender keeps working if it is ever re-enabled.
         """
-        job = self._new_job("harvest", account)
+        job = self._new_job("contacts_save", account)
         job.task = asyncio.create_task(
-            self._harvest_job(job, report, account_phone or account))
+            self._save_contacts_job(job, report, account_phone or account))
         return job
 
-    async def _harvest_job(self, job: Job, report: Report, phone: str) -> None:
+    async def _save_contacts_job(self, job: Job, report: Report, phone: str) -> None:
         account = job.account
         self._busy.add(account)
         start = time.time()
+        before = contacts_store.count(account)
         try:
             async with open_session(account) as session:
                 driver = EitaaDriver(session)
                 await driver.open()
                 if not await driver.is_logged_in():
                     await report(cards.error_card(
-                        "harvest", account, code="not_logged_in",
+                        "save_contacts", account, code="not_logged_in",
                         detail="account is not logged in"))
                     return
 
                 contacts = await driver.collect_all_contacts()
+                record = contacts_store.save(account, contacts)
                 await driver._return_to_chat_list()
-                peer_ids = [c.get("peer_id") for c in contacts if c.get("peer_id")]
-                new = await self._harvest_peers(driver, account, report, peer_ids)
 
-                total = 0
-                try:
-                    from direct import peers as peer_store
-                    total = peer_store.count(account)
-                except Exception:  # noqa: BLE001
-                    pass
-                job.summary = {"contacts": len(contacts), "peers_new": new,
-                               "peers_total": total}
-                await report(cards.harvest_finished(
-                    phone, len(contacts), len(peer_ids), new, total,
-                    time.time() - start))
+                peer_ids = [c.get("peer_id") for c in record["contacts"]
+                            if c.get("peer_id")]
+                # Harvesting is a bonus for the browser-free engine; it never
+                # affects the saved list.
+                await self._harvest_peers(driver, account, report, peer_ids)
+
+                job.summary = {"contacts": record["count"],
+                               "with_peer_id": len(peer_ids)}
+                await report(cards.contacts_saved(
+                    phone, record["count"], len(peer_ids),
+                    time.time() - start, replaced=before))
         except Exception as exc:  # noqa: BLE001
-            await report(cards.error_card("harvest", account, code=type(exc).__name__,
-                                          detail=str(exc), phase="harvest",
-                                          trace_id=job.job_id))
+            await report(cards.error_card("save_contacts", account,
+                                          code=type(exc).__name__, detail=str(exc),
+                                          phase="collect", trace_id=job.job_id))
         finally:
             self._busy.discard(account)
 
@@ -499,7 +499,9 @@ class JobManager:
                         engine = _store.engine
                     except Exception:  # noqa: BLE001
                         engine = None
-                    await report(cards.account_added(account, phone_digits, contacts, pvs, engine))
+                    await report(cards.account_added(
+                        account, phone_digits, contacts, pvs, engine,
+                        saved=contacts_store.count(account)))
                 else:
                     await report(cards.card(
                         "⚠️ LOGIN INCOMPLETE",
@@ -541,18 +543,28 @@ class JobManager:
 
                 is_file = content.get("kind") == "file"
                 if recipients is None:
-                    contacts = await driver.collect_all_contacts()
-                    # Keep BOTH title and peer_id: peer_id drives the fast bridge
-                    # send (Eitaa's own engine, no UI), title is the search
-                    # fallback + failure label. Collecting also warms tweb's peer
-                    # cache so peer resolution works for the bridge.
-                    recipient_items = [
-                        (c.get("title", ""), c.get("peer_id"))
-                        for c in contacts if c.get("title")
-                    ]
-                    # collect_all_contacts leaves the Contacts subview open;
-                    # return to the main chat list before we start opening chats.
-                    await driver._return_to_chat_list()
+                    # Prefer the SAVED contacts list: collecting it means
+                    # scrolling Eitaa's virtualized list for minutes, and it was
+                    # being redone on every single send. Saved once, sends start
+                    # immediately.
+                    recipient_items = contacts_store.items(account)
+                    if recipient_items:
+                        print(f"[send] using {len(recipient_items)} saved contacts "
+                              f"(no re-scroll)", flush=True)
+                    else:
+                        contacts = await driver.collect_all_contacts()
+                        # Keep BOTH title and peer_id: peer_id drives the fast
+                        # bridge send (Eitaa's own engine, no UI), title is the
+                        # search fallback + failure label. Collecting also warms
+                        # tweb's peer cache so peer resolution works.
+                        contacts_store.save(account, contacts)
+                        recipient_items = contacts_store.items(account)
+                        # collect_all_contacts leaves the Contacts subview open;
+                        # return to the main chat list before opening chats.
+                        await driver._return_to_chat_list()
+                        await report(cards.contacts_saved(
+                            phone, len(recipient_items),
+                            sum(1 for _, p in recipient_items if p), 0))
                 else:
                     # Externally-supplied recipients are plain names -> no peer_id,
                     # so they use the proven UI flow unchanged.

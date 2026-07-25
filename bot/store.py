@@ -95,6 +95,14 @@ class Store:
 
     @property
     def engine(self) -> str:
+        """The engine every job uses.
+
+        The panel is bridge-only, so this reports "bridge" no matter what is
+        stored -- unless MKWL_ENABLE_DIRECT=1 brings the switch back. The stored
+        value is left untouched so enabling the flag restores the old choice.
+        """
+        if not config.ENABLE_DIRECT:
+            return "bridge"
         eng = str(self._data["settings"].get("engine", config.ENGINE))
         return eng if eng in ("bridge", "direct") else "bridge"
 

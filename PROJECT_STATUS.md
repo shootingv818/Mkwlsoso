@@ -90,6 +90,24 @@ python cli.py direct-send-file --account <a> [--to "<c>"] --file f.zip --caption
 python cli.py direct-import    --account <a> --phone "+98..." --first Name
 ```
 
+### FINAL SHAPE: the panel is BRIDGE-ONLY (2026-07-25)
+After the live tests below, the panel was moved fully onto the proven browser
+(bridge) path and the engine switch was REMOVED from the UI:
+- `store.engine` always reports `bridge` unless `MKWL_ENABLE_DIRECT=1` is set in
+  `.env`. The stored choice is never overwritten, so the flag restores it.
+- `direct/` is untouched and its CLI commands still work. It is kept because the
+  browser-free FILE send is proven live (9.5 MB zip, 19 parts, uploaded once);
+  only browser-free CONTACT IMPORT is unsupported by Eitaa (dead-end below).
+- Contact building auto-hands-over to the bridge if the direct path is ever used.
+- **Contacts are now cached** (`bot/contacts_store.py` -> `DATA_DIR/contacts_<acct>.json`,
+  title + peer_id only). Collecting Eitaa's virtualized contact list took minutes
+  and was being redone at the start of EVERY send; now it is done once via
+  📥 Save Contacts and later sends start delivering immediately.
+- **Multi Send is its own top-level section** on Home (bridge-based), showing the
+  combined reach before starting and reporting into ONE live card.
+- UI reworked: progress bars, ETA, per-account saved-contact counts in every list,
+  10 per page, and honest titles (a run with failures is never a green success).
+
 ### Fast send + multi-account panel (branch `feat/fast-send-multi-account`)
 Built entirely by WIRING UP existing proven code — no new protocol work.
 
