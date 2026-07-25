@@ -718,15 +718,17 @@ def _print_op_capture(label: str, recs: list) -> list:
 def _newest_capture(account: str):
     """Return (path, loaded_json) for the newest capall_/worker_tx_ capture."""
     import glob as _glob
+    import os as _os
     from pathlib import Path as _Path
     cap_dir = config.ARTIFACTS_DIR / "sessions"
-    files = sorted(
+    files = (
         _glob.glob(str(cap_dir / f"capall_{account}_*.json"))
         + _glob.glob(str(cap_dir / f"worker_tx_{account}_*.json"))
     )
     if not files:
         return None, None
-    path = files[-1]
+    # newest by real modification time (not alphabetical: 'capall' < 'worker_tx')
+    path = max(files, key=_os.path.getmtime)
     return path, json.loads(_Path(path).read_text(encoding="utf-8"))
 
 
