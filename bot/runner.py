@@ -22,6 +22,7 @@ from config import config
 from capture.browser import open_session
 from eitaa.driver import EitaaDriver, SendResult
 from bot import cards
+from bot import contacts_store
 
 Report = Callable[[str], Awaitable[None]]
 
@@ -78,15 +79,51 @@ def _is_limit(detail: str) -> bool:
     return any(pat in low for pat in _LIMIT_PATTERNS)
 
 
+def effective_engine(settings: dict) -> str:
+    """The engine a job may actually use.
+
+    The panel is bridge-only, so "direct" is refused unless MKWL_ENABLE_DIRECT=1.
+    This is the single place every job asks, so a stale `engine: "direct"` left in
+    a saved settings file (or passed in by a caller) can never route work to the
+    browser-free engine behind the owner's back.
+    """
+    engine = str((settings or {}).get("engine", config.ENGINE))
+    if engine == "direct" and not config.ENABLE_DIRECT:
+        return "bridge"
+    return engine if engine in ("bridge", "direct") else "bridge"
+
+
 @dataclass
 class Job:
     job_id: str
-    kind: str          # "send" | "contacts"
+    kind: str          # "send" | "contacts" | "contacts_save" | "multi"
     account: str
     stop: bool = False
     task: asyncio.Task | None = None
     started: float = field(default_factory=time.time)
     summary: dict = field(default_factory=dict)
+    # Set together with `stop`. Every wait inside a job sleeps on this event
+    # instead of a plain timer, so a stop takes effect immediately instead of
+    # after the remaining delay.
+    stop_event: asyncio.Event = field(default_factory=asyncio.Event)
+
+    def ask_stop(self) -> None:
+        self.stop = True
+        self.stop_event.set()
+
+    async def wait(self, delay: float) -> bool:
+        """Sleep up to `delay`, waking at once if a stop is requested.
+
+        Returns True when the job should stop.
+        """
+        if self.stop:
+            return True
+        if delay and delay > 0:
+            try:
+                await asyncio.wait_for(self.stop_event.wait(), timeout=delay)
+            except asyncio.TimeoutError:
+                return self.stop
+        return self.stop
 
 
 @dataclass
@@ -98,6 +135,101 @@ class LoginState:
     stage: str = "sending"   # sending | awaiting_code | done
 
 
+class AggregateProgress:
+    """Shared progress for a SIMULTANEOUS multi-account send.
+
+    Several per-account send jobs run at once but must report into ONE live
+    card: the combined "sent of total" across every selected account (their
+    contact lists added together), which account most recently sent, and a
+    per-account breakdown. Each job calls `update()`; rendering + throttling is
+    handled by the LiveCard underneath.
+    """
+
+    def __init__(self, live, accounts: list[tuple[str, str]],
+                 kind: str | None = None, engine: str | None = None) -> None:
+        self.live = live
+        self.kind = kind
+        self.engine = engine
+        self.start = time.time()
+        self.order = [acc for acc, _ in accounts]
+        self.rows: dict[str, dict] = {
+            acc: {"phone": phone, "sent": 0, "failed": 0, "total": 0,
+                  "state": "pending"}
+            for acc, phone in accounts
+        }
+        self.current: str | None = None
+        self._lock = asyncio.Lock()
+
+    # ---- numbers ----
+    def breakdown(self) -> list[dict]:
+        return [self.rows[a] for a in self.order if a in self.rows]
+
+    def totals(self) -> tuple[int, int, int]:
+        rows = self.breakdown()
+        return (sum(r["sent"] for r in rows),
+                sum(r["failed"] for r in rows),
+                sum(r["total"] for r in rows))
+
+    def _status(self) -> str:
+        rows = self.breakdown()
+        states = [r["state"] for r in rows]
+        if "preparing" in states:
+            return "📥 Reading contacts"
+        if "running" in states:
+            return "🟢 Sending"
+        # Only once nothing is in flight can the run be summarized. This check
+        # comes BEFORE the limited/stopped ones so a finished run that merely
+        # contained a limited account is not reported as "Limited".
+        if states and set(states) <= {"done", "failed", "no_targets",
+                                      "stopped", "limited"}:
+            # Never claim a green "Done" when accounts could not send at all --
+            # that made 7 of 8 accounts failing look like a 100% success.
+            parts = []
+            for count, word in ((states.count("no_targets"), "with no peers"),
+                                (states.count("failed"), "failed"),
+                                (states.count("limited"), "limited"),
+                                (states.count("stopped"), "stopped")):
+                if count:
+                    parts.append(f"{count} {word}")
+            if parts:
+                return "⚠️ Done — " + ", ".join(parts)
+            return "✅ Done"
+        if "limited" in states:
+            return "🚫 Limited"
+        if "stopped" in states:
+            return "🛑 Stopped"
+        return "⏳ Starting"
+
+    def render(self) -> str:
+        sent, failed, total = self.totals()
+        # "Now" means an account is actually working right now; once the run is
+        # over it would otherwise keep naming the last account forever.
+        busy = any(r["state"] in ("running", "preparing") for r in self.breakdown())
+        return cards.live_send_multi(
+            self.breakdown(), self.current if busy else None, sent, failed, total,
+            time.time() - self.start, status=self._status(),
+            engine=self.engine, kind=self.kind,
+        )
+
+    # ---- updates ----
+    async def update(self, account: str, force: bool = False, **fields) -> None:
+        """Merge this account's numbers/state in, then refresh the single card."""
+        async with self._lock:
+            row = self.rows.get(account)
+            if row is None:
+                return
+            row.update({k: v for k, v in fields.items() if v is not None})
+            if row.get("state") == "running":
+                self.current = row.get("phone")
+        if self.live is not None:
+            await self.live.set(self.render(), force=force)
+
+    async def finish(self) -> None:
+        """Force one last repaint so the card ends on exact final numbers."""
+        if self.live is not None:
+            await self.live.set(self.render(), force=True)
+
+
 class JobManager:
     """Tracks running jobs and enforces one job per account at a time."""
 
@@ -105,6 +237,8 @@ class JobManager:
         self._jobs: dict[str, Job] = {}
         self._busy: set[str] = set()
         self._logins: dict[str, LoginState] = {}
+        # multi-run job id -> the per-account job it is currently waiting on.
+        self._multi_children: dict[str, Job] = {}
 
     def is_busy(self, account: str) -> bool:
         return account in self._busy
@@ -112,23 +246,62 @@ class JobManager:
     def active_jobs(self) -> list[Job]:
         return [j for j in self._jobs.values() if j.task and not j.task.done()]
 
+    def multi_jobs(self) -> list[Job]:
+        """Running multi-account runs (kind "multi")."""
+        return [j for j in self.active_jobs() if j.kind == "multi"]
+
     def get(self, job_id: str) -> Job | None:
         return self._jobs.get(job_id)
 
-    def stop(self, job_id: str) -> bool:
-        job = self._jobs.get(job_id)
-        if job:
-            job.stop = True
-            return True
-        return False
+    def stop(self, job_id: str, force: bool = False) -> bool:
+        """Ask a job to stop. `force` cancels it outright.
 
-    def stop_account(self, account: str) -> int:
+        Graceful stop wakes every wait immediately, so the job ends as soon as
+        the message in flight is done. `force` is the second press: it cancels
+        the task, which unwinds the browser session through its context manager.
+        """
+        job = self._jobs.get(job_id)
+        if not job:
+            return False
+        job.ask_stop()
+        # Stopping a multi run must also stop the account sending right now,
+        # otherwise it would keep going and only the queue would halt.
+        child = self._multi_children.get(job_id)
+        if child is not None:
+            child.ask_stop()
+        if force:
+            # Cancel the job that actually owns the browser. For a multi run that
+            # is the account in flight -- never the sequence itself, otherwise the
+            # run would die before it could post its final card.
+            if child is not None and child.task and not child.task.done():
+                child.task.cancel()
+            elif (job.kind != "multi" and job.task and not job.task.done()):
+                job.task.cancel()
+        return True
+
+    def is_stopping(self, job_id: str) -> bool:
+        job = self._jobs.get(job_id)
+        return bool(job and job.stop)
+
+    def stop_multi(self, force: bool = False) -> int:
+        """Stop every running multi-account run (and its current account)."""
+        return sum(1 for j in self.multi_jobs() if self.stop(j.job_id, force=force))
+
+    def multi_stopping(self) -> bool:
+        """True when a multi run has already been asked to stop."""
+        return any(j.stop for j in self.multi_jobs())
+
+    def stop_account(self, account: str, force: bool = False) -> int:
         n = 0
-        for job in self._jobs.values():
+        for job in list(self._jobs.values()):
             if job.account == account and job.task and not job.task.done():
-                job.stop = True
+                self.stop(job.job_id, force=force)
                 n += 1
         return n
+
+    def account_stopping(self, account: str) -> bool:
+        return any(j.account == account and j.stop and j.task and not j.task.done()
+                   for j in self._jobs.values())
 
     def _new_job(self, kind: str, account: str) -> Job:
         job = Job(job_id=uuid.uuid4().hex[:8], kind=kind, account=account)
@@ -137,18 +310,209 @@ class JobManager:
 
     async def run_send(self, account: str, content: dict, settings: dict,
                        report: Report, recipients: list[str] | None = None,
-                       live=None, account_phone: str | None = None) -> Job:
+                       live=None, account_phone: str | None = None,
+                       agg: AggregateProgress | None = None) -> Job:
+        """Start a send job, honouring the engine setting.
+
+        engine=direct -> browser-free MTProto (no Chromium at all), which needs
+        saved peers for the targets. engine=bridge -> the proven tweb path.
+        Routing mirrors run_contacts, which already dispatched on the engine.
+        """
         job = self._new_job("send", account)
-        job.task = asyncio.create_task(
-            self._send_job(job, content, settings, report, recipients, live, account_phone)
-        )
+        engine = effective_engine(settings)
+        if engine == "direct":
+            job.task = asyncio.create_task(
+                self._send_job_direct(job, content, settings, report,
+                                      recipients, live, account_phone, agg)
+            )
+        else:
+            job.task = asyncio.create_task(
+                self._send_job(job, content, settings, report, recipients,
+                               live, account_phone, agg)
+            )
         return job
+
+    async def run_send_multi(self, accounts: list[tuple[str, str]], content: dict,
+                             settings: dict, report: Report, live=None) -> Job:
+        """Send from several accounts ONE AFTER ANOTHER, in the order given.
+
+        `accounts` is [(account, phone)] in the order the owner ticked them, so
+        the first account ticked is the first to send. An account runs until it
+        finishes, is stopped, or fails for ANY reason (expired session, limit,
+        crash) -- then the run moves on to the next one. Nothing runs in
+        parallel, so only one browser is open at a time.
+
+        Returns the single "multi" job that represents the whole run; stopping it
+        stops the account currently sending and skips the rest.
+        """
+        multi = self._new_job("multi", "*")
+        multi.task = asyncio.create_task(
+            self._multi_send_sequence(multi, list(accounts), content, settings,
+                                      report, live))
+        return multi
+
+    async def _multi_send_sequence(self, multi: Job, accounts: list[tuple[str, str]],
+                                   content: dict, settings: dict, report: Report,
+                                   live=None) -> None:
+        kind = "File" if content.get("kind") == "file" else "Text"
+        engine = effective_engine(settings)
+        agg = AggregateProgress(live, accounts, kind=kind, engine=engine)
+        start = time.time()
+
+        # ---- PHASE 1: know the reach before sending anything ----------------
+        # Every account's contacts are counted up front (collected first if this
+        # account has none saved yet), so the card can show a real grand total
+        # instead of a number that grows as the run goes.
+        for acc, phone in accounts:
+            if multi.stop:
+                break
+            known = contacts_store.count(acc)
+            if not known:
+                await agg.update(acc, state="preparing", force=True)
+                save_job = await self.run_save_contacts(acc, report, phone)
+                self._multi_children[multi.job_id] = save_job
+                try:
+                    await save_job.task
+                except asyncio.CancelledError:
+                    multi.ask_stop()
+                except Exception:  # noqa: BLE001 - a failure here just means 0
+                    pass
+                known = contacts_store.count(acc)
+            await agg.update(acc, total=known, state="pending", force=True)
+
+        _, _, grand_total = agg.totals()
+        await report(cards.multi_ready(agg.breakdown(), grand_total, kind=kind))
+
+        # ---- PHASE 2: send, one account at a time, in order -----------------
+        order = 0
+        for acc, phone in accounts:
+            if multi.stop:
+                break
+            order += 1
+            await agg.update(acc, state="running", force=True)
+            job = await self.run_send(acc, content, settings, report, live=None,
+                                      account_phone=phone, agg=agg)
+            self._multi_children[multi.job_id] = job
+            try:
+                await job.task
+            except asyncio.CancelledError:
+                # This account was force-stopped. Only IT was cancelled, so the
+                # sequence stays alive to report and (if asked) stop cleanly.
+                await agg.update(acc, state="stopped", force=True)
+            except Exception as exc:  # noqa: BLE001 - never abort the whole run
+                await report(cards.error_card(
+                    "multi_send", acc, code=type(exc).__name__, detail=str(exc),
+                    phase="account_job", trace_id=multi.job_id))
+
+            # Whatever happened, record an outcome for this account and move on.
+            row = agg.rows.get(acc, {})
+            summary = job.summary or {}
+            if row.get("state") not in ("done", "stopped", "limited", "failed",
+                                        "no_targets"):
+                # The job returned without reporting (e.g. it was not logged in),
+                # so mark it failed rather than leaving it looking pending.
+                await agg.update(acc, state="failed", force=True)
+                row = agg.rows.get(acc, {})
+            await report(cards.multi_account_done(
+                phone, order, len(accounts), row.get("state", "failed"),
+                int(summary.get("sent", row.get("sent", 0)) or 0),
+                int(summary.get("failed", row.get("failed", 0)) or 0),
+                int(row.get("total", 0) or 0),
+                next_phone=(accounts[order][1] if order < len(accounts)
+                            and not multi.stop else None)))
+
+        self._multi_children.pop(multi.job_id, None)
+        await agg.finish()
+        sent, failed, total = agg.totals()
+        multi.summary = {"sent": sent, "failed": failed, "total": total,
+                         "accounts": len(accounts)}
+        await report(cards.multi_send_finished(
+            agg.breakdown(), sent, failed, total, time.time() - start,
+            kind=kind, engine=engine, stopped=multi.stop))
+
+    async def _send_progress(self, live, agg: AggregateProgress | None,
+                             account: str, phone: str, *, sent: int, failed: int,
+                             total: int, elapsed: float, status: str, state: str,
+                             engine: str | None, kind: str | None,
+                             force: bool = False) -> None:
+        """Publish progress to whichever card this job owns.
+
+        A multi-account job feeds the shared aggregate card; a single-account
+        job keeps its own live card exactly as before.
+        """
+        if agg is not None:
+            await agg.update(account, sent=sent, failed=failed, total=total,
+                             state=state, force=force)
+        elif live is not None:
+            await live.set(cards.live_send(phone, sent, failed, total, elapsed,
+                                           status=status, engine=engine, kind=kind),
+                           force=force)
+
+    async def run_save_contacts(self, account: str, report: Report,
+                                account_phone: str | None = None) -> Job:
+        """Collect the account's contacts ONCE and cache them.
+
+        This is the slow part of any send (Eitaa's contact list is virtualized,
+        so it has to be scrolled). Doing it here means every later send starts
+        delivering immediately. Peers are harvested in the same pass, so the
+        browser-free sender keeps working if it is ever re-enabled.
+        """
+        job = self._new_job("contacts_save", account)
+        job.task = asyncio.create_task(
+            self._save_contacts_job(job, report, account_phone or account))
+        return job
+
+    async def _save_contacts_job(self, job: Job, report: Report, phone: str) -> None:
+        account = job.account
+        self._busy.add(account)
+        start = time.time()
+        before = contacts_store.count(account)
+        try:
+            async with open_session(account) as session:
+                driver = EitaaDriver(session)
+                await driver.open()
+                if not await driver.is_logged_in():
+                    await report(cards.error_card(
+                        "save_contacts", account, code="not_logged_in",
+                        detail="account is not logged in"))
+                    return
+
+                # Poll the stop flag between scrolls: collecting a big list takes
+                # minutes and used to ignore Stop completely.
+                contacts = await driver.collect_all_contacts(
+                    should_stop=lambda: job.stop)
+                record = contacts_store.save(account, contacts)
+                await driver._return_to_chat_list()
+                if job.stop:
+                    await report(cards.contacts_saved(
+                        phone, record["count"],
+                        sum(1 for c in record["contacts"] if c.get("peer_id")),
+                        time.time() - start, replaced=before, partial=True))
+                    return
+
+                peer_ids = [c.get("peer_id") for c in record["contacts"]
+                            if c.get("peer_id")]
+                # Harvesting is a bonus for the browser-free engine; it never
+                # affects the saved list.
+                await self._harvest_peers(driver, account, report, peer_ids)
+
+                job.summary = {"contacts": record["count"],
+                               "with_peer_id": len(peer_ids)}
+                await report(cards.contacts_saved(
+                    phone, record["count"], len(peer_ids),
+                    time.time() - start, replaced=before))
+        except Exception as exc:  # noqa: BLE001
+            await report(cards.error_card("save_contacts", account,
+                                          code=type(exc).__name__, detail=str(exc),
+                                          phase="collect", trace_id=job.job_id))
+        finally:
+            self._busy.discard(account)
 
     async def run_contacts(self, account: str, prefix: str, count: int,
                            settings: dict, report: Report, live=None,
                            account_phone: str | None = None) -> Job:
         job = self._new_job("contacts", account)
-        engine = str(settings.get("engine", config.ENGINE))
+        engine = effective_engine(settings)
         phone = account_phone or account
         if engine == "direct":
             job.task = asyncio.create_task(
@@ -281,6 +645,28 @@ class JobManager:
                             contacts, pvs = s.get("contacts"), s.get("pvs")
                     except Exception:  # noqa: BLE001
                         pass
+
+                    # Save the contacts list RIGHT NOW, while the browser is
+                    # already open and logged in. This is the slow part, so doing
+                    # it here means the owner never has to trigger it by hand and
+                    # the first send starts delivering immediately.
+                    t_save = time.time()
+                    try:
+                        collected = await driver.collect_all_contacts(
+                            should_stop=lambda: False)
+                        record = contacts_store.save(account, collected)
+                        await driver._return_to_chat_list()
+                        peer_ids = [c.get("peer_id") for c in record["contacts"]
+                                    if c.get("peer_id")]
+                        await self._harvest_peers(driver, account, report, peer_ids)
+                        await report(cards.contacts_saved(
+                            re.sub(r"\D", "", intl), record["count"],
+                            len(peer_ids), time.time() - t_save))
+                    except Exception as exc:  # noqa: BLE001 - login still succeeded
+                        await report(cards.error_card(
+                            "save_contacts", account, code=type(exc).__name__,
+                            detail=str(exc), phase="on_add",
+                            trace_id="login"))
                     phone_digits = re.sub(r"\D", "", intl)
                     try:
                         from bot.store import store as _store
@@ -289,7 +675,9 @@ class JobManager:
                         engine = _store.engine
                     except Exception:  # noqa: BLE001
                         engine = None
-                    await report(cards.account_added(account, phone_digits, contacts, pvs, engine))
+                    await report(cards.account_added(
+                        account, phone_digits, contacts, pvs, engine,
+                        saved=contacts_store.count(account)))
                 else:
                     await report(cards.card(
                         "⚠️ LOGIN INCOMPLETE",
@@ -306,11 +694,13 @@ class JobManager:
     # ---- send job ----
     async def _send_job(self, job: Job, content: dict, settings: dict,
                         report: Report, recipients: list[str] | None,
-                        live=None, account_phone: str | None = None) -> None:
+                        live=None, account_phone: str | None = None,
+                        agg: AggregateProgress | None = None) -> None:
         account = job.account
         phone = account_phone or account
-        # Sending always uses the proven bridge fast-path; the engine SETTING
-        # governs contact-building. Label the send card accordingly (honest).
+        # This is the BRIDGE job: it drives Eitaa Web (tweb) in Chromium and
+        # uses Eitaa's own send engine via peer_id where possible. The
+        # browser-free path lives in _send_job_direct.
         engine = "bridge"
         kind = "File" if content.get("kind") == "file" else "Text"
         delay = float(settings.get("text_send_delay", config.TEXT_SEND_DELAY))
@@ -329,28 +719,47 @@ class JobManager:
 
                 is_file = content.get("kind") == "file"
                 if recipients is None:
-                    contacts = await driver.collect_all_contacts()
-                    # Keep BOTH title and peer_id: peer_id drives the fast bridge
-                    # send (Eitaa's own engine, no UI), title is the search
-                    # fallback + failure label. Collecting also warms tweb's peer
-                    # cache so peer resolution works for the bridge.
-                    recipient_items = [
-                        (c.get("title", ""), c.get("peer_id"))
-                        for c in contacts if c.get("title")
-                    ]
-                    # collect_all_contacts leaves the Contacts subview open;
-                    # return to the main chat list before we start opening chats.
-                    await driver._return_to_chat_list()
+                    # Prefer the SAVED contacts list: collecting it means
+                    # scrolling Eitaa's virtualized list for minutes, and it was
+                    # being redone on every single send. Saved once, sends start
+                    # immediately.
+                    recipient_items = contacts_store.items(account)
+                    if recipient_items:
+                        print(f"[send] using {len(recipient_items)} saved contacts "
+                              f"(no re-scroll)", flush=True)
+                    else:
+                        contacts = await driver.collect_all_contacts(
+                            should_stop=lambda: job.stop)
+                        # Keep BOTH title and peer_id: peer_id drives the fast
+                        # bridge send (Eitaa's own engine, no UI), title is the
+                        # search fallback + failure label. Collecting also warms
+                        # tweb's peer cache so peer resolution works.
+                        contacts_store.save(account, contacts)
+                        recipient_items = contacts_store.items(account)
+                        # collect_all_contacts leaves the Contacts subview open;
+                        # return to the main chat list before opening chats.
+                        await driver._return_to_chat_list()
+                        await report(cards.contacts_saved(
+                            phone, len(recipient_items),
+                            sum(1 for _, p in recipient_items if p), 0))
                 else:
                     # Externally-supplied recipients are plain names -> no peer_id,
                     # so they use the proven UI flow unchanged.
                     recipient_items = [(name, None) for name in recipients]
                 total = len(recipient_items)
-                if live is not None:
-                    await live.set(cards.live_send(phone, 0, 0, total, 0,
-                                                   status="🟢 Sending", engine=engine, kind=kind))
+                if live is not None or agg is not None:
+                    await self._send_progress(
+                        live, agg, account, phone, sent=0, failed=0, total=total,
+                        elapsed=0, status="🟢 Sending", state="running",
+                        engine=engine, kind=kind, force=True)
                 else:
                     await report(cards.send_started(account, kind, total, delay))
+
+                # Opportunistically remember every peer we resolve here, so the
+                # browser-free engine can reach these same contacts later with
+                # no browser at all.
+                await self._harvest_peers(driver, account, report,
+                                          [p for _, p in recipient_items if p])
 
                 # Pre-warm the right bridge ONCE.
                 file_bridge_ready = False
@@ -461,15 +870,20 @@ class JobManager:
                             account, f"{consecutive_failures} consecutive failures", sent))
                         break
 
-                    if live is not None:
-                        await live.set(cards.live_send(
-                            phone, sent, failed, total, time.time() - start,
-                            status="🟢 Sending", engine=engine, kind=kind))
+                    if live is not None or agg is not None:
+                        await self._send_progress(
+                            live, agg, account, phone, sent=sent, failed=failed,
+                            total=total, elapsed=time.time() - start,
+                            status="🟢 Sending", state="running",
+                            engine=engine, kind=kind)
                     elif i % log_every == 0:
                         await report(cards.send_progress(
                             sent, failed, skipped, total - i, time.time() - start))
 
-                    await asyncio.sleep(delay)
+                    # Interruptible: a stop wakes this immediately instead of
+                    # waiting out the whole delay.
+                    if await job.wait(delay):
+                        break
 
                 # Evidence of which path carried the load (fast bridge vs the UI
                 # fallback) so alternative methods stay observable at a glance.
@@ -479,18 +893,250 @@ class JobManager:
                 job.summary = {"sent": sent, "failed": failed, "skipped": skipped,
                                "total": total, "via_bridge": via_bridge,
                                "via_fallback": via_fallback}
-                if live is not None:
-                    await live.set(cards.live_send(
-                        phone, sent, failed, total, time.time() - start,
-                        status="🛑 Stopped" if job.stop else "✅ Done",
-                        engine=engine, kind=kind), force=True)
+                await self._send_progress(
+                    live, agg, account, phone, sent=sent, failed=failed,
+                    total=total, elapsed=time.time() - start,
+                    status="🛑 Stopped" if job.stop else "✅ Done",
+                    state="stopped" if job.stop else "done",
+                    engine=engine, kind=kind, force=True)
+                # In a multi-account run the combined summary is posted once by
+                # the supervisor, so skip the per-account finish card.
+                if agg is None:
+                    await report(cards.send_finished(
+                        account, kind, sent, failed, skipped, total,
+                        time.time() - start, stopped=job.stop))
+        except Exception as exc:  # noqa: BLE001
+            if agg is not None:
+                await agg.update(account, state="failed", force=True)
+            await report(cards.error_card("send_job", account, code=type(exc).__name__,
+                                          detail=str(exc), trace_id=job.job_id))
+        finally:
+            self._busy.discard(account)
+
+    # ---- peer harvesting (what the browser-free sender needs) ----
+    async def _harvest_peers(self, driver, account: str, report: Report,
+                             peer_ids: list) -> int:
+        """Ask Eitaa's own peer manager for the access_hash of known peers and
+        persist them, so the browser-free engine can reach these contacts.
+
+        Silent on failure: harvesting is a bonus, never a reason to fail a job.
+        """
+        if not peer_ids:
+            return 0
+        try:
+            from direct import peers as peer_store
+            res = await driver.bridge_harvest_peers(peer_ids)
+            if not res.get("ok"):
+                return 0
+            found = res.get("peers") or []
+            if not found:
+                return 0
+            new = peer_store.save_users(account, found)
+            if new:
+                await report(cards.peers_saved(account, new, peer_store.count(account),
+                                               source="contacts list"))
+            return new
+        except Exception as exc:  # noqa: BLE001
+            print(f"[peers] harvest skipped: {type(exc).__name__}: {exc}", flush=True)
+            return 0
+
+    async def _save_imported_peers(self, account: str, report: Report,
+                                   added: list | None) -> int:
+        """Persist the user_id + access_hash of freshly imported contacts.
+
+        `contacts.importContacts` answers with the matched users AND their
+        access_hash. That is exactly the pair the browser-free sender needs, so
+        every import now feeds the peer store instead of only being counted.
+        """
+        rows = [a for a in (added or []) if a and a.get("access_hash")]
+        if not rows:
+            return 0
+        try:
+            from direct import peers as peer_store
+            users = [{"user_id": a.get("user_id"),
+                      "access_hash": a.get("access_hash"),
+                      "label": a.get("phone")} for a in rows]
+            new = peer_store.save_users(account, users)
+            if new:
+                await report(cards.peers_saved(account, new, peer_store.count(account),
+                                               source="importContacts"))
+            return new
+        except Exception as exc:  # noqa: BLE001
+            print(f"[peers] save skipped: {type(exc).__name__}: {exc}", flush=True)
+            return 0
+
+    # ---- send job (DIRECT / browser-free MTProto) ----
+    async def _send_job_direct(self, job: Job, content: dict, settings: dict,
+                               report: Report, recipients: list[str] | None,
+                               live=None, account_phone: str | None = None,
+                               agg: AggregateProgress | None = None) -> None:
+        """Send text or a file to every saved peer with NO browser.
+
+        Uses direct/sender.py (the reusable form of the proven `direct-send` /
+        `direct-send-file` commands) and direct/peers.py for the targets. A file
+        is uploaded ONCE and then re-sent to each recipient, exactly like the
+        browser file bridge does.
+
+        Targets come from the peer store, which is filled while contacts are
+        built or collected. With no saved peers this job cannot run, and says so
+        instead of silently sending nothing.
+        """
+        account = job.account
+        phone = account_phone or account
+        engine = "direct"
+        is_file = content.get("kind") == "file"
+        kind = "File" if is_file else "Text"
+        delay = float(settings.get("text_send_delay", config.TEXT_SEND_DELAY))
+        log_every = int(settings.get("send_log_every", config.SEND_LOG_EVERY))
+        text_body = content.get("text", "")
+        caption_body = content.get("caption", "")
+        where = "direct_send_file" if is_file else "direct_send"
+
+        self._busy.add(account)
+        start = time.time()
+        sent = failed = skipped = 0
+        sender = None
+        try:
+            from direct import peers as peer_store
+            from direct.sender import DirectSender, SenderError
+
+            targets = peer_store.targets(account)
+            if recipients:
+                wanted = {str(r) for r in recipients}
+                targets = [(label, p) for label, p in targets if label in wanted]
+                # Names with no saved peer can't be reached browser-free.
+                skipped = max(0, len(wanted) - len(targets))
+            if not targets:
+                await report(cards.error_card(
+                    where, account, code="no_peers", engine=engine, phase="targets",
+                    trace_id=job.job_id,
+                    detail="no saved peers for this account, so the browser-free "
+                           "engine has nobody to send to. Open this account and tap "
+                           "'📥 Save Contacts' (reads your existing contacts once via "
+                           "the browser), then send again. Or switch the engine to "
+                           "bridge."))
+                if agg is not None:
+                    await agg.update(account, state="no_targets", force=True)
+                return
+
+            try:
+                sender = await asyncio.to_thread(DirectSender, account)
+            except SenderError as exc:
+                await report(cards.error_card(
+                    where, account, code="no_session", engine=engine,
+                    phase="load_context", detail=str(exc), trace_id=job.job_id))
+                if agg is not None:
+                    await agg.update(account, state="failed", force=True)
+                return
+
+            total = len(targets)
+            if live is not None or agg is not None:
+                await self._send_progress(
+                    live, agg, account, phone, sent=0, failed=0, total=total,
+                    elapsed=0, status="🟢 Sending", state="running",
+                    engine=engine, kind=kind, force=True)
+            else:
+                await report(cards.send_started(account, kind, total, delay))
+
+            # Upload the file a single time; every recipient reuses it.
+            if is_file:
+                up = await asyncio.to_thread(sender.upload_file,
+                                             content.get("file_path", ""))
+                if not up.get("ok"):
+                    await report(cards.error_card(
+                        where, account, code="upload_failed", engine=engine,
+                        phase="upload", detail=str(up.get("code")),
+                        trace_id=job.job_id))
+                    if agg is not None:
+                        await agg.update(account, state="failed", force=True)
+                    return
+                print(f"[dsend] uploaded ONCE: {up.get('name')} "
+                      f"{up.get('size')}B in {up.get('parts')} part(s) "
+                      f"-> {up.get('host')}", flush=True)
+
+            consecutive_failures = 0
+            error_cards = 0
+            for i, (label, peer) in enumerate(targets, start=1):
+                if job.stop:
+                    break
+                limited = False
+                try:
+                    if is_file:
+                        res = await asyncio.to_thread(
+                            sender.send_uploaded_file, peer, caption_body)
+                    else:
+                        res = await asyncio.to_thread(
+                            sender.send_text, peer, text_body)
+                except Exception as exc:  # noqa: BLE001
+                    res = {"ok": False, "code": f"{type(exc).__name__}: {exc}"}
+
+                if res.get("ok"):
+                    sent += 1
+                    consecutive_failures = 0
+                else:
+                    detail = str(res.get("code") or "send produced no result")
+                    if res.get("limit") or _is_limit(detail):
+                        await report(cards.restriction_card(
+                            account, f"server: {detail}", sent))
+                        limited = True
+                    else:
+                        failed += 1
+                        consecutive_failures += 1
+                        if error_cards < 12:
+                            await report(cards.error_card(
+                                where, account, target=label, code="send_failed",
+                                detail=detail, engine=engine, trace_id=job.job_id))
+                            error_cards += 1
+                if limited:
+                    if agg is not None:
+                        await agg.update(account, sent=sent, failed=failed,
+                                         total=total, state="limited", force=True)
+                    break
+
+                if consecutive_failures >= config.MAX_CONSECUTIVE_FAILURES:
+                    await report(cards.paused_card(
+                        account, f"{consecutive_failures} consecutive failures", sent))
+                    break
+
+                if live is not None or agg is not None:
+                    await self._send_progress(
+                        live, agg, account, phone, sent=sent, failed=failed,
+                        total=total, elapsed=time.time() - start,
+                        status="🟢 Sending", state="running",
+                        engine=engine, kind=kind)
+                elif i % log_every == 0:
+                    await report(cards.send_progress(
+                        sent, failed, skipped, total - i, time.time() - start))
+
+                if await job.wait(delay):
+                    break
+
+            print(f"[dsend] path=direct sent={sent} failed={failed} of {total} "
+                  f"({'file' if is_file else 'text'})", flush=True)
+            job.summary = {"sent": sent, "failed": failed, "skipped": skipped,
+                           "total": total, "via_direct": sent, "via_fallback": 0}
+            await self._send_progress(
+                live, agg, account, phone, sent=sent, failed=failed, total=total,
+                elapsed=time.time() - start,
+                status="🛑 Stopped" if job.stop else "✅ Done",
+                state="stopped" if job.stop else "done",
+                engine=engine, kind=kind, force=True)
+            if agg is None:
                 await report(cards.send_finished(
                     account, kind, sent, failed, skipped, total,
                     time.time() - start, stopped=job.stop))
         except Exception as exc:  # noqa: BLE001
-            await report(cards.error_card("send_job", account, code=type(exc).__name__,
-                                          detail=str(exc), trace_id=job.job_id))
+            if agg is not None:
+                await agg.update(account, state="failed", force=True)
+            await report(cards.error_card(where, account, code=type(exc).__name__,
+                                          detail=str(exc), engine=engine,
+                                          phase="loop", trace_id=job.job_id))
         finally:
+            if sender is not None:
+                try:
+                    await asyncio.to_thread(sender.close)
+                except Exception:  # noqa: BLE001
+                    pass
             self._busy.discard(account)
 
     # ---- contacts job (bridge / browser) ----
@@ -499,7 +1145,7 @@ class JobManager:
                             account_phone: str | None = None) -> None:
         account = job.account
         phone = account_phone or account
-        engine = str(settings.get("engine", config.ENGINE))
+        engine = effective_engine(settings)
         delay = float(settings.get("contact_create_delay", config.CONTACT_CREATE_DELAY))
         log_every = int(settings.get("send_log_every", config.SEND_LOG_EVERY))
         entries, err = expand_range(prefix, count)
@@ -528,18 +1174,72 @@ class JobManager:
                 else:
                     await report(cards.contacts_started(account, prefix, total, delay))
 
-                if await driver.ensure_contacts_bridge():
+                BATCH = 50
+                done = 0
+                aborted = False
+                plus_prefix = False
+                use_bridge = await driver.ensure_contacts_bridge()
+
+                if use_bridge:
+                    # PROBE FIRST. If the phone format is not the one this Eitaa
+                    # build expects, the server matches nobody and answers
+                    # "imported: 0" with NO error -- which looked exactly like the
+                    # job racing through and building nothing. So try both
+                    # formats on the first batch and report the raw counts.
+                    probe = entries[:min(BATCH, total)]
+                    tried: list[dict] = []
+                    chosen: str | None = None
+                    for plus in (False, True):
+                        r = await driver.bridge_import_contacts(probe, plus_prefix=plus)
+                        fmt = "+98" if plus else "98"
+                        if r.get("limit"):
+                            wait = r.get("wait")
+                            detail = (f"server: {r.get('code')}"
+                                      + (f" (wait {wait}s)" if wait else ""))
+                            await report(cards.restriction_card(account, detail, added))
+                            aborted = True
+                            use_bridge = False
+                            break
+                        if not r.get("ok"):
+                            tried.append({"format": fmt, "batch": len(probe),
+                                          "code": r.get("code")})
+                            continue
+                        imp = int(r.get("imported_count", 0))
+                        tried.append({"format": fmt, "batch": len(probe),
+                                      "imported": imp,
+                                      "users": int(r.get("users_count", 0)),
+                                      "retry": int(r.get("retry_count", 0))})
+                        if imp > 0:
+                            # This format works -> keep its result and use it for
+                            # the remaining batches.
+                            chosen = fmt
+                            plus_prefix = plus
+                            rc = int(r.get("retry_count", 0))
+                            added += imp
+                            not_on += max(0, len(probe) - imp - rc)
+                            error += rc
+                            await self._save_imported_peers(account, report, r.get("added"))
+                            done = len(probe)
+                            break
+                    if not aborted:
+                        await report(cards.contacts_probe(
+                            account, tried, chosen, fallback=chosen is None))
+                        if chosen is None:
+                            # Neither format matched anyone. Rather than report a
+                            # silent zero, fall through to the proven per-number
+                            # UI add flow, which reports a real reason per number.
+                            use_bridge = False
+
+                if use_bridge:
                     # FAST PATH: contacts.importContacts in batches. The server
                     # returns exactly which numbers are on Eitaa (as users WITH
                     # access_hash -> instantly sendable). No per-number UI popup,
                     # no server strain.
-                    BATCH = 50
-                    done = 0
                     while done < total:
                         if job.stop:
                             break
                         batch = entries[done:done + BATCH]
-                        r = await driver.bridge_import_contacts(batch)
+                        r = await driver.bridge_import_contacts(batch, plus_prefix=plus_prefix)
                         if r.get("limit"):
                             wait = r.get("wait")
                             detail = f"server: {r.get('code')}" + (f" (wait {wait}s)" if wait else "")
@@ -551,6 +1251,9 @@ class JobManager:
                             added += imp
                             not_on += max(0, len(batch) - imp - rc)
                             error += rc
+                            # Keep the access_hash of every matched user: this is
+                            # what the browser-free sender needs to reach them.
+                            await self._save_imported_peers(account, report, r.get("added"))
                         else:
                             error += len(batch)
                             await report(cards.error_card(
@@ -565,11 +1268,14 @@ class JobManager:
                         else:
                             await report(cards.contacts_progress(
                                 added, not_on, invalid, error, total - done))
-                        await asyncio.sleep(delay)
-                    print(f"[contacts] path=bridge added={added} not_on={not_on} "
-                          f"error={error} of {total}", flush=True)
-                else:
-                    # FALLBACK: the proven (slower) per-number UI add flow.
+                        if await job.wait(delay):
+                            break
+                    print(f"[contacts] path=bridge format={'+98' if plus_prefix else '98'} "
+                          f"added={added} not_on={not_on} error={error} of {total}",
+                          flush=True)
+                elif not aborted:
+                    # FALLBACK: the proven (slower) per-number UI add flow. Used
+                    # when the bridge is unavailable OR when it matched nobody.
                     await driver.open_contacts_view()
                     for i, entry in enumerate(entries, start=1):
                         if job.stop:
@@ -604,7 +1310,8 @@ class JobManager:
                         elif i % log_every == 0:
                             await report(cards.contacts_progress(
                                 added, not_on, invalid, error, total - i))
-                        await asyncio.sleep(delay)
+                        if await job.wait(delay):
+                            break
 
                     await driver._reset_to_contacts_view()
                     print(f"[contacts] path=UI added={added} not_on={not_on} "
@@ -644,26 +1351,18 @@ class JobManager:
         for e in entries:
             e["first"] = phone
 
-        # Load the browser-free session context from this account's newest capture.
+        # Load the browser-free session context from this account's newest
+        # capture. DirectSender owns that logic (and picks the API host the
+        # browser itself used, instead of a hardcoded one).
         try:
-            from direct import eitaa_tl as E
-            from direct.transport import HttpTransport, wrap_eitaa, unwrap_eitaa
-            import glob as _glob
-            import os as _os
-            cap_dir = config.ARTIFACTS_DIR / "sessions"
-            files = (_glob.glob(str(cap_dir / f"capall_{account}_*.json"))
-                     + _glob.glob(str(cap_dir / f"worker_tx_{account}_*.json")))
-            if not files:
+            from direct.sender import DirectSender, SenderError
+            try:
+                sender = await asyncio.to_thread(DirectSender, account)
+            except SenderError as exc:
                 await report(cards.error_card(
                     "contacts_direct", account, code="no_session", engine="direct",
-                    phase="load_context",
-                    detail="no direct session capture for this account. Run a capture "
-                           "or switch the engine to bridge in Settings."))
+                    phase="load_context", detail=str(exc)))
                 return
-            import json as _json
-            cap = _json.loads(open(max(files, key=_os.path.getmtime), encoding="utf-8").read())
-            ctx = E.extract_context(cap)
-            endpoint = "https://bagher.eitaa.ir/eitaa/"
         except Exception as exc:  # noqa: BLE001
             await report(cards.error_card("contacts_direct", account, code=type(exc).__name__,
                                           detail=str(exc), engine="direct", phase="load_context"))
@@ -678,40 +1377,113 @@ class JobManager:
             if live is not None:
                 await live.set(cards.live_contacts(phone, prefix, 0, 0, total,
                                                    status="🟢 Searching", engine="direct"))
-            tx = HttpTransport(endpoint, timeout=30.0, cookies=None)
             done = 0
+            plus_prefix = True   # expand_range produces "+98..."
+
+            # PROBE FIRST, same as the bridge path: a wrong phone format makes the
+            # server match NOBODY and answer with no error, which is exactly the
+            # "raced through and built nothing" symptom. Try both formats on the
+            # first batch and post the raw counts.
+            probe = entries[:min(BATCH, total)]
+            tried: list[dict] = []
+            chosen: str | None = None
+            for plus in (True, False):
+                r = await asyncio.to_thread(sender.import_contacts, probe, plus)
+                fmt = "+98" if plus else "98"
+                if r.get("limit"):
+                    await report(cards.restriction_card(
+                        account, f"server: {r.get('code')}", added))
+                    chosen = None
+                    tried.append({"format": fmt, "batch": len(probe),
+                                  "code": r.get("code")})
+                    break
+                if not r.get("ok"):
+                    tried.append({"format": fmt, "batch": len(probe),
+                                  "code": r.get("code")})
+                    continue
+                imp = int(r.get("imported", 0))
+                tried.append({"format": fmt, "batch": len(probe), "imported": imp,
+                              "users": len(r.get("imported_ids") or []),
+                              "retry": 0, "parse_ok": r.get("parse_ok"),
+                              "cid": r.get("cid"), "head": r.get("head")})
+                if imp > 0:
+                    chosen = fmt
+                    plus_prefix = plus
+                    added += imp
+                    not_on += max(0, len(probe) - imp)
+                    done = len(probe)
+                    break
+            note = None
+            if chosen is None:
+                note = ("Neither phone format worked, so this job is handing over to "
+                        "the bridge (browser) path, which is proven. Nothing is lost.")
+            await report(cards.contacts_probe(account, tried, chosen, note=note))
+
+            if chosen is None:
+                # LIVE FINDING (2026-07-25): Eitaa answers importContacts on the
+                # browser-free path with a 4-byte, payload-less reply
+                # cid=0xdc252379 -- not contacts.importedContacts, and not any
+                # standard Telegram constructor. Both phone formats got it, so the
+                # format was never the problem: this endpoint simply does not serve
+                # contact import off the browser path.
+                # Rather than leaving the owner with a dead engine, hand the whole
+                # job over to the bridge path, which is proven AND harvests peers.
+                try:
+                    await asyncio.to_thread(sender.close)
+                except Exception:  # noqa: BLE001
+                    pass
+                self._busy.discard(account)
+                print("[contacts] direct import unsupported "
+                      "(reply cid=0xdc252379) -> handing over to bridge", flush=True)
+                await report(cards.card(
+                    "🔄 SWITCHING TO BRIDGE",
+                    [("Account", phone), ("Reason ", "direct import not served")],
+                    footer="Building these contacts through the browser instead. This "
+                           "also harvests peers, so fast sending keeps working."))
+                bridge_settings = dict(settings)
+                bridge_settings["engine"] = "bridge"
+                await self._contacts_job(job, prefix, count, bridge_settings,
+                                         report, live, phone)
+                return
+
             while done < total:
                 if job.stop:
                     break
                 batch = entries[done:done + BATCH]
-                trip = [(e["phone"], e["first"], e["last"]) for e in batch]
-                body = E.import_contacts(trip)
-                try:
-                    resp = tx.post(wrap_eitaa(ctx["token1"], ctx["token2"], body))
-                    rb = unwrap_eitaa(resp)["body"] if resp[:4] == bytes.fromhex("ed77be7a") else resp
-                    verdict = E.classify_response(rb)
-                    if not verdict["ok"]:
-                        error += len(batch)
-                        await report(cards.error_card(
-                            "import_contacts", account, code=str(verdict.get("code") or "err"),
-                            detail=str(verdict.get("message") or verdict.get("note")),
-                            engine="direct", phase="importContacts", trace_id=job.job_id))
-                    else:
-                        imp = E.parse_import_result(rb).get("imported", 0)
-                        added += imp
-                        not_on += max(0, len(batch) - imp)
-                except Exception as exc:  # noqa: BLE001
+                # Blocking HTTPS in a worker thread so the panel stays responsive.
+                r = await asyncio.to_thread(sender.import_contacts, batch, plus_prefix)
+                if r.get("limit"):
+                    await report(cards.restriction_card(
+                        account, f"server: {r.get('code')}", added))
+                    break
+                if not r.get("ok"):
                     error += len(batch)
                     await report(cards.error_card(
-                        "import_contacts", account, code=type(exc).__name__, detail=str(exc),
-                        engine="direct", phase="post", trace_id=job.job_id))
+                        "import_contacts", account, code="import_failed",
+                        detail=str(r.get("code")), engine="direct",
+                        phase="importContacts", trace_id=job.job_id))
+                elif not r.get("parse_ok", True):
+                    # The call succeeded but the reply was not importedContacts,
+                    # so "imported 0" would be a lie. Report it as an error.
+                    error += len(batch)
+                    cid = r.get("cid")
+                    await report(cards.error_card(
+                        "import_contacts", account, code="unexpected_reply",
+                        detail=f"reply cid={('0x%08x' % cid) if cid else '?'} "
+                               f"head={r.get('head')}",
+                        engine="direct", phase="parse_reply", trace_id=job.job_id))
+                    break
+                else:
+                    imp = int(r.get("imported", 0))
+                    added += imp
+                    not_on += max(0, len(batch) - imp)
                 done += len(batch)
                 if live is not None:
                     await live.set(cards.live_contacts(
                         phone, prefix, added, done, total, status="🟢 Searching",
                         engine="direct", not_on=not_on, failed=error))
-                await asyncio.sleep(delay)
-            tx.close()
+                if await job.wait(delay):
+                    break
             print(f"[contacts] path=direct added={added} not_on={not_on} "
                   f"error={error} of {total}", flush=True)
             job.summary = {"added": added, "not_on": not_on, "invalid": 0,
@@ -723,11 +1495,26 @@ class JobManager:
                     engine="direct", not_on=not_on, failed=error), force=True)
             await report(cards.contacts_finished(
                 account, added, not_on, 0, error, total, time.time() - start, stopped=job.stop))
+            if added:
+                # The direct path can count matches but cannot safely read each
+                # user's access_hash (Eitaa's User row constructor is unknown and
+                # guessing it would create silently-wrong peers). Say so, so the
+                # owner knows how to make these contacts fast-sendable.
+                await report(cards.card(
+                    "ℹ️ PEERS NOT HARVESTED",
+                    [("Account", phone), ("Imported", added), ("Engine ", "direct")],
+                    footer="Contacts were created, but the direct engine can't read their "
+                           "access_hash. Run Build Contacts or a Send once with the bridge "
+                           "engine to harvest peers, then fast send can reach them."))
         except Exception as exc:  # noqa: BLE001
             await report(cards.error_card("contacts_direct_job", account, code=type(exc).__name__,
                                           detail=str(exc), engine="direct", phase="loop",
                                           trace_id=job.job_id))
         finally:
+            try:
+                await asyncio.to_thread(sender.close)
+            except Exception:  # noqa: BLE001
+                pass
             self._busy.discard(account)
 
 

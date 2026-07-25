@@ -330,22 +330,50 @@ def extract_media_url(capture) -> str | None:
 
 
 IMPORTED_CONTACTS = 0x77D01C3B
+# importedContact#c13e3c50 user_id:long client_id:long -- standard Telegram row,
+# so the imported user_ids can be read out safely.
+IMPORTED_CONTACT = 0xC13E3C50
 
 
 def parse_import_result(body: bytes) -> dict:
-    """Parse contacts.importedContacts#77d01c3b: the FIRST vector after the
-    constructor is `imported` (the numbers that ARE on Eitaa). Returns
-    {"ok": bool, "imported": int}."""
+    """Parse contacts.importedContacts#77d01c3b.
+
+    The FIRST vector after the constructor is `imported` (the numbers that ARE
+    on Eitaa). Returns {"ok", "imported": int, "imported_ids": [int, ...]}.
+
+    `imported_ids` is best-effort: the row constructor is standard Telegram, so
+    reading the user_ids is safe, but Eitaa's own `User` rows (which carry the
+    access_hash) use an unknown constructor and are deliberately NOT guessed --
+    peers are harvested through the page bridge instead, where tweb has already
+    parsed them. `imported` stays exactly as before for existing callers.
+    """
+    out: dict = {"ok": False, "imported": 0, "imported_ids": []}
     try:
         r = tl.Reader(body)
         cid = r.int(signed=False)
         if cid != IMPORTED_CONTACTS:
-            return {"ok": False, "imported": 0, "cid": cid}
-        vec = r.int(signed=False)          # 0x1cb5c415
+            out["cid"] = cid
+            return out
+        r.int(signed=False)               # vector id 0x1cb5c415
         count = r.int(signed=False)
-        return {"ok": True, "imported": int(count)}
+        out["ok"] = True
+        out["imported"] = int(count)
     except Exception:  # noqa: BLE001
-        return {"ok": False, "imported": 0}
+        return out
+
+    # The user_ids are a bonus: never let a parse slip break the count above.
+    try:
+        ids = []
+        for _ in range(out["imported"]):
+            row_cid = r.int(signed=False)
+            if row_cid != IMPORTED_CONTACT:
+                break
+            ids.append(r.long(signed=False))
+            r.long(signed=True)           # client_id
+        out["imported_ids"] = ids
+    except Exception:  # noqa: BLE001
+        pass
+    return out
 
 
 def find_message_peer(capture, marker: str) -> bytes | None:

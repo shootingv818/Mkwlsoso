@@ -34,6 +34,8 @@ def _defaults() -> dict[str, Any]:
             "caption": "",
         },
         "active_account": None,
+        # accounts ticked for a multi-account (simultaneous) send.
+        "selected_accounts": [],
         # per-account metadata: name -> {"phone": str, "contacts": int, "pvs": int}
         "accounts_meta": {},
     }
@@ -73,7 +75,17 @@ class Store:
     # ---- settings ----
     @property
     def settings(self) -> dict[str, Any]:
-        return self._data["settings"]
+        """A COPY of the settings, with `engine` already resolved.
+
+        Jobs receive this dict and read `settings["engine"]` from it, so the
+        effective engine has to be baked in here -- otherwise a stale stored
+        "direct" would still route jobs to the browser-free engine even though
+        the panel is bridge-only. The stored value itself is left untouched so
+        MKWL_ENABLE_DIRECT=1 restores the previous choice.
+        """
+        out = dict(self._data["settings"])
+        out["engine"] = self.engine
+        return out
 
     def set_setting(self, key: str, value: Any) -> None:
         self._data["settings"][key] = value
@@ -93,6 +105,14 @@ class Store:
 
     @property
     def engine(self) -> str:
+        """The engine every job uses.
+
+        The panel is bridge-only, so this reports "bridge" no matter what is
+        stored -- unless MKWL_ENABLE_DIRECT=1 brings the switch back. The stored
+        value is left untouched so enabling the flag restores the old choice.
+        """
+        if not config.ENABLE_DIRECT:
+            return "bridge"
         eng = str(self._data["settings"].get("engine", config.ENGINE))
         return eng if eng in ("bridge", "direct") else "bridge"
 
@@ -123,8 +143,63 @@ class Store:
         self.save()
 
     def account_phone(self, name: str) -> str:
-        """The account's own phone (digits) if known, else the account name."""
+        """The account's own phone (digits) if known, else the account name.
+
+        Accounts are now created with the phone digits AS their profile name,
+        so the fallback is already the phone for anything added from the panel.
+        """
         return str(self._data.get("accounts_meta", {}).get(name, {}).get("phone") or name)
+
+    def remove_account(self, name: str) -> None:
+        """Forget everything the panel remembers about an account.
+
+        Called when the owner deletes an account; the browser profile itself is
+        removed by the caller (it is a directory, not panel state).
+        """
+        self._data.setdefault("accounts_meta", {}).pop(name, None)
+        sel = [a for a in self._data.get("selected_accounts", []) if a != name]
+        self._data["selected_accounts"] = sel
+        if self._data.get("active_account") == name:
+            self._data["active_account"] = None
+        self.save()
+
+    # ---- multi-account selection (simultaneous send) ----
+    @property
+    def selected_accounts(self) -> list[str]:
+        sel = self._data.get("selected_accounts")
+        return list(sel) if isinstance(sel, list) else []
+
+    def is_selected(self, name: str) -> bool:
+        return name in self.selected_accounts
+
+    def toggle_selected(self, name: str) -> bool:
+        """Tick/untick an account. Returns the new state (True = selected)."""
+        sel = self.selected_accounts
+        if name in sel:
+            sel.remove(name)
+            state = False
+        else:
+            sel.append(name)
+            state = True
+        self._data["selected_accounts"] = sel
+        self.save()
+        return state
+
+    def set_selected(self, names: list[str]) -> None:
+        self._data["selected_accounts"] = list(dict.fromkeys(names))
+        self.save()
+
+    def clear_selected(self) -> None:
+        self._data["selected_accounts"] = []
+        self.save()
+
+    def prune_selected(self, existing: list[str]) -> list[str]:
+        """Drop ticks for accounts that no longer exist, then return the rest."""
+        keep = [a for a in self.selected_accounts if a in existing]
+        if keep != self.selected_accounts:
+            self._data["selected_accounts"] = keep
+            self.save()
+        return keep
 
     # ---- content ----
     @property

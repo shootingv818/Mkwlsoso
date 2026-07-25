@@ -145,11 +145,13 @@ class EitaaDriver:
         rows = await self._snapshot_chats()
         return [r["title"] for r in rows[:limit]]
 
-    async def collect_all_chats(self, max_scrolls: int = 60) -> list[dict]:
+    async def collect_all_chats(self, max_scrolls: int = 60,
+                                should_stop: Callable[[], bool] | None = None) -> list[dict]:
         """Scroll the chat list and collect all rendered chats (deduped).
 
         tweb virtualizes the list, so we scroll the container repeatedly and
-        accumulate rows until no new ones appear.
+        accumulate rows until no new ones appear. `should_stop` is polled between
+        scrolls so the walk can be interrupted.
         """
         seen: dict[str, dict] = {}
         # Find a scrollable chat-list container.
@@ -165,6 +167,9 @@ class EitaaDriver:
 
         stagnant = 0
         for _ in range(max_scrolls):
+            if should_stop is not None and should_stop():
+                print(f"[chats] collection interrupted at {len(seen)} chats", flush=True)
+                break
             for r in await self._snapshot_chats():
                 key = r.get("peer_id") or r.get("title")
                 if key and key not in seen:
@@ -262,8 +267,13 @@ class EitaaDriver:
         except Exception:  # noqa: BLE001
             return []
 
-    async def collect_all_contacts(self, max_scrolls: int = 120) -> list[dict]:
-        """Open the Contacts view and scroll-collect ALL contacts (deduped)."""
+    async def collect_all_contacts(self, max_scrolls: int = 120,
+                                   should_stop: Callable[[], bool] | None = None) -> list[dict]:
+        """Open the Contacts view and scroll-collect ALL contacts (deduped).
+
+        `should_stop` is polled between scrolls so a long collection can be
+        interrupted; whatever was gathered so far is returned.
+        """
         await self.open_contacts_view()
 
         # Find the contacts scroll container.
@@ -279,6 +289,10 @@ class EitaaDriver:
         seen: dict[str, dict] = {}
         stagnant = 0
         for _ in range(max_scrolls):
+            if should_stop is not None and should_stop():
+                print(f"[contacts] collection interrupted at {len(seen)} contacts",
+                      flush=True)
+                break
             for r in await self._snapshot_contacts(container_sel):
                 key = r.get("peer_id") or r.get("title")
                 if key and key not in seen:
@@ -980,10 +994,15 @@ class EitaaDriver:
             return {"contacts": res.get("contacts", -1), "pvs": res.get("pvs", -1)}
         return None
 
+    _CONTACTS_BRIDGE_PROBE = (
+        "() => typeof window.__MKWL_importContacts === 'function'"
+        " && typeof window.__MKWL_harvestPeers === 'function'"
+    )
+
     async def ensure_contacts_bridge(self) -> bool:
-        """Make sure window.__MKWL_importContacts is defined."""
+        """Make sure window.__MKWL_importContacts / __MKWL_harvestPeers exist."""
         try:
-            has = await self.page.evaluate("() => typeof window.__MKWL_importContacts === 'function'")
+            has = await self.page.evaluate(self._CONTACTS_BRIDGE_PROBE)
         except Exception:  # noqa: BLE001
             has = False
         if has:
@@ -992,26 +1011,55 @@ class EitaaDriver:
             return False
         try:
             await self.page.evaluate(_BRIDGE_CONTACTS_SRC)
-            return await self.page.evaluate("() => typeof window.__MKWL_importContacts === 'function'")
+            return await self.page.evaluate(self._CONTACTS_BRIDGE_PROBE)
         except Exception:  # noqa: BLE001
             return False
 
-    async def bridge_import_contacts(self, entries: list[dict]) -> dict:
+    async def bridge_import_contacts(self, entries: list[dict],
+                                     plus_prefix: bool = False) -> dict:
         """Import a batch of phone numbers via contacts.importContacts.
 
         entries: [{"phone": "+98...", "first": "...", "last": "..."}]. Returns
-        {ok, batch, imported_count, retry_count, added:[...]} or, on rate-limit,
+        {ok, batch, imported_count, users_count, retry_count, phone_format,
+        added:[{user_id, access_hash, phone, first}]} or, on rate-limit,
         {ok:False, limit:True, code, wait}. Never raises.
+
+        `plus_prefix` picks the phone format sent to the server ("+98..." vs
+        "98..."); the caller probes both so an empty import is diagnosable
+        instead of silently returning zero contacts.
         """
         if not entries:
             return {"ok": True, "batch": 0, "imported_count": 0, "added": []}
         if not await self.ensure_contacts_bridge():
             return {"ok": False, "code": "contacts bridge unavailable"}
         try:
-            res = await self.page.evaluate("(a) => window.__MKWL_importContacts(a)", entries)
+            res = await self.page.evaluate(
+                "(a) => window.__MKWL_importContacts(a.entries, {plusPrefix: a.plus})",
+                {"entries": entries, "plus": bool(plus_prefix)},
+            )
             return res if isinstance(res, dict) else {"ok": False, "code": "bad import result"}
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "code": f"import evaluate error: {exc}"}
+
+    async def bridge_harvest_peers(self, peer_ids: list) -> dict:
+        """Resolve known peer_ids into {user_id, access_hash} via Eitaa's own
+        peer manager, so the browser-free sender can target them.
+
+        Returns {ok, peers:[{peer_id, user_id, access_hash}], missing:[...]}.
+        Never raises.
+        """
+        if not peer_ids:
+            return {"ok": True, "peers": [], "missing": []}
+        if not await self.ensure_contacts_bridge():
+            return {"ok": False, "code": "contacts bridge unavailable"}
+        try:
+            res = await self.page.evaluate(
+                "(ids) => window.__MKWL_harvestPeers(ids)",
+                [str(p) for p in peer_ids],
+            )
+            return res if isinstance(res, dict) else {"ok": False, "code": "bad harvest result"}
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "code": f"harvest evaluate error: {exc}"}
 
     async def send_text(self, query: str, text: str, verify: bool = True) -> SendResult:
         try:

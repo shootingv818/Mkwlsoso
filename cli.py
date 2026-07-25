@@ -773,45 +773,36 @@ async def cmd_direct_capture_cookies(account: str) -> int:
     return 0
 
 
-def _peers_path(account: str):
-    return config.ARTIFACTS_DIR / "sessions" / f"peers_{account}.json"
-
-
+# The peer store lives in direct/peers.py so the CLI and the Telegram bot share
+# ONE file format and one implementation. Imported lazily inside the helpers so
+# `direct/` stays deletable.
 def _load_peers(account: str) -> dict:
-    from pathlib import Path as _Path
-    p = _peers_path(account)
-    if _Path(p).is_file():
-        try:
-            return json.loads(_Path(p).read_text(encoding="utf-8"))
-        except Exception:  # noqa: BLE001
-            return {}
-    return {}
+    from direct import peers as peer_store
+    return peer_store.load(account)
 
 
 def _save_peer(account: str, name: str, peer: bytes, user_id: int, access_hash: int) -> None:
-    from pathlib import Path as _Path
-    peers = _load_peers(account)
-    peers[name] = {"peer_hex": peer.hex(), "user_id": user_id, "access_hash": access_hash}
-    p = _peers_path(account)
-    _Path(p).parent.mkdir(parents=True, exist_ok=True)
-    _Path(p).write_text(json.dumps(peers, ensure_ascii=False, indent=2), encoding="utf-8")
+    from direct import peers as peer_store
+    peer_store.save_peer(account, name, peer, user_id, access_hash)
 
 
 def _resolve_target_peer(account: str, ctx: dict, to: str | None, label: str):
     """Return (peer_bytes, human_label) for a send target.
     to=None -> Saved Messages (self); otherwise a saved contact peer.
     """
+    from direct import peers as peer_store
+
     if not to or to.lower() in ("self", "saved", "me"):
         return ctx.get("self_peer"), "Saved Messages"
-    peers = _load_peers(account)
-    entry = peers.get(to)
-    if not entry:
+    raw = peer_store.resolve(account, to)
+    if raw is None:
+        known = [k for k in peer_store.load(account) if not k.startswith("id:")]
         print(f"[{label}] no saved peer for '{to}'. capture it first:")
         print(f"[{label}]   DISPLAY=:99 python cli.py direct-capture-peer --account {account} --to \"{to}\"")
-        if peers:
-            print(f"[{label}] known contacts: {list(peers)}")
+        if known:
+            print(f"[{label}] known contacts: {known}")
         return None, to
-    return bytes.fromhex(entry["peer_hex"]), to
+    return raw, to
 
 
 def _direct_rpc(body: bytes, ctx: dict, url: str, label: str, tx=None, cookies: dict | None = None) -> int:

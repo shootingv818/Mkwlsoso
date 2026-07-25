@@ -21,17 +21,109 @@ from telethon.errors import MessageNotModifiedError
 
 from config import config
 from bot import cards
+from bot import contacts_store
 from bot.store import store
 from bot.runner import manager, expand_range
 
 
 # ---- helpers -----------------------------------------------------------
 
+# Every list in the panel is paged at this size so a keyboard never grows huge.
+PAGE_SIZE = 10
+
+
 def list_accounts() -> list[str]:
     d = config.PROFILES_DIR
     if not d.is_dir():
         return []
     return sorted(p.name for p in d.iterdir() if p.is_dir())
+
+
+def account_name_for_phone(phone: str) -> str:
+    """The profile (account) name for a phone number: its digits.
+
+    Accounts used to need a made-up name; now the number is the identity, so the
+    profile directory is simply "989304683887" and every list can show the number
+    with nothing extra to remember. Iranian numbers are normalized to 98XXXXXXXXXX
+    so 0930..., 930... and +98930... all map to the SAME account.
+    """
+    digits = re.sub(r"\D", "", phone or "")
+    if digits.startswith("0098"):
+        digits = digits[4:]
+    elif digits.startswith("98"):
+        digits = digits[2:]
+    elif digits.startswith("0"):
+        digits = digits[1:]
+    if len(digits) == 10 and digits.startswith("9"):
+        return "98" + digits
+    # Not an Iranian mobile: keep the digits as given rather than mangling them.
+    return re.sub(r"\D", "", phone or "")
+
+
+def _page_slice(items: list, page: int) -> tuple[list, int, int]:
+    """(items on this page, clamped page index, page count) for PAGE_SIZE paging."""
+    pages = max(1, (len(items) + PAGE_SIZE - 1) // PAGE_SIZE)
+    page = max(0, min(page, pages - 1))
+    start = page * PAGE_SIZE
+    return items[start:start + PAGE_SIZE], page, pages
+
+
+def _pager_row(prefix: str, page: int, pages: int) -> list:
+    """A ◀ / page / ▶ row for a paged keyboard (only when there's >1 page)."""
+    if pages <= 1:
+        return []
+    prev_page = (page - 1) % pages
+    next_page = (page + 1) % pages
+    return [
+        Button.inline("◀", f"{prefix}{prev_page}".encode()),
+        Button.inline(f"{page + 1}/{pages}", b"noop"),
+        Button.inline("▶", f"{prefix}{next_page}".encode()),
+    ]
+
+
+def delete_account_files(account: str) -> list[str]:
+    """Remove an account's browser profile and its per-account artifacts.
+
+    Returns human labels of what was actually removed, for the log card.
+    """
+    import shutil
+
+    removed: list[str] = []
+    profile = config.profile_dir(account)
+    try:
+        if profile.is_dir():
+            shutil.rmtree(profile)
+            removed.append("browser profile")
+    except OSError as exc:
+        print(f"[account] could not remove profile {profile}: {exc}", flush=True)
+
+    if contacts_store.forget(account):
+        removed.append("saved contacts")
+
+    # Saved peers live in the isolated direct/ store; ask it to clean up.
+    try:
+        from direct import peers as peer_store
+        if peer_store.forget(account):
+            removed.append("saved peers")
+    except Exception:  # noqa: BLE001 - direct/ may have been deleted on purpose
+        pass
+
+    # Captured session + cookies for this account (gitignored artifacts).
+    sessions = config.ARTIFACTS_DIR / "sessions"
+    if sessions.is_dir():
+        patterns = (f"capall_{account}_*.json", f"worker_tx_{account}_*.json",
+                    f"cookies_{account}.json", f"{account}_*.json")
+        hit = False
+        for pattern in patterns:
+            for path in sessions.glob(pattern):
+                try:
+                    path.unlink()
+                    hit = True
+                except OSError:
+                    pass
+        if hit:
+            removed.append("captured session")
+    return removed
 
 
 def is_owner(event) -> bool:
@@ -105,11 +197,15 @@ class LiveCard:
 # ---- keyboards ---------------------------------------------------------
 
 def kb_home():
+    """Home is now four clear sections; Multi Send is one of them, not buried
+    inside the accounts list."""
     return [
         [Button.inline("👤 Accounts", b"menu:accounts"),
-         Button.inline("➕ Add Account", b"acc:add")],
+         Button.inline("🚀 Multi Send", b"multi:open:0")],
         [Button.inline("📝 Content", b"menu:content"),
          Button.inline("⚙ Settings", b"menu:settings")],
+        [Button.inline("➕ Add Account", b"acc:add"),
+         Button.inline("🔄 Refresh", b"menu:home")],
     ]
 
 
@@ -117,15 +213,28 @@ def kb_back():
     return [[Button.inline("⬅ Back", b"menu:home")]]
 
 
-def kb_accounts():
-    rows = []
+def kb_accounts(page: int = 0):
+    """Accounts list, 10 per page. Each row: the number + its saved contact count,
+    with a mark for the active one and for anything currently running."""
+    accounts = list_accounts()
+    shown, page, pages = _page_slice(accounts, page)
     active = store.active_account
-    for acc in list_accounts():
-        mark = "🟢 " if acc == active else "• "
-        label = store.account_phone(acc)
-        rows.append([Button.inline(f"{mark}{label}", f"acc:open:{acc}".encode())])
+    rows = []
+    for acc in shown:
+        if manager.is_busy(acc):
+            mark = "⏳"
+        elif acc == active:
+            mark = "🟢"
+        else:
+            mark = "•"
+        n = contacts_store.count(acc)
+        label = f"{mark} {store.account_phone(acc)}" + (f" · {n:,}" if n else "")
+        rows.append([Button.inline(label, f"acc:open:{acc}".encode())])
+    pager = _pager_row("acc:page:", page, pages)
+    if pager:
+        rows.append(pager)
     rows.append([Button.inline("➕ Add Account", b"acc:add"),
-                 Button.inline("⬅ Back", b"menu:home")])
+                 Button.inline("⬅ Home", b"menu:home")])
     return rows
 
 
@@ -134,12 +243,59 @@ def kb_account_panel(acc: str):
     rows = [
         [Button.inline("📤 Send", b"pnl:send"),
          Button.inline("➕ Build Contacts", b"pnl:contacts")],
-        [Button.inline("🔄 Refresh", b"pnl:refresh")],
+        [Button.inline("📥 Save Contacts", b"pnl:save"),
+         Button.inline("🔄 Refresh", b"pnl:refresh")],
     ]
     if busy:
-        rows.append([Button.inline("⏹ Stop", b"pnl:stop")])
+        # The label escalates: a second press force-stops.
+        label = "❌ Force Stop" if manager.account_stopping(acc) else "⏹ Stop"
+        rows.append([Button.inline(label, b"pnl:stop")])
+    rows.append([Button.inline("🗑 Delete Account", f"acc:del:{acc}".encode())])
     rows.append([Button.inline("👤 Accounts", b"menu:accounts"),
                  Button.inline("⬅ Home", b"menu:home")])
+    return rows
+
+
+def kb_confirm_delete(acc: str):
+    return [
+        [Button.inline("✅ Yes, delete", f"acc:delx:{acc}".encode()),
+         Button.inline("❌ Cancel", f"acc:open:{acc}".encode())],
+    ]
+
+
+def kb_multi(page: int = 0):
+    """Tick several accounts, then send from all of them at once (10 per page).
+
+    Each row shows the account's saved contact count, so it is obvious how much
+    reach a tick actually adds.
+    """
+    accounts = list_accounts()
+    selected = store.prune_selected(accounts)
+    shown, page, pages = _page_slice(accounts, page)
+    rows = []
+    for acc in shown:
+        # Ticked accounts show their position, because the order is the send order.
+        if acc in selected:
+            mark = f"{selected.index(acc) + 1}️⃣"
+        else:
+            mark = "☐"
+        n = contacts_store.count(acc)
+        label = f"{mark} {store.account_phone(acc)} · " + (f"{n:,}" if n else "—")
+        rows.append([Button.inline(label, f"multi:tog:{page}:{acc}".encode())])
+    pager = _pager_row("multi:open:", page, pages)
+    if pager:
+        rows.append(pager)
+    if accounts:
+        if manager.multi_jobs():
+            label = "❌ Force Stop Run" if manager.multi_stopping() else "⏹ Stop Run"
+            rows.append([Button.inline(label, b"multi:stop")])
+        else:
+            reach = sum(contacts_store.count(a) for a in selected)
+            rows.append([Button.inline(
+                f"🚀 Send · {len(selected)} acct · {reach:,} contacts", b"multi:go")])
+        rows.append([Button.inline("☑ All", f"multi:all:{page}".encode()),
+                     Button.inline("🧹 Clear", f"multi:clear:{page}".encode())])
+    rows.append([Button.inline("⬅ Home", b"menu:home")])
     return rows
 
 
@@ -153,34 +309,107 @@ def kb_content():
 
 
 def kb_settings():
-    eng = store.engine
-    other = "direct ⚡" if eng == "bridge" else "bridge 🌉"
-    return [
-        [Button.inline(f"🔧 Engine: {eng}  →  switch to {other}", b"set:engine")],
-        [Button.inline("⏱ Text Send Delay", b"set:textdelay")],
-        [Button.inline("⏱ Contact Create Delay", b"set:contactdelay")],
+    rows = []
+    # The engine switch is hidden: the panel is bridge-only. direct/ is still in
+    # the source and MKWL_ENABLE_DIRECT=1 brings this button back.
+    if config.ENABLE_DIRECT:
+        eng = store.engine
+        other = "direct ⚡" if eng == "bridge" else "bridge 🌉"
+        rows.append([Button.inline(f"🔧 Engine: {eng}  →  switch to {other}",
+                                   b"set:engine")])
+    rows += [
+        [Button.inline("⏱ Send Delay", b"set:textdelay"),
+         Button.inline("⏱ Contact Delay", b"set:contactdelay")],
         [Button.inline("🔢 Log Every N", b"set:logevery")],
         [Button.inline("⬅ Back", b"menu:home")],
     ]
+    return rows
 
 
 # ---- panel renderers ---------------------------------------------------
 
 async def home_text() -> str:
     ping = await server_ping_ms()
-    return cards.panel_home(config.BOT_VERSION, len(list_accounts()),
-                            store.active_account, engine=store.engine, ping_ms=ping)
+    accounts = list_accounts()
+    saved_total = sum(contacts_store.count(a) for a in accounts)
+    return cards.panel_home(
+        config.BOT_VERSION, len(accounts),
+        store.account_phone(store.active_account) if store.active_account else None,
+        engine=store.engine if config.ENABLE_DIRECT else None,
+        ping_ms=ping, contacts=saved_total,
+        running=len(manager.active_jobs()),
+        content=store.content_summary() if store.content.get("kind") else None,
+    )
 
 
 def accounts_text() -> str:
     accs = list_accounts()
+    saved = sum(contacts_store.count(a) for a in accs)
+    running = [a for a in accs if manager.is_busy(a)]
     return cards.card(
         "👤 ACCOUNTS",
-        [("Total ", len(accs)), ("Active", store.account_phone(store.active_account)
-                                  if store.active_account else "none")],
-        footer=("Tap an account's number to open its panel (send + build contacts)."
+        [
+            ("Total   ", len(accs)),
+            ("Contacts", f"{saved:,} saved" if saved else "none saved yet"),
+            ("Active  ", store.account_phone(store.active_account)
+             if store.active_account else "—"),
+            ("Running ", f"⏳ {len(running)}" if running else None),
+        ],
+        footer=("Tap a number to open it. 🟢 active · ⏳ busy · the number after each "
+                "account is its saved contacts."
                 if accs else "No accounts yet. Use ➕ Add Account."),
     )
+
+
+def multi_text() -> str:
+    """The Multi Send section: pick accounts, see the order and combined reach."""
+    accounts = list_accounts()
+    selected = store.prune_selected(accounts)
+    reach = sum(contacts_store.count(a) for a in selected)
+    unsaved = [a for a in selected if not contacts_store.count(a)]
+    running = manager.multi_jobs()
+
+    pairs = [
+        ("Accounts", f"{len(selected)} of {len(accounts)} ticked"),
+        ("Reach   ", f"{reach:,} contacts" if reach else "—"),
+        ("Content ", store.content_summary()),
+        ("Delay   ", f"{store.text_send_delay:g}s between messages"),
+    ]
+    # The tick order IS the send order, so show it.
+    body = None
+    if selected:
+        body = "Order:\n" + "\n".join(
+            f"{i}. {store.account_phone(a)} · "
+            + (f"{contacts_store.count(a):,}" if contacts_store.count(a) else "reads first")
+            for i, a in enumerate(selected, start=1))
+
+    if running:
+        footer = ("🛑 Stopping… press Force Stop Run to cut it off immediately."
+                  if manager.multi_stopping()
+                  else "⏳ A run is in progress. Stop Run ends it after the message "
+                       "in flight; press it twice to force.")
+    elif not accounts:
+        footer = "No accounts yet. Add one first."
+    elif not selected:
+        footer = ("Tick accounts in the order you want them used — the first one "
+                  "ticked sends first.")
+    else:
+        footer = (f"{len(selected)} account(s) run ONE AFTER ANOTHER into a single "
+                  "live card. When one finishes, stops, or its session fails, the "
+                  "next begins.")
+        if unsaved:
+            footer += (f"\n📥 {len(unsaved)} of them have no saved contacts yet; their "
+                       "list is read automatically before sending starts.")
+    return cards.card("🚀 MULTI SEND", pairs, footer=footer, body=body)
+
+
+def peer_count(acc: str) -> int | None:
+    """How many contacts the browser-free sender can reach for this account."""
+    try:
+        from direct import peers as peer_store
+        return peer_store.count(acc)
+    except Exception:  # noqa: BLE001 - direct/ is optional by design
+        return None
 
 
 def account_panel_text(acc: str) -> str:
@@ -188,7 +417,8 @@ def account_panel_text(acc: str) -> str:
     return cards.account_panel(
         acc, store.account_phone(acc),
         meta.get("contacts"), meta.get("pvs"),
-        store.engine, manager.is_busy(acc),
+        store.engine, manager.is_busy(acc), peers=peer_count(acc),
+        saved=contacts_store.count(acc), saved_age=contacts_store.age_hours(acc),
     )
 
 
@@ -198,18 +428,18 @@ def content_text() -> str:
 
 
 def settings_text() -> str:
-    eng = store.engine
+    pairs = [
+        ("Send delay   ", f"{store.text_send_delay:g}s between messages"),
+        ("Contact delay", f"{store.contact_create_delay:g}s between batches"),
+        ("Log every    ", f"{store.send_log_every} sends"),
+    ]
+    if config.ENABLE_DIRECT:
+        pairs.insert(0, ("Engine       ",
+                         "🌉 bridge (browser)" if store.engine == "bridge"
+                         else "⚡ direct (no browser)"))
     return cards.card(
-        "⚙ SETTINGS",
-        [
-            ("Engine            ", "🌉 bridge (browser)" if eng == "bridge"
-             else "⚡ direct (no browser)"),
-            ("Text send delay   ", f"{store.text_send_delay:g}s"),
-            ("Contact create delay", f"{store.contact_create_delay:g}s"),
-            ("Log every         ", store.send_log_every),
-        ],
-        footer="Engine governs contact building (direct = no browser). "
-               "Sending uses the bridge fast-path.",
+        "⚙ SETTINGS", pairs,
+        footer="Longer delays are safer against Eitaa's rate limits.",
     )
 
 
@@ -263,8 +493,13 @@ async def _handle_callback(event):
     if data == "menu:home":
         pending.pop(event.sender_id, None)
         return await show_home(event, edit=True)
+    if data == "noop":
+        return await event.answer()
     if data == "menu:accounts":
-        return await event.edit(accounts_text(), buttons=kb_accounts())
+        return await event.edit(accounts_text(), buttons=kb_accounts(0))
+    if data.startswith("acc:page:"):
+        page = int(data.rsplit(":", 1)[1] or 0)
+        return await event.edit(accounts_text(), buttons=kb_accounts(page))
     if data == "menu:content":
         return await event.edit(content_text(), buttons=kb_content())
     if data == "menu:settings":
@@ -277,19 +512,84 @@ async def _handle_callback(event):
         await event.answer(f"Active: {store.account_phone(acc)}")
         return await event.edit(account_panel_text(acc), buttons=kb_account_panel(acc))
     if data == "acc:add":
-        pending[event.sender_id] = {"step": "login_name"}
+        # No name step: the phone number IS the account, so that's all we ask.
+        pending[event.sender_id] = {"step": "login_phone"}
         return await event.edit(
             cards.card("➕ ADD ACCOUNT",
-                       footer="Send a short name for the account (letters, numbers, "
-                              "underscore — e.g. acc2). Then I'll ask for the phone and "
-                              "the login code, right here. No noVNC needed."),
+                       footer="Send the phone number (e.g. 09304683887). Then I'll ask "
+                              "for the login code, right here. No noVNC needed."),
             buttons=kb_back())
+
+    # ---- delete an account ----
+    if data.startswith("acc:del:"):
+        acc = data.split(":", 2)[2]
+        if manager.is_busy(acc):
+            return await event.answer("Account is busy with a running job.", alert=True)
+        return await event.edit(
+            cards.card("🗑 DELETE ACCOUNT",
+                       [("Phone", store.account_phone(acc))],
+                       footer="This removes its browser profile, saved peers and captured "
+                              "session. You would have to log in again. Are you sure?"),
+            buttons=kb_confirm_delete(acc))
+    if data.startswith("acc:delx:"):
+        acc = data.split(":", 2)[2]
+        if manager.is_busy(acc):
+            return await event.answer("Account is busy with a running job.", alert=True)
+        phone = store.account_phone(acc)
+        removed = delete_account_files(acc)
+        store.remove_account(acc)
+        await event.answer("Deleted.")
+        await report(cards.account_deleted(phone, removed))
+        return await event.edit(accounts_text(), buttons=kb_accounts(0))
+
+    # ---- multi-account send ----
+    if data.startswith("multi:open:"):
+        page = int(data.rsplit(":", 1)[1] or 0)
+        return await event.edit(multi_text(), buttons=kb_multi(page))
+    if data.startswith("multi:tog:"):
+        _, _, page_s, acc = data.split(":", 3)
+        store.toggle_selected(acc)
+        return await event.edit(multi_text(), buttons=kb_multi(int(page_s or 0)))
+    if data.startswith("multi:clear:"):
+        page = int(data.rsplit(":", 1)[1] or 0)
+        store.clear_selected()
+        return await event.edit(multi_text(), buttons=kb_multi(page))
+    if data.startswith("multi:all:"):
+        page = int(data.rsplit(":", 1)[1] or 0)
+        store.set_selected(list_accounts())
+        return await event.edit(multi_text(), buttons=kb_multi(page))
+    if data == "multi:go":
+        return await _start_multi_send(event)
+    if data == "multi:stop":
+        force = manager.multi_stopping()
+        n = manager.stop_multi(force=force)
+        if not n:
+            await event.answer("No multi-account run is active.", alert=True)
+        elif force:
+            await event.answer("Force-stopped the whole run.")
+        else:
+            await event.answer("Stopping now — press again to force.")
+        return await event.edit(multi_text(), buttons=kb_multi(0))
 
     # ---- per-account panel actions (operate on active) ----
     if data == "pnl:refresh":
         if not active:
             return await event.answer("No active account.", alert=True)
         return await _refresh_account(event, active)
+    if data == "pnl:save":
+        if not active:
+            return await event.answer("Select an account first.", alert=True)
+        if manager.is_busy(active):
+            return await event.answer("Account already has a running job.", alert=True)
+        await manager.run_save_contacts(active, report, store.account_phone(active))
+        await event.answer("Saving contacts…")
+        return await event.edit(
+            cards.card("📥 SAVE CONTACTS",
+                       [("Phone", store.account_phone(active))],
+                       footer="Reading this account's full contacts list once and saving "
+                              "it. This is the slow part — a 📥 CONTACTS SAVED card will "
+                              "follow, and after that every send starts instantly."),
+            buttons=kb_back())
     if data == "pnl:send":
         return await _start_send(event)
     if data == "pnl:contacts":
@@ -304,8 +604,16 @@ async def _handle_callback(event):
             buttons=kb_back())
     if data == "pnl:stop":
         if active:
-            manager.stop_account(active)
-            await event.answer("Stop requested.")
+            # First press: stop cleanly (every wait wakes at once, so this is
+            # immediate unless a message is mid-flight). Press again to kill it.
+            force = manager.account_stopping(active)
+            n = manager.stop_account(active, force=force)
+            if not n:
+                await event.answer("Nothing is running on this account.", alert=True)
+            elif force:
+                await event.answer("Force-stopped.")
+            else:
+                await event.answer("Stopping now — press again to force.")
         return await event.edit(account_panel_text(active), buttons=kb_account_panel(active))
 
     # ---- content ----
@@ -373,7 +681,7 @@ async def _refresh_account(event, acc: str):
                 store.set_account_meta(acc, contacts=s.get("contacts"), pvs=s.get("pvs"))
                 await report(cards.account_panel(
                     acc, store.account_phone(acc), s.get("contacts"), s.get("pvs"),
-                    store.engine, False))
+                    store.engine, False, peers=peer_count(acc)))
         except Exception as exc:  # noqa: BLE001
             await report(cards.error_card("stats", acc, code=type(exc).__name__,
                                           detail=str(exc), phase="refresh"))
@@ -394,6 +702,61 @@ async def _start_send(event):
                            live=live, account_phone=store.account_phone(active))
     await event.answer("Send job started.")
     await event.edit(account_panel_text(active), buttons=kb_account_panel(active))
+
+
+async def _start_multi_send(event):
+    """Send from every ticked account at once, into ONE shared live card."""
+    accounts = list_accounts()
+    selected = store.prune_selected(accounts)
+    if not selected:
+        return await event.answer("Tick at least one account first.", alert=True)
+    if store.content.get("kind") not in ("text", "file"):
+        return await event.answer("Set content first (Content menu).", alert=True)
+    busy = [a for a in selected if manager.is_busy(a)]
+    free = [a for a in selected if not manager.is_busy(a)]
+    if not free:
+        return await event.answer("All selected accounts already have a running job.",
+                                  alert=True)
+    # With the browser-free engine (only reachable when explicitly enabled) an
+    # account without saved peers can send NOTHING. Say so BEFORE starting.
+    no_peers = []
+    if store.engine == "direct":
+        no_peers = [a for a in free if not (peer_count(a) or 0)]
+        if len(no_peers) == len(free):
+            return await event.answer(
+                "None of the selected accounts have saved peers. Tap 'Save Contacts' "
+                "on each first.", alert=True)
+
+    live = LiveCard(config.report_to())
+    # Selection ORDER matters: the first account ticked sends first.
+    pairs = [(a, store.account_phone(a)) for a in free]
+    reach = sum(contacts_store.count(a) for a in free)
+    await manager.run_send_multi(pairs, dict(store.content),
+                                 dict(store.settings), report, live=live)
+    await event.answer(f"Queued {len(pairs)} account(s).")
+    notes = ["Accounts run ONE AT A TIME in the order below. When one finishes "
+             "(or stops, or its session fails) the next one starts."]
+    if busy:
+        notes.append("Skipped (already busy): "
+                     + ", ".join(store.account_phone(a) for a in busy))
+    unsaved = [a for a in free if not contacts_store.count(a)]
+    if unsaved:
+        notes.append(f"📥 {len(unsaved)} account(s) have no saved contacts yet, so "
+                     "their list is read first. A queue card with the grand total "
+                     "follows.")
+    if no_peers:
+        notes.append(f"🚧 {len(no_peers)} account(s) have no saved peers and will send "
+                     "nothing: " + ", ".join(store.account_phone(a) for a in no_peers))
+    order = "\n".join(f"{i}. {p}" for i, (_, p) in enumerate(pairs, start=1))
+    await event.edit(
+        cards.card("🚀 MULTI SEND QUEUED",
+                   [("Accounts", len(pairs)),
+                    ("Reach   ", f"{reach:,} contacts" if reach else "reading…"),
+                    ("Content ", store.content_summary())],
+                   body="Order:\n" + order,
+                   footer="\n".join(notes)),
+        buttons=[[Button.inline("⏹ Stop Run", b"multi:stop")],
+                 [Button.inline("⬅ Home", b"menu:home")]])
 
 
 @bot.on(events.NewMessage)
@@ -429,35 +792,28 @@ async def _conversation(event):
         pending.pop(event.sender_id, None)
         return await event.respond(content_text(), buttons=kb_content())
 
-    if step == "login_name":
-        name = text
-        if not re.fullmatch(r"[A-Za-z0-9_]{1,32}", name or ""):
-            return await event.respond(
-                "Send a valid name: letters, numbers, underscore (max 32). e.g. acc2")
-        if manager.is_busy(name):
-            return await event.respond("That account already has a running job. Try again later.")
-        st["login_account"] = name
-        st["step"] = "login_phone"
-        return await event.respond(
-            cards.card("➕ ADD ACCOUNT", [("Account", name)],
-                       footer="Now send the phone number (e.g. 0930... or 98930...)."),
-            buttons=kb_back())
-
     if step == "login_phone":
         phone = re.sub(r"[^\d+]", "", text or "")
         if len(re.sub(r"\D", "", phone)) < 10:
             return await event.respond("Send a valid phone number (e.g. 09304683887).")
-        name = st.get("login_account")
-        if not name:
+        # The phone number IS the account: no separate name to invent or remember.
+        name = account_name_for_phone(phone)
+        if name in list_accounts():
             pending.pop(event.sender_id, None)
-            return await event.respond("Lost the account name; tap Add Account again.")
+            return await event.respond(
+                cards.card("➕ ADD ACCOUNT", [("Phone", store.account_phone(name))],
+                           footer="This number is already added. Open it from Accounts."),
+                buttons=kb_back())
+        if manager.is_busy(name):
+            return await event.respond("That account already has a running job. Try again later.")
         started = await manager.start_bridge_login(name, phone, report)
         if not started:
             pending.pop(event.sender_id, None)
             return await event.respond("That account is busy right now. Try again later.")
+        st["login_account"] = name
         st["step"] = "login_code"
         return await event.respond(
-            cards.card("➕ ADD ACCOUNT", [("Account", name), ("Status", "requesting code…")],
+            cards.card("➕ ADD ACCOUNT", [("Phone ", name), ("Status", "requesting code…")],
                        footer="Wait for the '📩 CODE SENT' card, then send the code here (digits only)."),
             buttons=kb_back())
 
