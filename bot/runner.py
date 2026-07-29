@@ -920,6 +920,7 @@ class JobManager:
         except (TypeError, ValueError):
             conc = 1
         conc = max(1, min(10, conc))
+        stop_on_limit = bool(settings.get("stop_on_limit", config.STOP_ON_LIMIT))
         self._busy.add(account)
         start = time.time()
         sent = failed = skipped = 0
@@ -1126,6 +1127,8 @@ class JobManager:
                 via_fallback = 0    # sent through the proven UI path
                 reinits = 0         # times the in-page upload state was rebuilt
                 ui_file_sends = 0   # file sends that had to re-upload per recipient
+                limit_hits = 0      # server restrictions seen (PEER_FLOOD etc.)
+                limit_cards = 0     # restriction cards posted (capped, not spam)
                 waited_for_server = 0.0  # seconds spent honouring FLOOD_WAIT
                 where = "send_file" if is_file else "send_text"
                 text_body = content.get("text", "")
@@ -1224,9 +1227,27 @@ class JobManager:
 
                             if b is not None:
                                 if b.get("limit"):
-                                    await report(cards.restriction_card(
-                                        account, f"server: {b.get('code')}", sent))
-                                    limited = True
+                                    # The server refused this recipient. Whether
+                                    # that ends the run is the owner's choice:
+                                    # stop_on_limit=True pauses (safe, because
+                                    # the server usually refuses everyone),
+                                    # False just reports and carries on.
+                                    limit_hits += 1
+                                    if stop_on_limit:
+                                        await report(cards.restriction_card(
+                                            account, f"server: {b.get('code')}", sent))
+                                        limited = True
+                                    else:
+                                        if limit_cards < 3:
+                                            await report(cards.restriction_card(
+                                                account, f"server: {b.get('code')}",
+                                                sent, paused=False))
+                                            limit_cards += 1
+                                        failed += 1
+                                        consecutive_failures += 1
+                                        res = None
+                                        b = None
+                                        continue
                                 elif b.get("ok"):
                                     used_bridge = True
                                     res = SendResult(
@@ -1297,8 +1318,15 @@ class JobManager:
                                         detail=detail, trace_id=job.job_id))
                                     error_cards += 1
                                 if _is_limit(detail):
-                                    await report(cards.restriction_card(account, detail, sent))
-                                    limited = True
+                                    limit_hits += 1
+                                    if stop_on_limit:
+                                        await report(cards.restriction_card(
+                                            account, detail, sent))
+                                        limited = True
+                                    elif limit_cards < 3:
+                                        await report(cards.restriction_card(
+                                            account, detail, sent, paused=False))
+                                        limit_cards += 1
                         except Exception as exc:  # noqa: BLE001
                             failed += 1
                             consecutive_failures += 1
@@ -1380,7 +1408,7 @@ class JobManager:
                 print(f"[send] path summary: via_bridge={via_bridge} "
                       f"via_fallback={via_fallback} reinits={reinits} sent={sent} "
                       f"failed={failed} skipped={skipped} conc={conc} "
-                      f"server_wait={int(waited_for_server)}s "
+                      f"limits={limit_hits} server_wait={int(waited_for_server)}s "
                       f"({'file' if is_file else 'text'})", flush=True)
                 job.summary = {"sent": sent, "failed": failed, "skipped": skipped,
                                "total": total, "via_bridge": via_bridge,

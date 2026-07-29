@@ -78,6 +78,12 @@ class Config:
     # A server-declared wait (FLOOD_WAIT_n) up to this many seconds is honoured
     # and the run continues; anything longer stops the run and reports it.
     MAX_FLOOD_WAIT: int = _get_int("MAX_FLOOD_WAIT", 90)
+    # What to do when the server reports a restriction it gave no wait time for
+    # (PEER_FLOOD, spam warnings...). True = pause the run, which is the safe
+    # default: the server keeps rejecting every recipient, so continuing just
+    # collects errors. False = only post a card and keep going, leaving the
+    # decision to stop with the owner.
+    STOP_ON_LIMIT: bool = _get_bool("MKWL_STOP_ON_LIMIT", True)
 
     JOBS_DIR: Path = Path(os.environ.get("ARTIFACTS_DIR", "./artifacts")) / "jobs"
 

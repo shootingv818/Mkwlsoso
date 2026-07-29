@@ -629,16 +629,35 @@ def error_card(where: str, account: str | None = None, target: str | None = None
     )
 
 
-def restriction_card(account: str, reason: str, sent_before: int) -> str:
+def restriction_card(account: str, reason: str, sent_before: int,
+                     paused: bool = True) -> str:
+    """The server refused a recipient (PEER_FLOOD, spam warning, ...).
+
+    `paused=False` is used when the owner turned off "Pause on limit": the card
+    is still posted so the restriction is never hidden, but the run continues and
+    only Stop ends it.
+    """
+    peer_flood = "PEER_FLOOD" in str(reason).upper()
+    footer = None
+    if peer_flood:
+        footer = ("PEER_FLOOD is not a timed wait: Eitaa is refusing messages from "
+                  "this account to people it is not in two-way contact with. Waiting "
+                  "does not clear it — it usually needs a few quiet days, and it hits "
+                  "new accounts fastest.")
+    if not paused:
+        footer = ((footer + " ") if footer else "") + \
+                 "Pause on limit is OFF, so the run continues. Use Stop to end it."
     return card(
         "🚫 LIMIT DETECTED",
         [
             ("Account    ", account),
             ("Reason     ", sanitize(reason, 200)),
             ("Sent before", sent_before),
-            ("Action     ", "job auto-paused"),
+            ("Action     ", "job auto-paused" if paused
+                            else "continuing (pause on limit is off)"),
             ("Time       ", now_hms()),
         ],
+        footer=footer,
     )
 
 

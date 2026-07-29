@@ -328,6 +328,9 @@ def kb_settings():
     rows += [
         [Button.inline("⏱ Send Delay", b"set:textdelay"),
          Button.inline("⚡ Concurrency", b"set:concurrency")],
+        [Button.inline(
+            f"🚫 Pause on limit: {'ON' if store.stop_on_limit else 'OFF'}",
+            b"set:stoponlimit")],
         [Button.inline("⏱ Contact Delay", b"set:contactdelay"),
          Button.inline("🔢 Log Every N", b"set:logevery")],
         [Button.inline("⬅ Back", b"menu:home")],
@@ -447,6 +450,8 @@ def settings_text() -> str:
     pairs = [
         ("Send delay   ", f"{store.text_send_delay:g}s between messages"),
         ("Concurrency  ", f"{conc} at a time" + (" (sequential)" if conc == 1 else "")),
+        ("On limit     ", "pause the run" if store.stop_on_limit
+                          else "keep going, only report"),
         ("Contact delay", f"{store.contact_create_delay:g}s between batches"),
         ("Log every    ", f"{store.send_log_every} sends"),
     ]
@@ -701,6 +706,10 @@ async def _handle_callback(event):
         return await event.edit(
             cards.card("⏱ CONTACT CREATE DELAY", [("Current", f"{store.contact_create_delay:g}s")],
                        footer="Send a number of seconds (e.g. 0.2 for fast)."), buttons=kb_back())
+    if data == "set:stoponlimit":
+        now = store.toggle_stop_on_limit()
+        await event.answer("Pause on limit: " + ("ON" if now else "OFF"))
+        return await event.edit(settings_text(), buttons=kb_settings())
     if data == "set:concurrency":
         pending[event.sender_id] = {"step": "await_concurrency"}
         return await event.edit(

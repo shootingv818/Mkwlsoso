@@ -316,6 +316,50 @@ def test_short_flood_wait_is_obeyed():
           not any("RESTRICT" in x.upper() for x in lines), lines[:2])
 
 
+def test_peer_flood_can_be_configured_to_continue():
+    print("PEER_FLOOD: pause by default, keep going when the owner says so")
+    base = {"text_send_delay": 0, "send_log_every": 999, "send_concurrency": 1}
+
+    # Default: the run pauses on the restriction.
+    progress_store.clear("a_pf_stop")
+    d = FakeDriver(flood_at=2, flood_code="PEER_FLOOD")
+    job, lines, d = asyncio.run(run_send(
+        d, account="a_pf_stop", contacts=peers(10),
+        content={"kind": "text", "text": "pf"}, settings=dict(base)))
+    check("paused by default", job.summary.get("sent", 0) < 10, job.summary)
+    check("said it auto-paused",
+          any("auto-paused" in x for x in lines), lines[-2:])
+    check("explained PEER_FLOOD is not a wait",
+          any("not a timed wait" in x for x in lines), lines[-2:])
+
+    # Owner turned the pause off: every recipient is attempted, restrictions are
+    # reported (capped) and only Stop ends the run.
+    progress_store.clear("a_pf_go")
+
+    class AlwaysFlood(FakeDriver):
+        async def _send(self, peer_id):
+            self.calls["bridge"] += 1
+            await asyncio.sleep(0)
+            if self.calls["bridge"] % 2 == 0:
+                return {"ok": False, "limit": True, "code": "PEER_FLOOD"}
+            return {"ok": True, "method": "sendText", "msg_id": self.calls["bridge"]}
+
+    d2 = AlwaysFlood()
+    job2, lines2, d2 = asyncio.run(run_send(
+        d2, account="a_pf_go", contacts=peers(10),
+        content={"kind": "text", "text": "pf2"},
+        settings=dict(base, stop_on_limit=False)))
+    check("every recipient was attempted", d2.calls["bridge"] == 10, d2.calls)
+    check("the good half was delivered", job2.summary.get("sent") == 5, job2.summary)
+    check("the refused half counted as failed", job2.summary.get("failed") == 5,
+          job2.summary)
+    cards_posted = sum(1 for x in lines2 if "LIMIT DETECTED" in x)
+    check(f"restriction cards are capped ({cards_posted})", 1 <= cards_posted <= 3,
+          cards_posted)
+    check("the card says the run continues",
+          any("pause on limit is off" in x.lower() for x in lines2), lines2[:3])
+
+
 def test_long_flood_wait_stops():
     print("long server wait stops the run")
     progress_store.clear("a_flood_l")
@@ -654,6 +698,7 @@ def main() -> int:
                test_concurrency_is_faster, test_lost_upload_is_rebuilt,
                test_dead_upload_stops_instead_of_crawling,
                test_short_flood_wait_is_obeyed, test_long_flood_wait_stops,
+               test_peer_flood_can_be_configured_to_continue,
                test_resume_skips_delivered, test_partial_resume,
                test_zero_recipients_uploads_nothing, test_failure_brake,
                test_ui_fallback_when_no_peer_id, test_stop_is_immediate,

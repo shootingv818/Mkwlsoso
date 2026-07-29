@@ -24,6 +24,7 @@ def _defaults() -> dict[str, Any]:
             "contact_create_delay": float(config.CONTACT_CREATE_DELAY),
             "send_log_every": int(config.SEND_LOG_EVERY),
             "send_concurrency": int(config.SEND_CONCURRENCY),
+            "stop_on_limit": bool(config.STOP_ON_LIMIT),
             # "bridge" (browser/tweb) or "direct" (browser-free MTProto).
             "engine": str(config.ENGINE),
         },
@@ -104,6 +105,16 @@ class Store:
     @property
     def send_log_every(self) -> int:
         return int(self._data["settings"].get("send_log_every", config.SEND_LOG_EVERY))
+
+    @property
+    def stop_on_limit(self) -> bool:
+        """Whether a server restriction (e.g. PEER_FLOOD) pauses the run."""
+        return bool(self._data["settings"].get("stop_on_limit", config.STOP_ON_LIMIT))
+
+    def toggle_stop_on_limit(self) -> bool:
+        new = not self.stop_on_limit
+        self.set_setting("stop_on_limit", new)
+        return new
 
     @property
     def send_concurrency(self) -> int:
