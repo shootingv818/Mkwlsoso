@@ -243,8 +243,10 @@ def kb_account_panel(acc: str):
     rows = [
         [Button.inline("📤 Send", b"pnl:send"),
          Button.inline("➕ Build Contacts", b"pnl:contacts")],
-        [Button.inline("📥 Save Contacts", b"pnl:save"),
-         Button.inline("🔄 Refresh", b"pnl:refresh")],
+        # Contacts are saved automatically at login; this only re-reads them
+        # when the account has gained new contacts since.
+        [Button.inline("🔄 Update Contacts", b"pnl:save"),
+         Button.inline("♻️ Refresh Panel", b"pnl:refresh")],
     ]
     if busy:
         # The label escalates: a second press force-stops.
@@ -582,13 +584,13 @@ async def _handle_callback(event):
         if manager.is_busy(active):
             return await event.answer("Account already has a running job.", alert=True)
         await manager.run_save_contacts(active, report, store.account_phone(active))
-        await event.answer("Saving contacts…")
+        await event.answer("Updating contacts…")
         return await event.edit(
-            cards.card("📥 SAVE CONTACTS",
+            cards.card("🔄 UPDATE CONTACTS",
                        [("Phone", store.account_phone(active))],
-                       footer="Reading this account's full contacts list once and saving "
-                              "it. This is the slow part — a 📥 CONTACTS SAVED card will "
-                              "follow, and after that every send starts instantly."),
+                       footer="Re-reading this account's contact list from Eitaa. "
+                              "Contacts are already saved automatically at login, so "
+                              "this is only needed after new contacts were added."),
             buttons=kb_back())
     if data == "pnl:send":
         return await _start_send(event)
@@ -724,8 +726,8 @@ async def _start_multi_send(event):
         no_peers = [a for a in free if not (peer_count(a) or 0)]
         if len(no_peers) == len(free):
             return await event.answer(
-                "None of the selected accounts have saved peers. Tap 'Save Contacts' "
-                "on each first.", alert=True)
+                "None of the selected accounts have saved peers. Tap "
+                "'🔄 Update Contacts' on each first.", alert=True)
 
     live = LiveCard(config.report_to())
     # Selection ORDER matters: the first account ticked sends first.

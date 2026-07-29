@@ -462,6 +462,44 @@ class JobManager:
             self._save_contacts_job(job, report, account_phone or account))
         return job
 
+    async def _collect_contacts(self, driver, account: str,
+                                should_stop: Callable[[], bool] | None = None,
+                                report: Report | None = None) -> tuple[list[dict], str]:
+        """Get an account's contacts the fast way, with the old way as backup.
+
+        Returns (contacts, source). `source` is "api" or "scroll".
+
+        The API path asks Eitaa for the whole contact list in one call and gets
+        id + access_hash for every entry. Measured live on one account: 1,094
+        contacts in 4 seconds, versus the DOM scroll which was still unfinished
+        after 10 minutes AND is capped by max_scrolls, so long lists came back
+        truncated (that is what produced "saved 1,190" for an account Eitaa
+        reported 6,436 entries for).
+        """
+        try:
+            res = await driver.bridge_contacts_list()
+        except Exception:  # noqa: BLE001
+            res = None
+        if res and res.get("ok") and res.get("contacts"):
+            items = res["contacts"]
+            print(f"[contacts] api list: {len(items)} contacts "
+                  f"(skipped {res.get('skipped', 0)} of {res.get('raw', 0)})", flush=True)
+            return items, "api"
+
+        code = (res or {}).get("code") if isinstance(res, dict) else "bridge_unavailable"
+        print(f"[contacts] api list unavailable ({code}); falling back to the "
+              f"slow DOM scroll", flush=True)
+        if report is not None:
+            await report(cards.error_card(
+                "contacts_list", account, code="api_list_unavailable",
+                detail=f"{code} - using the slow scroll fallback for this run"))
+        contacts = await driver.collect_all_contacts(should_stop=should_stop)
+        try:
+            await driver._return_to_chat_list()
+        except Exception:  # noqa: BLE001
+            pass
+        return contacts, "scroll"
+
     async def _save_contacts_job(self, job: Job, report: Report, phone: str) -> None:
         account = job.account
         self._busy.add(account)
@@ -477,13 +515,12 @@ class JobManager:
                         detail="account is not logged in"))
                     return
 
-                # Poll the stop flag between scrolls: collecting a big list takes
-                # minutes and used to ignore Stop completely.
-                contacts = await driver.collect_all_contacts(
-                    should_stop=lambda: job.stop)
+                contacts, source = await self._collect_contacts(
+                    driver, account, should_stop=lambda: job.stop, report=report)
                 record = contacts_store.save(account, contacts)
-                await driver._return_to_chat_list()
-                if job.stop:
+                print(f"[contacts] saved {record['count']} for {account} "
+                      f"(source={source})", flush=True)
+                if job.stop and source == "scroll":
                     await report(cards.contacts_saved(
                         phone, record["count"],
                         sum(1 for c in record["contacts"] if c.get("peer_id")),
@@ -637,27 +674,23 @@ class JobManager:
                     logged = await driver.is_logged_in()
 
                 if logged:
-                    # On-add stats: fetch contacts + chats and persist account meta.
-                    contacts = pvs = None
-                    try:
-                        s = await driver.bridge_stats()
-                        if s:
-                            contacts, pvs = s.get("contacts"), s.get("pvs")
-                    except Exception:  # noqa: BLE001
-                        pass
-
                     # Save the contacts list RIGHT NOW, while the browser is
-                    # already open and logged in. This is the slow part, so doing
-                    # it here means the owner never has to trigger it by hand and
-                    # the first send starts delivering immediately.
+                    # already open and logged in, so the owner never has to
+                    # trigger it by hand and the first send starts delivering
+                    # immediately.
+                    contacts = pvs = None
                     t_save = time.time()
                     try:
-                        collected = await driver.collect_all_contacts(
-                            should_stop=lambda: False)
+                        collected, source = await self._collect_contacts(
+                            driver, account, report=report)
                         record = contacts_store.save(account, collected)
-                        await driver._return_to_chat_list()
                         peer_ids = [c.get("peer_id") for c in record["contacts"]
                                     if c.get("peer_id")]
+                        print(f"[contacts] saved {record['count']} at login for "
+                              f"{account} (source={source})", flush=True)
+                        # The saved list IS the account's contact count, so no
+                        # extra stats call is needed for it.
+                        contacts = record["count"]
                         await self._harvest_peers(driver, account, report, peer_ids)
                         await report(cards.contacts_saved(
                             re.sub(r"\D", "", intl), record["count"],
@@ -667,6 +700,15 @@ class JobManager:
                             "save_contacts", account, code=type(exc).__name__,
                             detail=str(exc), phase="on_add",
                             trace_id="login"))
+                    if contacts is None:
+                        # Contacts-only stats: the PV count pages getDialogs and
+                        # cost 98s live, which is not worth blocking a login for.
+                        try:
+                            s = await driver.bridge_stats(with_pvs=False)
+                            if s:
+                                contacts = s.get("contacts")
+                        except Exception:  # noqa: BLE001
+                            pass
                     phone_digits = re.sub(r"\D", "", intl)
                     try:
                         from bot.store import store as _store
@@ -726,27 +768,39 @@ class JobManager:
                     recipient_items = contacts_store.items(account)
                     if recipient_items:
                         print(f"[send] using {len(recipient_items)} saved contacts "
-                              f"(no re-scroll)", flush=True)
+                              f"(no re-collect)", flush=True)
                     else:
-                        contacts = await driver.collect_all_contacts(
-                            should_stop=lambda: job.stop)
                         # Keep BOTH title and peer_id: peer_id drives the fast
                         # bridge send (Eitaa's own engine, no UI), title is the
-                        # search fallback + failure label. Collecting also warms
-                        # tweb's peer cache so peer resolution works.
+                        # search fallback + failure label.
+                        t_col = time.time()
+                        contacts, source = await self._collect_contacts(
+                            driver, account, should_stop=lambda: job.stop,
+                            report=report)
                         contacts_store.save(account, contacts)
                         recipient_items = contacts_store.items(account)
-                        # collect_all_contacts leaves the Contacts subview open;
-                        # return to the main chat list before opening chats.
-                        await driver._return_to_chat_list()
                         await report(cards.contacts_saved(
                             phone, len(recipient_items),
-                            sum(1 for _, p in recipient_items if p), 0))
+                            sum(1 for _, p in recipient_items if p),
+                            time.time() - t_col))
                 else:
                     # Externally-supplied recipients are plain names -> no peer_id,
                     # so they use the proven UI flow unchanged.
                     recipient_items = [(name, None) for name in recipients]
                 total = len(recipient_items)
+                if total == 0:
+                    # Bail out BEFORE the file upload. Two live runs uploaded a
+                    # 9.5 MB file and then delivered it to nobody; one of them
+                    # burned 10 minutes locating that upload first.
+                    await report(cards.error_card(
+                        "send", account, code="no_recipients",
+                        detail="this account has no contacts to send to, so nothing "
+                               "was uploaded or sent",
+                        phase="targets", trace_id=job.job_id))
+                    if agg is not None:
+                        await agg.update(account, sent=0, failed=0, total=0,
+                                         state="no_targets", force=True)
+                    return
                 if live is not None or agg is not None:
                     await self._send_progress(
                         live, agg, account, phone, sent=0, failed=0, total=total,
@@ -1012,8 +1066,8 @@ class JobManager:
                     trace_id=job.job_id,
                     detail="no saved peers for this account, so the browser-free "
                            "engine has nobody to send to. Open this account and tap "
-                           "'📥 Save Contacts' (reads your existing contacts once via "
-                           "the browser), then send again. Or switch the engine to "
+                           "'🔄 Update Contacts' (reads your contacts via the "
+                           "browser), then send again. Or switch the engine to "
                            "bridge."))
                 if agg is not None:
                     await agg.update(account, state="no_targets", force=True)

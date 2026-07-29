@@ -50,6 +50,13 @@ try:
 except Exception:  # noqa: BLE001
     _BRIDGE_STATS_SRC = ""
 
+# Source of the in-page contacts LIST bridge (window.__MKWL_contactsList).
+try:
+    _BRIDGE_CONTACTS_LIST_SRC = (
+        Path(__file__).with_name("contacts_list.js")).read_text(encoding="utf-8")
+except Exception:  # noqa: BLE001
+    _BRIDGE_CONTACTS_LIST_SRC = ""
+
 # Source of the in-page session exporter (window.__MKWL_exportSession).
 try:
     _SESSION_EXPORT_SRC = (Path(__file__).with_name("session_export.js")).read_text(encoding="utf-8")
@@ -982,17 +989,66 @@ class EitaaDriver:
         except Exception:  # noqa: BLE001
             return False
 
-    async def bridge_stats(self) -> dict | None:
-        """Instant stats via the API: {contacts, pvs}. None if unavailable."""
+    async def bridge_stats(self, with_pvs: bool = True) -> dict | None:
+        """Instant stats via the API: {contacts, pvs}. None if unavailable.
+
+        `with_pvs=False` skips the private-chat count. That count pages through
+        messages.getDialogs and was measured live at 98 SECONDS while the
+        contacts number itself takes 4 -- far too expensive for a hot path like
+        adding an account, where only the contacts number is shown.
+        """
         if not await self.ensure_stats_bridge():
             return None
         try:
-            res = await self.page.evaluate("() => window.__MKWL_stats()")
+            res = await self.page.evaluate(
+                "(withPvs) => window.__MKWL_stats(withPvs)", bool(with_pvs))
         except Exception:  # noqa: BLE001
             return None
         if isinstance(res, dict) and res.get("ok"):
             return {"contacts": res.get("contacts", -1), "pvs": res.get("pvs", -1)}
         return None
+
+    _CONTACTS_LIST_PROBE = "() => typeof window.__MKWL_contactsList === 'function'"
+
+    async def ensure_contacts_list_bridge(self) -> bool:
+        """Make sure window.__MKWL_contactsList is defined."""
+        try:
+            has = await self.page.evaluate(self._CONTACTS_LIST_PROBE)
+        except Exception:  # noqa: BLE001
+            has = False
+        if has:
+            return True
+        if not _BRIDGE_CONTACTS_LIST_SRC:
+            return False
+        try:
+            await self.page.evaluate(_BRIDGE_CONTACTS_LIST_SRC)
+            return await self.page.evaluate(self._CONTACTS_LIST_PROBE)
+        except Exception:  # noqa: BLE001
+            return False
+
+    async def bridge_contacts_list(self) -> dict | None:
+        """The account's FULL contacts list via the API, in seconds.
+
+        Returns {ok, count, contacts:[{peer_id, access_hash, title, ...}],
+        skipped, raw} or None when the bridge is unavailable (caller then falls
+        back to collect_all_contacts). Never raises.
+
+        This is the fast, complete replacement for scroll-collecting the
+        virtualized Contacts view: >10 minutes and capped, versus ~4 seconds and
+        complete, both measured live on the same account.
+        """
+        if not await self.ensure_contacts_list_bridge():
+            return None
+        try:
+            res = await self.page.evaluate("() => window.__MKWL_contactsList()")
+        except Exception:  # noqa: BLE001
+            return None
+        if isinstance(res, dict) and res.get("ok"):
+            contacts = res.get("contacts") or []
+            return {"ok": True, "count": len(contacts), "contacts": contacts,
+                    "skipped": res.get("skipped", 0), "raw": res.get("raw", 0)}
+        return {"ok": False, "code": str(res.get("code")) if isinstance(res, dict) else "bad_reply",
+                "contacts": []}
 
     _CONTACTS_BRIDGE_PROBE = (
         "() => typeof window.__MKWL_importContacts === 'function'"

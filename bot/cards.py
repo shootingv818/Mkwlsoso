@@ -341,7 +341,8 @@ def account_added(account: str, phone: str, contacts: int | None, pvs: int | Non
             ("Time    ", now_hms()),
         ],
         footer=("Contacts saved — this account is ready to send." if saved else
-                "Open the account and tap 📥 Save Contacts to make sends start instantly."),
+                "Logged in, but no contacts came back. Add contacts in Eitaa, then tap "
+                "🔄 Update Contacts on this account."),
     )
 
 
@@ -368,8 +369,8 @@ def account_panel(account: str, phone: str, contacts: int | None, pvs: int | Non
     if busy:
         footer = "A job is running on this account. Use Stop to end it early."
     elif not saved:
-        footer = ("No contacts saved yet. Tap 📥 Save Contacts once — after that every "
-                  "send starts instantly instead of re-scrolling the list.")
+        footer = ("No contacts saved for this account. Tap 🔄 Update Contacts to read "
+                  "them from Eitaa (takes seconds).")
     else:
         footer = f"Ready to send to {saved:,} saved contact(s)."
 
@@ -402,7 +403,7 @@ def contacts_saved(phone: str, count: int, with_peer: int, elapsed: float,
     if partial:
         title = "🛑 CONTACTS SAVED (stopped early)"
         footer = ("Stopped before the list finished, so this is only part of it. "
-                  "Run 📥 Save Contacts again to complete it.")
+                  "Run 🔄 Update Contacts again to complete it.")
     elif count:
         title = "📥 CONTACTS SAVED"
         footer = "Sends from this account now start immediately."
@@ -680,8 +681,8 @@ def multi_send_finished(accounts: list[dict], sent: int, failed: int, total: int
     lines.append(DIVIDER)
     if blocked:
         lines.append(f"🚧 {len(blocked)} account(s) sent NOTHING because they have no "
-                     "saved peers. Open each one and tap '📥 Save Contacts', then send "
-                     "again.")
+                     "contacts saved. Open each one and tap '🔄 Update Contacts', then "
+                     "send again.")
     lines.append(f"🕒 {now_hms()}")
     return "\n".join(lines)
 
