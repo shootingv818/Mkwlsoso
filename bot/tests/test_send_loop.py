@@ -620,6 +620,135 @@ class _FakeLive:
         self.texts.append(text)
 
 
+def test_hybrid_engine_end_to_end():
+    print("hybrid engine drives a real run through the loop")
+    progress_store.clear("a_hyb")
+    sent_direct = []
+
+    class FakeSender:
+        account = "a_hyb"
+
+        def upload_file(self, path, caption=""):
+            return {"ok": True}
+
+        def send_text(self, peer, text):
+            sent_direct.append(peer)
+            # Every third recipient is refused by the server.
+            if len(sent_direct) % 3 == 0:
+                return {"ok": False, "limit": True, "code": "PEER_FLOOD"}
+            return {"ok": True, "method": "direct/sendMessage"}
+
+        def send_uploaded_file(self, peer, caption=""):
+            sent_direct.append(peer)
+            return {"ok": True, "method": "direct/sendMedia"}
+
+        def close(self):
+            return None
+
+    d = FakeDriver()
+
+    async def go():
+        install_driver(d)
+        contacts_store.save("a_hyb", [
+            {"peer_id": str(2000 + i), "access_hash": str(9000 + i), "title": f"h{i}"}
+            for i in range(9)])
+        # Pretend the direct engine is set up and its context is fresh.
+        R.direct_ctx.refresh_from_driver = lambda drv, acc: _ok_refresh()
+        R.direct_ctx.has_context = lambda acc: True
+        import direct.sender as ds
+        ds.DirectSender = lambda account: FakeSender()
+        mgr = R.JobManager()
+        job = R.Job(job_id="t", kind="send", account="a_hyb")
+        lines = []
+
+        async def report(t):
+            lines.append(t)
+
+        await mgr._send_job(job, {"kind": "text", "text": "hy"},
+                            {"text_send_delay": 0, "send_log_every": 999,
+                             "send_concurrency": 3, "engine": "hybrid",
+                             "stop_on_limit": False},
+                            report, None)
+        return job, lines
+
+    async def _ok_refresh():
+        return {"ok": True, "kept": 3, "user_id": 1}
+
+    job, lines = asyncio.run(go())
+    check("the run used the hybrid engine", job.summary.get("engine") == "hybrid",
+          job.summary)
+    check("the browser-free engine did the sending", len(sent_direct) == 9,
+          len(sent_direct))
+    check("deliverable recipients got it", job.summary.get("sent") == 6, job.summary)
+    check("refused ones are counted, not retried", job.summary.get("failed") == 3,
+          job.summary)
+    check("the refusals were remembered",
+          R.blocked_store.count("a_hyb") == 3, R.blocked_store.count("a_hyb"))
+    check("timing was measured", (job.summary.get("timing") or {}).get("total") is not None,
+          job.summary.get("timing"))
+    check("a timing card was posted", any("RUN TIMING" in x for x in lines), lines[-1:])
+
+    # Second run: the refused peers must be skipped up front.
+    sent_direct.clear()
+    progress_store.clear("a_hyb")
+
+    async def go2():
+        import direct.sender as ds
+        ds.DirectSender = lambda account: FakeSender()
+        mgr = R.JobManager()
+        job2 = R.Job(job_id="t2", kind="send", account="a_hyb")
+        lines2 = []
+
+        async def report(t):
+            lines2.append(t)
+
+        await mgr._send_job(job2, {"kind": "text", "text": "hy2"},
+                            {"text_send_delay": 0, "send_log_every": 999,
+                             "send_concurrency": 3, "engine": "hybrid",
+                             "stop_on_limit": False},
+                            report, None)
+        return job2, lines2
+
+    job2, lines2 = asyncio.run(go2())
+    check("refused peers are skipped on the next run",
+          job2.summary.get("total") == 6, job2.summary)
+    check("and the skip is announced",
+          any("SKIPPING REFUSED" in x.upper() for x in lines2), lines2[:3])
+
+
+def test_engine_falls_back_loudly_when_direct_is_unavailable():
+    print("an unusable direct engine falls back to the bridge, loudly")
+    progress_store.clear("a_nodirect")
+    d = FakeDriver()
+
+    async def go():
+        install_driver(d)
+        contacts_store.save("a_nodirect", peers(4))
+        R.direct_ctx.refresh_from_driver = lambda drv, acc: _bad()
+        R.direct_ctx.has_context = lambda acc: False
+        mgr = R.JobManager()
+        job = R.Job(job_id="t", kind="send", account="a_nodirect")
+        lines = []
+
+        async def report(t):
+            lines.append(t)
+
+        await mgr._send_job(job, {"kind": "text", "text": "x"},
+                            {"text_send_delay": 0, "send_log_every": 999,
+                             "engine": "hybrid"}, report, None)
+        return job, lines
+
+    async def _bad():
+        return {"ok": False, "code": "no envelope in the dump"}
+
+    job, lines = asyncio.run(go())
+    check("it still delivered via the bridge", job.summary.get("sent") == 4, job.summary)
+    check("the engine reported is the one actually used",
+          job.summary.get("engine") == "bridge", job.summary)
+    check("the switch was announced, not silent",
+          any("direct_context_missing" in x for x in lines), lines[:2])
+
+
 def test_stage_card_appears_before_any_send():
     print("the live checklist appears from the first second")
     progress_store.clear("a_stage")
@@ -707,6 +836,8 @@ def main() -> int:
                test_batch_results_are_not_discarded_on_limit,
                test_truncated_list_cannot_shrink_the_cache,
                test_ledger_survives_losing_peer_ids,
+               test_hybrid_engine_end_to_end,
+               test_engine_falls_back_loudly_when_direct_is_unavailable,
                test_stage_card_appears_before_any_send,
                test_stage_card_shows_a_failure,
                test_ui_send_cannot_hang_forever,

@@ -425,7 +425,9 @@ def account_added(account: str, phone: str, contacts: int | None, pvs: int | Non
 def account_panel(account: str, phone: str, contacts: int | None, pvs: int | None,
                   engine: str | None, busy: bool, peers: int | None = None,
                   saved: int | None = None, saved_age: float | None = None,
-                  meta_age: float | None = None, pending: int | None = None) -> str:
+                  meta_age: float | None = None, pending: int | None = None,
+                  refused: int | None = None,
+                  engine_ready: bool | None = None) -> str:
     """One account's panel.
 
     `saved` is how many contacts are in the local cache -- that is what a send
@@ -466,9 +468,17 @@ def account_panel(account: str, phone: str, contacts: int | None, pvs: int | Non
             ("Phone", phone),
             ("State", "⏳ busy" if busy else "🟢 idle"),
             ("Saved", f"{saved:,} contacts ({age})" if saved else "none"),
+            # What a send would ACTUALLY reach: saved minus the ones Eitaa keeps
+            # refusing from this account.
+            ("Reachable", f"{max(0, (saved or 0) - refused):,} of {saved:,}"
+                          if (saved and refused) else None),
+            ("Refused", f"{refused:,} (Eitaa won't deliver to them)" if refused else None),
             ("On Eitaa", on_eitaa or "—"),
             ("Chats", pvs if isinstance(pvs, int) and pvs >= 0 else None),
             ("Already sent", f"{pending:,} got the current content" if pending else None),
+            ("Engine", ("browser-free ready" if engine_ready
+                        else "browser-free not captured yet")
+                       if engine_ready is not None else None),
             # Only meaningful while the browser-free engine is enabled.
             ("Peers", peers if (peers and engine == "direct") else None),
         ],
@@ -626,6 +636,42 @@ def error_card(where: str, account: str | None = None, target: str | None = None
             ("Detail ", sanitize(detail, 400) if detail else None),
             ("Time   ", now_hms()),
         ],
+    )
+
+
+def timing_card(phone: str, engine: str, timing: dict, concurrency: int,
+                limits: int = 0, fallbacks: int = 0) -> str:
+    """Where a run's time actually went.
+
+    Added because a run measured 6.2s per message while the transport itself
+    answered in 1-2s, and nothing in the panel could say what the other 4s were.
+    """
+    total = float(timing.get("total") or 0) or 1.0
+
+    def share(key: str) -> str | None:
+        v = float(timing.get(key) or 0)
+        if v <= 0:
+            return None
+        return f"{v:.0f}s ({v / total * 100:.0f}%)"
+
+    return card(
+        "⏱ RUN TIMING",
+        [
+            ("Phone      ", phone),
+            ("Engine     ", f"{engine} · {concurrency} at a time"),
+            ("Total      ", fmt_duration(total)),
+            ("Sending    ", share("transport")),
+            ("Slow path  ", share("fallback")),
+            ("Pacing wait", share("pacing")),
+            ("Everything else", share("other")),
+            ("Per message", f"{timing.get('per_send')}s" if timing.get("per_send") else None),
+            ("Rate       ", f"{timing.get('msg_per_s')} msg/s"),
+            ("Refused    ", limits or None),
+            ("Browser fallbacks", fallbacks or None),
+        ],
+        footer="'Sending' is time Eitaa itself took. 'Pacing wait' is your Send Delay "
+               "setting. A big 'Everything else' means the server (CPU steal, swap) "
+               "rather than Eitaa or the settings.",
     )
 
 
