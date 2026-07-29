@@ -113,7 +113,7 @@
       try {
         const h = await AM.invokeApi("messages.getHistory", {
           peer: peerSelf, offset_id: 0, offset_date: 0, add_offset: 0,
-          limit: 8, max_id: 0, min_id: 0, hash: 0 });
+          limit: 20, max_id: 0, min_id: 0, hash: 0 });
         const msgs = (h && h.messages) || [];
         for (let i = 0; i < msgs.length; i++) {
           const m = msgs[i];

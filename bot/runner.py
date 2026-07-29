@@ -1026,11 +1026,52 @@ class JobManager:
                         print(f"[send] file uploaded ONCE (msg_id={finit.get('msg_id')}); "
                               f"reusing via sendMedia per recipient", flush=True)
                     else:
-                        print(f"[send] file bridge init failed ({finit.get('code')}); "
-                              f"falling back to UI file send", flush=True)
+                        print(f"[send] file bridge init failed ({finit.get('code')})",
+                              flush=True)
                         await report(cards.error_card(
                             "file_init", account, code="bridge_file_init",
                             detail=str(finit.get("code")), trace_id=job.job_id))
+                        # A failed upload is usually still running inside the
+                        # page: measured live, the renderer stayed so busy that
+                        # even clicking the search box timed out after 30s. So
+                        # the UI fallback cannot work either -- it ground through
+                        # recipients for an hour and delivered nothing. Give the
+                        # upload ONE more attempt on a fresh page, then stop.
+                        if total > _MAX_UI_FILE_FALLBACKS:
+                            if stages is not None:
+                                await stages.begin("upload", "first upload failed - "
+                                                             "reloading the page and "
+                                                             "retrying once")
+                            try:
+                                await session.page.reload(wait_until="domcontentloaded")
+                                await session.page.wait_for_timeout(4000)
+                                await driver.ensure_bridge()
+                            except Exception:  # noqa: BLE001
+                                pass
+                            finit = await driver.bridge_file_init(
+                                content.get("file_path", ""), content.get("caption", ""))
+                            if finit.get("ok"):
+                                file_bridge_ready = True
+                                print(f"[send] file uploaded on retry "
+                                      f"(msg_id={finit.get('msg_id')})", flush=True)
+                            else:
+                                if stages is not None:
+                                    await stages.fail("the file could not be uploaded")
+                                    stages.stop()
+                                    stages = None
+                                await report(cards.card(
+                                    "🛑 SEND STOPPED — UPLOAD FAILED",
+                                    [("Phone", phone),
+                                     ("Recipients", f"{total:,} waiting"),
+                                     ("Reason", str(finit.get("code"))[:120])],
+                                    footer="The shared upload failed twice, and the "
+                                           "per-recipient browser upload would take "
+                                           "~25s each (and usually fails while the "
+                                           "page is still busy with the dead upload). "
+                                           "Nothing was sent. Try a smaller file, or "
+                                           "retry when the server is less loaded - "
+                                           "press Send again and it resumes."))
+                                return
                 else:
                     await driver.ensure_bridge()
 
@@ -1209,6 +1250,13 @@ class JobManager:
                                 detail = res.detail if res is not None else "send produced no result"
                                 # Surface EXACTLY why the send failed (capped to
                                 # avoid spam).
+                                if is_file and peer_id and not used_bridge:
+                                    # A FAILED UI file attempt is just as
+                                    # expensive as a successful one, so it has to
+                                    # count towards the slow-path guard too -
+                                    # otherwise a broken page grinds the whole
+                                    # list at ~30-150s per recipient.
+                                    ui_file_sends += 1
                                 if error_cards < 12:
                                     await report(cards.error_card(
                                         where, account, target=name, code="send_failed",
@@ -1220,6 +1268,8 @@ class JobManager:
                         except Exception as exc:  # noqa: BLE001
                             failed += 1
                             consecutive_failures += 1
+                            if is_file and peer_id:
+                                ui_file_sends += 1
                             if error_cards < 12:
                                 await report(cards.error_card(
                                     where, account, target=name,
@@ -1236,18 +1286,21 @@ class JobManager:
 
                         # Guard against the silent disaster: the fast upload is
                         # gone for good and every remaining recipient would be
-                        # served by a full ~25s re-upload. Stop and say why --
-                        # the ledger means a re-run continues from here.
+                        # served by a full ~25-150s browser upload (attempted or
+                        # failed - both cost the same). Stop and say why; the
+                        # ledger means a re-run continues from here.
                         if is_file and ui_file_sends >= _MAX_UI_FILE_FALLBACKS:
                             await report(cards.card(
                                 "🛑 SEND STOPPED — SLOW PATH",
                                 [("Phone", phone),
                                  ("Sent", f"{sent:,} of {total:,}"),
+                                 ("Failed", failed or None),
                                  ("Reason", f"the shared upload could not be reused for "
                                             f"{ui_file_sends} recipients")],
-                                footer="Each of those had to re-upload the whole file "
-                                       "(~25s each), so the run was stopped instead of "
-                                       "crawling through the rest. Press Send again to "
+                                footer="Each of those falls back to uploading the whole "
+                                       "file again through the browser (~25s+ each, and "
+                                       "it usually fails), so the run was stopped instead "
+                                       "of crawling through the rest. Press Send again to "
                                        "resume from here; nobody gets it twice."))
                             limited = True
                             break

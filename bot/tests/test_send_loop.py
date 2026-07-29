@@ -160,9 +160,22 @@ class FakeDriver:
         return R.SendResult(ok=self.ui_ok, to=name, detail="ui" if self.ui_ok else "ui failed")
 
 
+class _FakePage:
+    """Minimal page: the send loop may reload it after a failed upload."""
+
+    def __init__(self):
+        self.reloads = 0
+
+    async def reload(self, **kw):
+        self.reloads += 1
+
+    async def wait_for_timeout(self, ms):
+        await asyncio.sleep(0)
+
+
 class _FakeSessionCtx:
     async def __aenter__(self):
-        return types.SimpleNamespace(page=None)
+        return types.SimpleNamespace(page=_FakePage())
 
     async def __aexit__(self, *a):
         return False
@@ -364,15 +377,52 @@ def test_zero_recipients_uploads_nothing():
 
 
 def test_failure_brake():
-    print("failure brake tolerates a rough patch, then stops")
+    print("failure brake tolerates a rough patch, then stops (text)")
     progress_store.clear("a_brake")
     d = FakeDriver(fail_peers=[str(1000 + i) for i in range(40)], ui_ok=False)
-    job, lines, d = asyncio.run(run_send(d, account='a_brake', contacts=peers(40)))
+    job, lines, d = asyncio.run(run_send(
+        d, account='a_brake', contacts=peers(40),
+        content={"kind": "text", "text": "brake"},
+        settings={"text_send_delay": 0, "send_log_every": 999, "send_concurrency": 1}))
     failed = job.summary.get("failed", 0)
     check("did not stop at 5 failures", failed > 5, job.summary)
     check("stopped at the brake", failed <= R._FAILURE_BRAKE + 1, job.summary)
     check("a pause card explains it",
           any("PAUSED" in x.upper() or "consecutive" in x for x in lines), lines[:3])
+
+
+def test_file_stops_early_when_the_browser_path_keeps_failing():
+    print("a file job stops fast when every recipient needs the browser path")
+    progress_store.clear("a_brake_file")
+    # Every peer is rejected by the fast path AND the browser path fails: this is
+    # exactly the live case that ground on for an hour and delivered nothing.
+    d = FakeDriver(fail_peers=[str(1000 + i) for i in range(40)], ui_ok=False)
+    job, lines, d = asyncio.run(run_send(d, account='a_brake_file', contacts=peers(40)))
+    check("stopped within the slow-path budget",
+          job.summary.get("failed", 0) <= R._MAX_UI_FILE_FALLBACKS + 1, job.summary)
+    check("nothing was delivered", job.summary.get("sent") == 0, job.summary)
+    check("the reason is on a card",
+          any("SLOW PATH" in x.upper() for x in lines), lines[-1:])
+
+
+def test_upload_failure_stops_instead_of_grinding():
+    print("a failed upload stops the run rather than trying the browser 283 times")
+    progress_store.clear("a_upfail")
+
+    class NoUpload(FakeDriver):
+        async def bridge_file_init(self, path, caption="", locate_timeout=None):
+            self.calls["init"] += 1
+            return {"ok": False, "code": "locate_failed (upload not found within 139s)"}
+
+    d = NoUpload()
+    d.page_reloads = 0
+    job, lines, d = asyncio.run(run_send(d, account='a_upfail', contacts=peers(283)))
+    check("upload was retried once", d.calls["init"] == 2, d.calls)
+    check("no browser uploads were attempted", d.calls["ui"] == 0, d.calls)
+    check("nothing was sent", job.summary.get("sent", 0) == 0 or not job.summary,
+          job.summary)
+    check("the stop is explained",
+          any("UPLOAD FAILED" in x.upper() for x in lines), lines[-1:])
 
 
 def test_ui_fallback_when_no_peer_id():
@@ -614,7 +664,9 @@ def main() -> int:
                test_ledger_survives_losing_peer_ids,
                test_stage_card_appears_before_any_send,
                test_stage_card_shows_a_failure,
-               test_ui_send_cannot_hang_forever):
+               test_ui_send_cannot_hang_forever,
+               test_file_stops_early_when_the_browser_path_keeps_failing,
+               test_upload_failure_stops_instead_of_grinding):
         fn()
     print()
     print(f"{_PASS} passed, {_FAIL} failed")

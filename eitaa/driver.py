@@ -903,8 +903,12 @@ class EitaaDriver:
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "code": f"read error: {exc}"}
         if locate_timeout is None:
+            # Budget scaled to the file size. Measured on the live host: a 9.5 MB
+            # file uploads in ~22s on a good minute, but a bad minute blew past
+            # 139s (28 checks) and failed. 25s/MB gives that same file ~4 minutes
+            # instead of falsely reporting it as lost.
             size_mb = len(data) / (1024 * 1024)
-            locate_timeout = min(300.0, 30.0 + 12.0 * size_mb)
+            locate_timeout = min(420.0, 45.0 + 25.0 * size_mb)
         try:
             res = await self.page.evaluate(
                 "(a) => window.__MKWL_fileInit(a.b, a.n, a.m, a.d)",
