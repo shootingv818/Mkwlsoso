@@ -36,7 +36,11 @@
     return { _: "inputPeerEmpty" };
   }
 
-  window.__MKWL_stats = async function () {
+  // withPvs=false returns as soon as the contacts number is known. The PV count
+  // below pages through messages.getDialogs, which was measured live at 98
+  // SECONDS against 4 seconds for the contacts call -- so callers that only
+  // need the contacts number must not pay for it.
+  window.__MKWL_stats = async function (withPvs) {
     const AM = window.apiManager;
     if (!AM || !AM.invokeApi) return { ok: false, code: "no invokeApi" };
 
@@ -48,6 +52,7 @@
     } catch (e) { /* leave -1 */ }
 
     let pvs = 0, pages = 0;
+    if (withPvs === false) return { ok: true, contacts: contacts, pvs: -1, pages: 0 };
     try {
       let offset_date = 0, offset_id = 0, offset_peer = { _: "inputPeerEmpty" };
       for (let loop = 0; loop < 80; loop++) {

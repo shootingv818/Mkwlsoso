@@ -42,12 +42,20 @@ def sanitize(text: str, limit: int = 300) -> str:
 
 
 def _rows(pairs: Iterable[tuple[str, object]]) -> list[str]:
-    """Format key/value pairs with aligned keys as `• Key   : value`."""
-    pairs = [(str(k), v) for k, v in pairs if v is not None]
-    if not pairs:
-        return []
-    width = max(len(k) for k, _ in pairs)
-    return [f"• {k.ljust(width)} : {v}" for k, v in pairs]
+    """Format key/value pairs as `• Key: value`.
+
+    Keys are NOT padded to a common width any more. Telegram renders card text
+    in a proportional font, so space padding does not line anything up -- on a
+    phone it just produced ragged rows with random gaps. Callers may still pass
+    padded labels (many do); the padding is stripped here so every card gets the
+    same tidy output without touching every call site.
+    """
+    out = []
+    for k, v in pairs:
+        if v is None:
+            continue
+        out.append(f"• {str(k).strip()}: {v}")
+    return out
 
 
 def card(title: str, pairs: Iterable[tuple[str, object]] | None = None,
@@ -134,6 +142,34 @@ def live_contacts(phone: str, prefix: str, found: int, probed: int, total: int,
         ]),
         f"🕒 {now_hms()}",
     ]
+    return "\n".join(lines)
+
+
+def live_stages(phone: str, stages: list[tuple[str, str, float | None]],
+                elapsed: float, note: str | None = None) -> str:
+    """Checklist card shown from the moment Send is pressed.
+
+    Before this existed the panel showed nothing for the first few minutes of a
+    job -- and on this host just opening Chromium takes 150-200 seconds, so there
+    was no way to tell a working bot from a stuck one.
+
+    stages: [(label, state, seconds)] where state is done | active | pending |
+    failed. `seconds` is how long a finished step took.
+    """
+    mark = {"done": "✅", "active": "⏳", "pending": "◻️", "failed": "⚠️"}
+    rows = []
+    for label, state, secs in stages:
+        line = f"{mark.get(state, '◻️')} {label}"
+        if state == "done" and secs:
+            line += f"  ({secs:.0f}s)"
+        elif state == "active":
+            line += "  …"
+        rows.append(line)
+    lines = ["⚙️ WORKING — Live", DIVIDER, f"📱 {phone}", *rows,
+             f"⏱ total {fmt_duration(elapsed)}"]
+    if note:
+        lines.append(note)
+    lines.append(f"🕒 {now_hms()}")
     return "\n".join(lines)
 
 
@@ -305,23 +341,63 @@ def _ping_mark(ping_ms: int | None) -> str:
     return f"🔴 {ping_ms} ms"
 
 
-def panel_home(version: str, accounts: int, active: str | None,
+def _ago(ts: float | None) -> str:
+    """How long ago a timestamp was, in words."""
+    if not ts:
+        return "never"
+    d = max(0, time.time() - float(ts))
+    if d < 90:
+        return "just now"
+    if d < 3600:
+        return f"{int(d / 60)}m ago"
+    if d < 172800:
+        return f"{int(d / 3600)}h ago"
+    return f"{int(d / 86400)}d ago"
+
+
+def panel_home(accounts: int, ready: int, active: str | None,
                engine: str | None = None, ping_ms: int | None = None,
-               bot_online: bool = True, contacts: int | None = None,
-               running: int = 0, content: str | None = None) -> str:
-    """Home screen: what's connected, what's loaded, what's running."""
+               contacts: int | None = None, running: int = 0,
+               content: str | None = None, last_run: dict | None = None) -> str:
+    """Home screen: what can send, what is loaded, what happened last.
+
+    Deliberately does NOT show "Bot: online" (if it were offline no card would
+    arrive), a version string, or a progress bar. Every row here is something the
+    owner can act on.
+    """
+    acc_txt = None
+    if accounts:
+        missing = max(0, accounts - max(0, ready))
+        acc_txt = f"{accounts}"
+        if ready:
+            acc_txt += f" ({ready} ready"
+            acc_txt += f" · {missing} without contacts)" if missing else ")"
+        elif missing:
+            acc_txt += f" ({missing} without contacts)"
+    lr = last_run or {}
+    lr_txt = None
+    if lr:
+        bits = [f"{int(lr.get('sent', 0)):,} sent"]
+        if lr.get("failed"):
+            bits.append(f"{int(lr['failed']):,} failed")
+        if lr.get("skipped"):
+            bits.append(f"{int(lr['skipped']):,} skipped")
+        if lr.get("elapsed"):
+            bits.append(fmt_duration(float(lr["elapsed"])))
+        lr_txt = " · ".join(bits) + f" ({_ago(lr.get('at'))})"
+
     lines = [
         "🤖 EITAA MANAGER",
         DIVIDER,
         *_rows([
-            ("Bot     ", "🟢 online" if bot_online else "🔴 offline"),
-            ("Eitaa   ", _ping_mark(ping_ms)),
-            ("Accounts", accounts if accounts else "none yet"),
-            ("Contacts", f"{contacts:,}" if contacts else None),
-            ("Active  ", active or "—"),
-            ("Running ", f"⏳ {running} job(s)" if running else "idle"),
-            ("Content ", content),
-            ("Version ", version),
+            ("Eitaa", _ping_mark(ping_ms)),
+            ("Accounts", acc_txt or "none yet"),
+            ("Contacts", f"{contacts:,} sendable" if contacts else "none saved yet"),
+            ("Active", active or "—"),
+            ("Job", f"⏳ {running} running" if running else "idle"),
+            ("Content", content or "nothing set"),
+            ("Last run", lr_txt),
+            ("Engine", engine),
         ]),
         DIVIDER,
         "Pick a section below.",
@@ -341,13 +417,15 @@ def account_added(account: str, phone: str, contacts: int | None, pvs: int | Non
             ("Time    ", now_hms()),
         ],
         footer=("Contacts saved — this account is ready to send." if saved else
-                "Open the account and tap 📥 Save Contacts to make sends start instantly."),
+                "Logged in, but no contacts came back. Add contacts in Eitaa, then tap "
+                "🔄 Update Contacts on this account."),
     )
 
 
 def account_panel(account: str, phone: str, contacts: int | None, pvs: int | None,
                   engine: str | None, busy: bool, peers: int | None = None,
-                  saved: int | None = None, saved_age: float | None = None) -> str:
+                  saved: int | None = None, saved_age: float | None = None,
+                  meta_age: float | None = None, pending: int | None = None) -> str:
     """One account's panel.
 
     `saved` is how many contacts are in the local cache -- that is what a send
@@ -368,21 +446,31 @@ def account_panel(account: str, phone: str, contacts: int | None, pvs: int | Non
     if busy:
         footer = "A job is running on this account. Use Stop to end it early."
     elif not saved:
-        footer = ("No contacts saved yet. Tap 📥 Save Contacts once — after that every "
-                  "send starts instantly instead of re-scrolling the list.")
+        footer = ("No contacts saved for this account. Tap 🔄 Update Contacts to read "
+                  "them from Eitaa (takes seconds).")
     else:
         footer = f"Ready to send to {saved:,} saved contact(s)."
+
+    # "On Eitaa" is a snapshot from the last measurement, so it says WHEN it was
+    # taken. Without that this row silently disagreed with reality (it showed
+    # 1,414 for an account that had 1,094) and nothing explained why.
+    on_eitaa = None
+    if isinstance(contacts, int) and contacts >= 0:
+        on_eitaa = f"{contacts:,}"
+        if meta_age:
+            on_eitaa += f" (measured {_ago(time.time() - meta_age * 3600)})"
 
     return card(
         "👤 ACCOUNT",
         [
-            ("Phone    ", phone),
-            ("State    ", "⏳ busy" if busy else "🟢 idle"),
-            ("Saved    ", f"{saved:,} contacts ({age})" if saved else "none"),
-            ("On Eitaa ", f"{contacts:,}" if isinstance(contacts, int) and contacts >= 0 else "—"),
-            ("Chats    ", pvs if isinstance(pvs, int) and pvs >= 0 else "—"),
+            ("Phone", phone),
+            ("State", "⏳ busy" if busy else "🟢 idle"),
+            ("Saved", f"{saved:,} contacts ({age})" if saved else "none"),
+            ("On Eitaa", on_eitaa or "—"),
+            ("Chats", pvs if isinstance(pvs, int) and pvs >= 0 else None),
+            ("Already sent", f"{pending:,} got the current content" if pending else None),
             # Only meaningful while the browser-free engine is enabled.
-            ("Peers    ", peers if (peers and engine == "direct") else None),
+            ("Peers", peers if (peers and engine == "direct") else None),
         ],
         footer=footer,
     )
@@ -402,7 +490,7 @@ def contacts_saved(phone: str, count: int, with_peer: int, elapsed: float,
     if partial:
         title = "🛑 CONTACTS SAVED (stopped early)"
         footer = ("Stopped before the list finished, so this is only part of it. "
-                  "Run 📥 Save Contacts again to complete it.")
+                  "Run 🔄 Update Contacts again to complete it.")
     elif count:
         title = "📥 CONTACTS SAVED"
         footer = "Sends from this account now start immediately."
@@ -541,16 +629,35 @@ def error_card(where: str, account: str | None = None, target: str | None = None
     )
 
 
-def restriction_card(account: str, reason: str, sent_before: int) -> str:
+def restriction_card(account: str, reason: str, sent_before: int,
+                     paused: bool = True) -> str:
+    """The server refused a recipient (PEER_FLOOD, spam warning, ...).
+
+    `paused=False` is used when the owner turned off "Pause on limit": the card
+    is still posted so the restriction is never hidden, but the run continues and
+    only Stop ends it.
+    """
+    peer_flood = "PEER_FLOOD" in str(reason).upper()
+    footer = None
+    if peer_flood:
+        footer = ("PEER_FLOOD is not a timed wait: Eitaa is refusing messages from "
+                  "this account to people it is not in two-way contact with. Waiting "
+                  "does not clear it — it usually needs a few quiet days, and it hits "
+                  "new accounts fastest.")
+    if not paused:
+        footer = ((footer + " ") if footer else "") + \
+                 "Pause on limit is OFF, so the run continues. Use Stop to end it."
     return card(
         "🚫 LIMIT DETECTED",
         [
             ("Account    ", account),
             ("Reason     ", sanitize(reason, 200)),
             ("Sent before", sent_before),
-            ("Action     ", "job auto-paused"),
+            ("Action     ", "job auto-paused" if paused
+                            else "continuing (pause on limit is off)"),
             ("Time       ", now_hms()),
         ],
+        footer=footer,
     )
 
 
@@ -680,8 +787,8 @@ def multi_send_finished(accounts: list[dict], sent: int, failed: int, total: int
     lines.append(DIVIDER)
     if blocked:
         lines.append(f"🚧 {len(blocked)} account(s) sent NOTHING because they have no "
-                     "saved peers. Open each one and tap '📥 Save Contacts', then send "
-                     "again.")
+                     "contacts saved. Open each one and tap '🔄 Update Contacts', then "
+                     "send again.")
     lines.append(f"🕒 {now_hms()}")
     return "\n".join(lines)
 

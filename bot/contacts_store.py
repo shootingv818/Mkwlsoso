@@ -46,7 +46,12 @@ def load(account: str) -> dict:
 
 
 def save(account: str, contacts: list[dict]) -> dict:
-    """Persist a freshly collected contacts list (deduped, blanks dropped)."""
+    """Persist a freshly collected contacts list (deduped, blanks dropped).
+
+    `access_hash` is kept when the source provides it (the API contacts bridge
+    does; the old DOM scrape does not). It is what lets a peer be addressed
+    without relying on the browser's in-memory peer cache.
+    """
     clean: list[dict] = []
     seen: set[str] = set()
     for c in contacts or []:
@@ -62,7 +67,26 @@ def save(account: str, contacts: list[dict]) -> dict:
         entry = {"title": title}
         if peer_id:
             entry["peer_id"] = peer_id
+        access_hash = c.get("access_hash")
+        if access_hash not in (None, ""):
+            entry["access_hash"] = str(access_hash)
         clean.append(entry)
+
+    # Guard against a partial collection replacing a complete one. The DOM
+    # scroll fallback is capped and returns a TRUNCATED list with no
+    # access_hash; letting that overwrite a full API list would silently shrink
+    # the reach of every later send (this is how "1,190 of 6,436" happened).
+    if clean:
+        prev = load(account)
+        prev_contacts = prev.get("contacts") or []
+        prev_had_hash = any(c.get("access_hash") for c in prev_contacts)
+        new_has_hash = any(c.get("access_hash") for c in clean)
+        if (prev_had_hash and not new_has_hash
+                and len(clean) < len(prev_contacts)):
+            print(f"[contacts] keeping the existing {len(prev_contacts)} saved "
+                  f"contacts for {account}: the new list has only {len(clean)} "
+                  f"and no access_hash (looks truncated)", flush=True)
+            return prev
 
     record = {"account": account, "updated": time.time(),
               "count": len(clean), "contacts": clean}

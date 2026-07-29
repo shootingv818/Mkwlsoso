@@ -22,6 +22,7 @@ from telethon.errors import MessageNotModifiedError
 from config import config
 from bot import cards
 from bot import contacts_store
+from bot import progress_store
 from bot.store import store
 from bot.runner import manager, expand_range
 
@@ -99,6 +100,9 @@ def delete_account_files(account: str) -> list[str]:
 
     if contacts_store.forget(account):
         removed.append("saved contacts")
+
+    if progress_store.clear(account):
+        removed.append("sent log")
 
     # Saved peers live in the isolated direct/ store; ask it to clean up.
     try:
@@ -243,13 +247,17 @@ def kb_account_panel(acc: str):
     rows = [
         [Button.inline("📤 Send", b"pnl:send"),
          Button.inline("➕ Build Contacts", b"pnl:contacts")],
-        [Button.inline("📥 Save Contacts", b"pnl:save"),
-         Button.inline("🔄 Refresh", b"pnl:refresh")],
+        # Contacts are saved automatically at login; this only re-reads them
+        # when the account has gained new contacts since.
+        [Button.inline("🔄 Update Contacts", b"pnl:save"),
+         Button.inline("♻️ Refresh Panel", b"pnl:refresh")],
     ]
     if busy:
         # The label escalates: a second press force-stops.
         label = "❌ Force Stop" if manager.account_stopping(acc) else "⏹ Stop"
         rows.append([Button.inline(label, b"pnl:stop")])
+    # Clears the resume ledger, so the current content goes to everyone again.
+    rows.append([Button.inline("🧹 Reset Sent Log", b"pnl:resetlog")])
     rows.append([Button.inline("🗑 Delete Account", f"acc:del:{acc}".encode())])
     rows.append([Button.inline("👤 Accounts", b"menu:accounts"),
                  Button.inline("⬅ Home", b"menu:home")])
@@ -319,8 +327,12 @@ def kb_settings():
                                    b"set:engine")])
     rows += [
         [Button.inline("⏱ Send Delay", b"set:textdelay"),
-         Button.inline("⏱ Contact Delay", b"set:contactdelay")],
-        [Button.inline("🔢 Log Every N", b"set:logevery")],
+         Button.inline("⚡ Concurrency", b"set:concurrency")],
+        [Button.inline(
+            f"🚫 Pause on limit: {'ON' if store.stop_on_limit else 'OFF'}",
+            b"set:stoponlimit")],
+        [Button.inline("⏱ Contact Delay", b"set:contactdelay"),
+         Button.inline("🔢 Log Every N", b"set:logevery")],
         [Button.inline("⬅ Back", b"menu:home")],
     ]
     return rows
@@ -331,14 +343,15 @@ def kb_settings():
 async def home_text() -> str:
     ping = await server_ping_ms()
     accounts = list_accounts()
-    saved_total = sum(contacts_store.count(a) for a in accounts)
+    counts = [contacts_store.count(a) for a in accounts]
     return cards.panel_home(
-        config.BOT_VERSION, len(accounts),
+        len(accounts), sum(1 for n in counts if n),
         store.account_phone(store.active_account) if store.active_account else None,
         engine=store.engine if config.ENABLE_DIRECT else None,
-        ping_ms=ping, contacts=saved_total,
+        ping_ms=ping, contacts=sum(counts),
         running=len(manager.active_jobs()),
         content=store.content_summary() if store.content.get("kind") else None,
+        last_run=store.last_run,
     )
 
 
@@ -414,11 +427,16 @@ def peer_count(acc: str) -> int | None:
 
 def account_panel_text(acc: str) -> str:
     meta = store.account_meta(acc)
+    meta_ts = meta.get("meta_updated")
+    meta_age = ((time.time() - float(meta_ts)) / 3600.0) if meta_ts else None
+    already = progress_store.done_count(
+        acc, progress_store.content_key(store.content)) if store.content.get("kind") else 0
     return cards.account_panel(
         acc, store.account_phone(acc),
         meta.get("contacts"), meta.get("pvs"),
         store.engine, manager.is_busy(acc), peers=peer_count(acc),
         saved=contacts_store.count(acc), saved_age=contacts_store.age_hours(acc),
+        meta_age=meta_age, pending=already,
     )
 
 
@@ -428,8 +446,12 @@ def content_text() -> str:
 
 
 def settings_text() -> str:
+    conc = store.send_concurrency
     pairs = [
         ("Send delay   ", f"{store.text_send_delay:g}s between messages"),
+        ("Concurrency  ", f"{conc} at a time" + (" (sequential)" if conc == 1 else "")),
+        ("On limit     ", "pause the run" if store.stop_on_limit
+                          else "keep going, only report"),
         ("Contact delay", f"{store.contact_create_delay:g}s between batches"),
         ("Log every    ", f"{store.send_log_every} sends"),
     ]
@@ -473,6 +495,24 @@ async def _callbacks(event):
     if not is_owner(event):
         await event.answer("Not authorized.", alert=True)
         return
+    # Telegram invalidates a callback query after a few seconds, and a handler
+    # here can open a browser (measured: 158s on the live host), so the answer
+    # that came after the work failed with QueryIdInvalidError. Answering up
+    # front is NOT an option: Telethon marks the query answered, which would
+    # silently swallow every later alert like "Select an account first". Instead
+    # a watchdog acknowledges only if the handler is still working after 6s.
+    done = asyncio.Event()
+
+    async def _ack_if_slow():
+        try:
+            await asyncio.wait_for(done.wait(), timeout=6)
+        except asyncio.TimeoutError:
+            try:
+                await event.answer()
+            except Exception:  # noqa: BLE001
+                pass
+
+    watchdog = asyncio.create_task(_ack_if_slow())
     try:
         await _handle_callback(event)
     except MessageNotModifiedError:
@@ -484,6 +524,9 @@ async def _callbacks(event):
             await event.answer("Error handled; a log card was sent.", alert=True)
         except Exception:  # noqa: BLE001
             pass
+    finally:
+        done.set()
+        watchdog.cancel()
 
 
 async def _handle_callback(event):
@@ -582,14 +625,28 @@ async def _handle_callback(event):
         if manager.is_busy(active):
             return await event.answer("Account already has a running job.", alert=True)
         await manager.run_save_contacts(active, report, store.account_phone(active))
-        await event.answer("Saving contacts…")
+        await event.answer("Updating contacts…")
         return await event.edit(
-            cards.card("📥 SAVE CONTACTS",
+            cards.card("🔄 UPDATE CONTACTS",
                        [("Phone", store.account_phone(active))],
-                       footer="Reading this account's full contacts list once and saving "
-                              "it. This is the slow part — a 📥 CONTACTS SAVED card will "
-                              "follow, and after that every send starts instantly."),
+                       footer="Re-reading this account's contact list from Eitaa. "
+                              "Contacts are already saved automatically at login, so "
+                              "this is only needed after new contacts were added."),
             buttons=kb_back())
+    if data == "pnl:resetlog":
+        if not active:
+            return await event.answer("Select an account first.", alert=True)
+        had = progress_store.done_count(
+            active, progress_store.content_key(store.content))
+        progress_store.clear(active)
+        await event.answer("Sent log cleared.")
+        return await event.edit(
+            cards.card("🧹 SENT LOG CLEARED",
+                       [("Phone   ", store.account_phone(active)),
+                        ("Cleared ", f"{had:,} delivered marks" if had else "nothing to clear")],
+                       footer="The next send treats every saved contact as new, so the "
+                              "current content will be delivered again to all of them."),
+            buttons=kb_account_panel(active))
     if data == "pnl:send":
         return await _start_send(event)
     if data == "pnl:contacts":
@@ -649,6 +706,20 @@ async def _handle_callback(event):
         return await event.edit(
             cards.card("⏱ CONTACT CREATE DELAY", [("Current", f"{store.contact_create_delay:g}s")],
                        footer="Send a number of seconds (e.g. 0.2 for fast)."), buttons=kb_back())
+    if data == "set:stoponlimit":
+        now = store.toggle_stop_on_limit()
+        await event.answer("Pause on limit: " + ("ON" if now else "OFF"))
+        return await event.edit(settings_text(), buttons=kb_settings())
+    if data == "set:concurrency":
+        pending[event.sender_id] = {"step": "await_concurrency"}
+        return await event.edit(
+            cards.card("⚡ SEND CONCURRENCY",
+                       [("Current", f"{store.send_concurrency} at a time")],
+                       footer="How many recipients may be in flight at once on the fast "
+                              "path (1-10). 1 is the proven sequential behaviour. Try 3 "
+                              "first and watch for limit cards before going higher. The "
+                              "UI fallback always stays sequential."),
+            buttons=kb_back())
     if data == "set:logevery":
         pending[event.sender_id] = {"step": "await_logevery"}
         return await event.edit(
@@ -724,8 +795,8 @@ async def _start_multi_send(event):
         no_peers = [a for a in free if not (peer_count(a) or 0)]
         if len(no_peers) == len(free):
             return await event.answer(
-                "None of the selected accounts have saved peers. Tap 'Save Contacts' "
-                "on each first.", alert=True)
+                "None of the selected accounts have saved peers. Tap "
+                "'🔄 Update Contacts' on each first.", alert=True)
 
     live = LiveCard(config.report_to())
     # Selection ORDER matters: the first account ticked sends first.
@@ -806,7 +877,10 @@ async def _conversation(event):
                 buttons=kb_back())
         if manager.is_busy(name):
             return await event.respond("That account already has a running job. Try again later.")
-        started = await manager.start_bridge_login(name, phone, report)
+        # A live stage card, because opening Chromium alone takes minutes here
+        # and the login used to be silent until the code arrived.
+        started = await manager.start_bridge_login(
+            name, phone, report, live=LiveCard(config.report_to()))
         if not started:
             pending.pop(event.sender_id, None)
             return await event.respond("That account is busy right now. Try again later.")
@@ -845,6 +919,17 @@ async def _conversation(event):
             return await event.respond("Send a number of seconds between 0 and 3600.")
         key = "text_send_delay" if step == "await_textdelay" else "contact_create_delay"
         store.set_setting(key, val)
+        pending.pop(event.sender_id, None)
+        return await event.respond(settings_text(), buttons=kb_settings())
+
+    if step == "await_concurrency":
+        try:
+            val = int(re.sub(r"\D", "", text or ""))
+        except ValueError:
+            return await event.respond("Send a whole number between 1 and 10.")
+        if not 1 <= val <= 10:
+            return await event.respond("Send a whole number between 1 and 10.")
+        store.set_setting("send_concurrency", val)
         pending.pop(event.sender_id, None)
         return await event.respond(settings_text(), buttons=kb_settings())
 

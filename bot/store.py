@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +23,8 @@ def _defaults() -> dict[str, Any]:
             "text_send_delay": float(config.TEXT_SEND_DELAY),
             "contact_create_delay": float(config.CONTACT_CREATE_DELAY),
             "send_log_every": int(config.SEND_LOG_EVERY),
+            "send_concurrency": int(config.SEND_CONCURRENCY),
+            "stop_on_limit": bool(config.STOP_ON_LIMIT),
             # "bridge" (browser/tweb) or "direct" (browser-free MTProto).
             "engine": str(config.ENGINE),
         },
@@ -104,6 +107,36 @@ class Store:
         return int(self._data["settings"].get("send_log_every", config.SEND_LOG_EVERY))
 
     @property
+    def stop_on_limit(self) -> bool:
+        """Whether a server restriction (e.g. PEER_FLOOD) pauses the run."""
+        return bool(self._data["settings"].get("stop_on_limit", config.STOP_ON_LIMIT))
+
+    def toggle_stop_on_limit(self) -> bool:
+        new = not self.stop_on_limit
+        self.set_setting("stop_on_limit", new)
+        return new
+
+    @property
+    def send_concurrency(self) -> int:
+        """How many recipients may be in flight at once (fast path only)."""
+        try:
+            n = int(self._data["settings"].get("send_concurrency", config.SEND_CONCURRENCY))
+        except (TypeError, ValueError):
+            n = 1
+        return max(1, min(10, n))
+
+    # ---- last run (so the home card can show a real outcome) ----
+    @property
+    def last_run(self) -> dict[str, Any]:
+        lr = self._data.get("last_run")
+        return dict(lr) if isinstance(lr, dict) else {}
+
+    def set_last_run(self, **fields: Any) -> None:
+        self._data["last_run"] = {k: v for k, v in fields.items() if v is not None}
+        self._data["last_run"]["at"] = time.time()
+        self.save()
+
+    @property
     def engine(self) -> str:
         """The engine every job uses.
 
@@ -134,11 +167,22 @@ class Store:
         return dict(self._data.setdefault("accounts_meta", {}).get(name, {}))
 
     def set_account_meta(self, name: str, **fields: Any) -> None:
+        """Update an account's metadata and stamp WHEN it was measured.
+
+        The numbers used to be written once at login and then shown forever, so
+        the panel kept reporting 1,414 contacts for an account that really had
+        1,094. The timestamp lets the card say how old the number is.
+        """
         meta = self._data.setdefault("accounts_meta", {})
         cur = dict(meta.get(name, {}))
+        touched = False
         for k, v in fields.items():
             if v is not None:
                 cur[k] = v
+                if k in ("contacts", "pvs"):
+                    touched = True
+        if touched:
+            cur["meta_updated"] = time.time()
         meta[name] = cur
         self.save()
 

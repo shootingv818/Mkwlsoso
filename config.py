@@ -50,17 +50,40 @@ class Config:
     EITAA_WEB_URL: str = os.environ.get("EITAA_WEB_URL", "https://web.eitaa.com")
     PROFILES_DIR: Path = Path(os.environ.get("PROFILES_DIR", "./profiles"))
     ARTIFACTS_DIR: Path = Path(os.environ.get("ARTIFACTS_DIR", "./artifacts"))
+    # HEADED shows a real window (needed only for a manual noVNC login).
+    # HEADED_JOBS decides whether the BOT's own jobs use one. Automated jobs
+    # never need pixels -- they drive Eitaa through its own API inside the page --
+    # and a headless Chromium starts faster and uses far less RAM, which matters
+    # on a 1-core / 1 GB host where launching took 158-203 seconds.
     HEADED: bool = _get_bool("HEADED", True)
+    HEADED_JOBS: bool = _get_bool("MKWL_HEADED_JOBS", False)
     BASELINE_SECONDS: int = _get_int("BASELINE_SECONDS", 12)
     ACTION_TRAIL_SECONDS: int = _get_int("ACTION_TRAIL_SECONDS", 8)
     RAW_ENCRYPTION_KEY: str = os.environ.get("RAW_ENCRYPTION_KEY", "")
 
-    # Broadcaster (tabchi) rate limiting
+    # Pacing for the CLI campaign runner (jobs/campaign.py) ONLY. The Telegram
+    # panel does NOT read these -- it uses TEXT_SEND_DELAY and SEND_CONCURRENCY
+    # below. Changing these while using the panel changes nothing, which is
+    # exactly the confusion this comment exists to prevent.
     SEND_MIN_DELAY: int = _get_int("SEND_MIN_DELAY", 8)
     SEND_MAX_DELAY: int = _get_int("SEND_MAX_DELAY", 18)
     SEND_BATCH_SIZE: int = _get_int("SEND_BATCH_SIZE", 20)
     SEND_BATCH_COOLDOWN: int = _get_int("SEND_BATCH_COOLDOWN", 90)
+
     MAX_CONSECUTIVE_FAILURES: int = _get_int("MAX_CONSECUTIVE_FAILURES", 5)
+    # How many recipients may be in flight at once on the fast (API) path.
+    # 1 == the proven sequential behaviour. Raise it to trade safety margin for
+    # throughput; the UI fallback always stays serial because it drives one page.
+    SEND_CONCURRENCY: int = _get_int("SEND_CONCURRENCY", 1)
+    # A server-declared wait (FLOOD_WAIT_n) up to this many seconds is honoured
+    # and the run continues; anything longer stops the run and reports it.
+    MAX_FLOOD_WAIT: int = _get_int("MAX_FLOOD_WAIT", 90)
+    # What to do when the server reports a restriction it gave no wait time for
+    # (PEER_FLOOD, spam warnings...). True = pause the run, which is the safe
+    # default: the server keeps rejecting every recipient, so continuing just
+    # collects errors. False = only post a card and keep going, leaving the
+    # decision to stop with the owner.
+    STOP_ON_LIMIT: bool = _get_bool("MKWL_STOP_ON_LIMIT", True)
 
     JOBS_DIR: Path = Path(os.environ.get("ARTIFACTS_DIR", "./artifacts")) / "jobs"
 

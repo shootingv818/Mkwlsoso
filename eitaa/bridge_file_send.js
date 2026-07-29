@@ -68,8 +68,19 @@
   }
   const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
+  // Is an uploaded document still available for reuse? The state lives in the
+  // page, so any reload/navigation wipes it and every following recipient would
+  // otherwise fall back to a full per-recipient re-upload (~25s each, measured).
+  window.__MKWL_fileReady = function () {
+    const st = window.__MKWL_fileState;
+    return !!(st && st.doc);
+  };
+
   // Upload the file ONCE to Saved Messages and remember its document.
-  window.__MKWL_fileInit = async function (b64, filename, mime) {
+  // deadlineMs caps the "find my upload" phase by WALL CLOCK. It used to be a
+  // fixed 90 iterations of (1s sleep + one getHistory round-trip); on a slow
+  // host each iteration took ~6.7s, so a failing init burned 600 seconds.
+  window.__MKWL_fileInit = async function (b64, filename, mime, deadlineMs) {
     const AM = window.apiManager, AMM = window.appMessagesManager;
     if (!AM || !AM.invokeApi) return { ok: false, code: "no invokeApi" };
     if (!AMM || !AMM.sendFile) return { ok: false, code: "no sendFile" };
@@ -93,13 +104,16 @@
       await AMM.sendFile(selfNum, file, { caption: marker });
     } catch (e) { return { ok: false, code: "sendFile:" + errCode(e) }; }
 
-    let doc = null, mid = null;
-    for (let a = 0; a < 90 && mid == null; a++) {
+    const budget = (typeof deadlineMs === "number" && deadlineMs > 0) ? deadlineMs : 180000;
+    const until = Date.now() + budget;
+    let doc = null, mid = null, tries = 0;
+    while (mid == null && Date.now() < until) {
       await sleep(1000);
+      tries++;
       try {
         const h = await AM.invokeApi("messages.getHistory", {
           peer: peerSelf, offset_id: 0, offset_date: 0, add_offset: 0,
-          limit: 8, max_id: 0, min_id: 0, hash: 0 });
+          limit: 20, max_id: 0, min_id: 0, hash: 0 });
         const msgs = (h && h.messages) || [];
         for (let i = 0; i < msgs.length; i++) {
           const m = msgs[i];
@@ -107,12 +121,16 @@
             mid = m.id; doc = m.media.document; break;
           }
         }
-      } catch (e) { return { ok: false, code: "getHistory:" + errCode(e) }; }
+      } catch (e) { return { ok: false, code: "getHistory:" + errCode(e), tries: tries }; }
     }
-    if (mid == null) return { ok: false, code: "locate_failed (upload may still be running)" };
+    if (mid == null) {
+      return { ok: false, tries: tries, waited_ms: budget,
+               code: "locate_failed (upload not found within " +
+                     Math.round(budget / 1000) + "s over " + tries + " checks)" };
+    }
 
     window.__MKWL_fileState = { selfPeer: peerSelf, msgId: mid, doc: doc, marker: marker };
-    return { ok: true, msg_id: mid, doc_id: doc && String(doc.id) };
+    return { ok: true, msg_id: mid, doc_id: doc && String(doc.id), tries: tries };
   };
 
   async function refreshDoc() {
