@@ -22,6 +22,7 @@ from telethon.errors import MessageNotModifiedError
 from config import config
 from bot import cards
 from bot import contacts_store
+from bot import progress_store
 from bot.store import store
 from bot.runner import manager, expand_range
 
@@ -99,6 +100,9 @@ def delete_account_files(account: str) -> list[str]:
 
     if contacts_store.forget(account):
         removed.append("saved contacts")
+
+    if progress_store.clear(account):
+        removed.append("sent log")
 
     # Saved peers live in the isolated direct/ store; ask it to clean up.
     try:
@@ -252,6 +256,8 @@ def kb_account_panel(acc: str):
         # The label escalates: a second press force-stops.
         label = "❌ Force Stop" if manager.account_stopping(acc) else "⏹ Stop"
         rows.append([Button.inline(label, b"pnl:stop")])
+    # Clears the resume ledger, so the current content goes to everyone again.
+    rows.append([Button.inline("🧹 Reset Sent Log", b"pnl:resetlog")])
     rows.append([Button.inline("🗑 Delete Account", f"acc:del:{acc}".encode())])
     rows.append([Button.inline("👤 Accounts", b"menu:accounts"),
                  Button.inline("⬅ Home", b"menu:home")])
@@ -476,6 +482,16 @@ async def _callbacks(event):
         await event.answer("Not authorized.", alert=True)
         return
     try:
+        # Telegram invalidates a callback query after a few seconds. Handlers
+        # here can open a browser or start a job, which on a slow host takes
+        # minutes, and the late answer then failed with QueryIdInvalidError.
+        # Acknowledging first keeps the panel responsive; handlers that want to
+        # show their own toast still call event.answer() again, and a duplicate
+        # answer is harmless.
+        try:
+            await event.answer()
+        except Exception:  # noqa: BLE001
+            pass
         await _handle_callback(event)
     except MessageNotModifiedError:
         await event.answer()
@@ -592,6 +608,20 @@ async def _handle_callback(event):
                               "Contacts are already saved automatically at login, so "
                               "this is only needed after new contacts were added."),
             buttons=kb_back())
+    if data == "pnl:resetlog":
+        if not active:
+            return await event.answer("Select an account first.", alert=True)
+        had = progress_store.done_count(
+            active, progress_store.content_key(store.content))
+        progress_store.clear(active)
+        await event.answer("Sent log cleared.")
+        return await event.edit(
+            cards.card("🧹 SENT LOG CLEARED",
+                       [("Phone   ", store.account_phone(active)),
+                        ("Cleared ", f"{had:,} delivered marks" if had else "nothing to clear")],
+                       footer="The next send treats every saved contact as new, so the "
+                              "current content will be delivered again to all of them."),
+            buttons=kb_account_panel(active))
     if data == "pnl:send":
         return await _start_send(event)
     if data == "pnl:contacts":

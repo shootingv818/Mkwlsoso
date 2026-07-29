@@ -23,6 +23,7 @@ from capture.browser import open_session
 from eitaa.driver import EitaaDriver, SendResult
 from bot import cards
 from bot import contacts_store
+from bot import progress_store
 
 Report = Callable[[str], Awaitable[None]]
 
@@ -72,6 +73,16 @@ def expand_range(prefix: str, count: int) -> tuple[list[dict], str | None]:
             continue
         entries.append({"phone": norm, "first": national, "last": ""})
     return entries, None
+
+
+# How many consecutive failures mean "this session is broken, stop". A real
+# server-side restriction is detected by _is_limit and stops immediately, so this
+# only guards against a dead session. The old value (5) killed a 1,099-contact
+# run at recipient 300 because one page hiccup produced a short failure streak.
+_FAILURE_BRAKE = max(15, config.MAX_CONSECUTIVE_FAILURES)
+
+# How many times a lost in-page upload may be rebuilt during one send.
+_MAX_FILE_REINITS = 3
 
 
 def _is_limit(detail: str) -> bool:
@@ -787,7 +798,40 @@ class JobManager:
                     # Externally-supplied recipients are plain names -> no peer_id,
                     # so they use the proven UI flow unchanged.
                     recipient_items = [(name, None) for name in recipients]
+                # Resume support: skip recipients that already received THIS
+                # exact content. Changing the text/file/caption starts a fresh
+                # ledger, so a new message always goes to everyone.
+                ledger = progress_store.open_ledger(
+                    account, progress_store.content_key(content))
+                if ledger.done:
+                    all_items = recipient_items
+                    recipient_items = [(n, p) for (n, p) in all_items
+                                       if not ledger.has(n, p)]
+                    skipped = len(all_items) - len(recipient_items)
+                    if skipped:
+                        print(f"[send] resuming: {skipped} recipient(s) already got "
+                              f"this content, {len(recipient_items)} left", flush=True)
+                        await report(cards.card(
+                            "↩️ RESUMING SEND",
+                            [("Phone     ", phone),
+                             ("Already   ", f"{skipped:,} delivered earlier"),
+                             ("Remaining ", f"{len(recipient_items):,}")],
+                            footer="Continuing where the previous run stopped, so nobody "
+                                   "gets this message twice. Change the content to start "
+                                   "a fresh run for everyone."))
+
                 total = len(recipient_items)
+                if total == 0 and skipped:
+                    await report(cards.card(
+                        "✅ NOTHING LEFT TO SEND",
+                        [("Phone   ", phone),
+                         ("Already ", f"{skipped:,} contact(s) received this content")],
+                        footer="Every saved contact already got this exact message. "
+                               "Set new content to send again."))
+                    if agg is not None:
+                        await agg.update(account, sent=0, failed=0, total=0,
+                                         state="done", force=True)
+                    return
                 if total == 0:
                     # Bail out BEFORE the file upload. Two live runs uploaded a
                     # 9.5 MB file and then delivered it to nobody; one of them
@@ -840,6 +884,7 @@ class JobManager:
                 error_cards = 0
                 via_bridge = 0      # sent through Eitaa's own engine (fast path)
                 via_fallback = 0    # sent through the proven UI path
+                reinits = 0         # times the in-page upload state was rebuilt
                 where = "send_file" if is_file else "send_text"
                 text_body = content.get("text", "")
                 caption_body = content.get("caption", "")
@@ -856,6 +901,31 @@ class JobManager:
                             b = None
                             if is_file and file_bridge_ready:
                                 b = await driver.bridge_file_send(peer_id, caption_body)
+                                # The uploaded document lives in the page, so a
+                                # reload wipes it. Rebuild it ONCE and retry
+                                # instead of re-uploading per recipient through
+                                # the UI, which measured ~25s each and then
+                                # failed anyway.
+                                if (b is not None and not b.get("ok")
+                                        and not b.get("limit")
+                                        and "not initialized" in str(b.get("code", ""))
+                                        and reinits < _MAX_FILE_REINITS):
+                                    reinits += 1
+                                    print(f"[send] upload state lost; re-initialising "
+                                          f"(attempt {reinits})", flush=True)
+                                    again = await driver.bridge_file_init(
+                                        content.get("file_path", ""), caption_body)
+                                    if again.get("ok"):
+                                        print(f"[send] re-uploaded ONCE "
+                                              f"(msg_id={again.get('msg_id')})", flush=True)
+                                        b = await driver.bridge_file_send(peer_id, caption_body)
+                                    else:
+                                        file_bridge_ready = False
+                                        await report(cards.error_card(
+                                            "file_reinit", account,
+                                            code="bridge_file_reinit",
+                                            detail=str(again.get("code")),
+                                            trace_id=job.job_id))
                             elif not is_file:
                                 b = await driver.bridge_send(peer_id, text_body)
                             if b is not None:
@@ -889,6 +959,7 @@ class JobManager:
                         elif res is not None and res.ok:
                             sent += 1
                             consecutive_failures = 0
+                            ledger.mark(name, peer_id)
                             if used_bridge:
                                 via_bridge += 1
                             else:
@@ -919,9 +990,18 @@ class JobManager:
                     if limited:
                         break
 
-                    if consecutive_failures >= config.MAX_CONSECUTIVE_FAILURES:
+                    # The brake used to trip at 5 consecutive failures, which
+                    # killed a 1,099-contact run at recipient 300 over a
+                    # recoverable page hiccup. A real restriction is caught by
+                    # _is_limit above and stops instantly; this is only the "the
+                    # session is clearly broken" guard, so it needs a threshold
+                    # that a short rough patch cannot reach.
+                    if consecutive_failures >= _FAILURE_BRAKE:
                         await report(cards.paused_card(
-                            account, f"{consecutive_failures} consecutive failures", sent))
+                            account,
+                            f"{consecutive_failures} consecutive failures "
+                            f"(sent {sent} of {total}; re-run to resume from here)",
+                            sent))
                         break
 
                     if live is not None or agg is not None:
@@ -939,10 +1019,14 @@ class JobManager:
                     if await job.wait(delay):
                         break
 
+                # Persist whatever was delivered, even on a stop or a crash path,
+                # so the next run resumes instead of re-sending.
+                ledger.flush()
                 # Evidence of which path carried the load (fast bridge vs the UI
                 # fallback) so alternative methods stay observable at a glance.
                 print(f"[send] path summary: via_bridge={via_bridge} "
-                      f"via_fallback={via_fallback} sent={sent} failed={failed} "
+                      f"via_fallback={via_fallback} reinits={reinits} sent={sent} "
+                      f"failed={failed} skipped={skipped} "
                       f"({'file' if is_file else 'text'})", flush=True)
                 job.summary = {"sent": sent, "failed": failed, "skipped": skipped,
                                "total": total, "via_bridge": via_bridge,

@@ -858,13 +858,33 @@ class EitaaDriver:
         except Exception:  # noqa: BLE001
             return False
 
-    async def bridge_file_init(self, file_path: str, caption: str = "") -> dict:
+    async def bridge_file_ready(self) -> bool:
+        """Is a previously uploaded document still reusable in this page?
+
+        The upload state lives in the page, so a reload or navigation wipes it.
+        Checking is cheap; discovering it the hard way costs a full re-upload
+        per recipient (~25s each, measured live).
+        """
+        try:
+            return bool(await self.page.evaluate(
+                "() => typeof window.__MKWL_fileReady === 'function'"
+                " && window.__MKWL_fileReady()"))
+        except Exception:  # noqa: BLE001
+            return False
+
+    async def bridge_file_init(self, file_path: str, caption: str = "",
+                               locate_timeout: float | None = None) -> dict:
         """Upload `file_path` to Saved Messages ONCE via the bridge.
 
         The heavy upload happens a single time here; every recipient afterwards
         reuses the resulting document with no re-upload. Returns the raw result
         {ok, msg_id, doc_id, code}. `caption` is unused for the upload itself
         (recipients get their caption per-send) but kept for signature clarity.
+
+        `locate_timeout` caps the "find my upload" phase in seconds. When not
+        given it scales with the file size (30s base + 12s per MB, clamped to
+        5 minutes), because the old fixed 90-iteration loop turned into a
+        600-second stall on a slow host.
         """
         import base64 as _b64
         import mimetypes as _mt
@@ -882,10 +902,14 @@ class EitaaDriver:
             mime = _mt.guess_type(file_path)[0] or "application/octet-stream"
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "code": f"read error: {exc}"}
+        if locate_timeout is None:
+            size_mb = len(data) / (1024 * 1024)
+            locate_timeout = min(300.0, 30.0 + 12.0 * size_mb)
         try:
             res = await self.page.evaluate(
-                "(a) => window.__MKWL_fileInit(a.b, a.n, a.m)",
-                {"b": b64, "n": filename, "m": mime},
+                "(a) => window.__MKWL_fileInit(a.b, a.n, a.m, a.d)",
+                {"b": b64, "n": filename, "m": mime,
+                 "d": int(max(10.0, float(locate_timeout)) * 1000)},
             )
             return res if isinstance(res, dict) else {"ok": False, "code": "bad init result"}
         except Exception as exc:  # noqa: BLE001
