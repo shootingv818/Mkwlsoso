@@ -55,12 +55,23 @@ class Config:
     ACTION_TRAIL_SECONDS: int = _get_int("ACTION_TRAIL_SECONDS", 8)
     RAW_ENCRYPTION_KEY: str = os.environ.get("RAW_ENCRYPTION_KEY", "")
 
-    # Broadcaster (tabchi) rate limiting
+    # Pacing for the CLI campaign runner (jobs/campaign.py) ONLY. The Telegram
+    # panel does NOT read these -- it uses TEXT_SEND_DELAY and SEND_CONCURRENCY
+    # below. Changing these while using the panel changes nothing, which is
+    # exactly the confusion this comment exists to prevent.
     SEND_MIN_DELAY: int = _get_int("SEND_MIN_DELAY", 8)
     SEND_MAX_DELAY: int = _get_int("SEND_MAX_DELAY", 18)
     SEND_BATCH_SIZE: int = _get_int("SEND_BATCH_SIZE", 20)
     SEND_BATCH_COOLDOWN: int = _get_int("SEND_BATCH_COOLDOWN", 90)
+
     MAX_CONSECUTIVE_FAILURES: int = _get_int("MAX_CONSECUTIVE_FAILURES", 5)
+    # How many recipients may be in flight at once on the fast (API) path.
+    # 1 == the proven sequential behaviour. Raise it to trade safety margin for
+    # throughput; the UI fallback always stays serial because it drives one page.
+    SEND_CONCURRENCY: int = _get_int("SEND_CONCURRENCY", 1)
+    # A server-declared wait (FLOOD_WAIT_n) up to this many seconds is honoured
+    # and the run continues; anything longer stops the run and reports it.
+    MAX_FLOOD_WAIT: int = _get_int("MAX_FLOOD_WAIT", 90)
 
     JOBS_DIR: Path = Path(os.environ.get("ARTIFACTS_DIR", "./artifacts")) / "jobs"
 

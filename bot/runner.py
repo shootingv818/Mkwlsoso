@@ -84,6 +84,32 @@ _FAILURE_BRAKE = max(15, config.MAX_CONSECUTIVE_FAILURES)
 # How many times a lost in-page upload may be rebuilt during one send.
 _MAX_FILE_REINITS = 3
 
+# How many recipients may be served by the per-recipient UI upload before the run
+# gives up. Each one measured ~25 SECONDS live, so letting a 1,000-contact list
+# crawl down this path means an 7-hour run that usually fails anyway. Stopping
+# with a clear reason is better: the ledger makes the re-run resume for free.
+_MAX_UI_FILE_FALLBACKS = 5
+
+
+def _flood_wait(code: object, wait: object = None) -> int | None:
+    """Seconds the server told us to wait, from FLOOD_WAIT_n or an explicit field.
+
+    A short server-declared pause is an instruction to obey, not a reason to
+    abandon the remaining recipients -- which is what the old code did.
+    """
+    for candidate in (wait, code):
+        if candidate is None:
+            continue
+        if isinstance(candidate, (int, float)) and candidate > 0:
+            return int(candidate)
+        m = re.search(r"(?:FLOOD_WAIT_|WAIT_)(\d+)", str(candidate), re.I)
+        if m:
+            try:
+                return int(m.group(1))
+            except ValueError:
+                continue
+    return None
+
 
 def _is_limit(detail: str) -> bool:
     low = (detail or "").lower()
@@ -491,10 +517,13 @@ class JobManager:
             res = await driver.bridge_contacts_list()
         except Exception:  # noqa: BLE001
             res = None
-        if res and res.get("ok") and res.get("contacts"):
-            items = res["contacts"]
+        if res and res.get("ok"):
+            items = res.get("contacts") or []
             print(f"[contacts] api list: {len(items)} contacts "
                   f"(skipped {res.get('skipped', 0)} of {res.get('raw', 0)})", flush=True)
+            # An empty-but-successful answer means this account genuinely has no
+            # contacts. Scrolling the DOM for 10 minutes cannot invent any, so
+            # take the answer instead of falling back.
             return items, "api"
 
         code = (res or {}).get("code") if isinstance(res, dict) else "bridge_unavailable"
@@ -758,9 +787,18 @@ class JobManager:
         kind = "File" if content.get("kind") == "file" else "Text"
         delay = float(settings.get("text_send_delay", config.TEXT_SEND_DELAY))
         log_every = int(settings.get("send_log_every", config.SEND_LOG_EVERY))
+        try:
+            conc = int(settings.get("send_concurrency", config.SEND_CONCURRENCY))
+        except (TypeError, ValueError):
+            conc = 1
+        conc = max(1, min(10, conc))
         self._busy.add(account)
         start = time.time()
         sent = failed = skipped = 0
+        # Declared out here so the finally block can always persist it: a Force
+        # Stop cancels this task, and a CancelledError skips every flush inside
+        # the body (measured: 11 delivered, 0 recorded -> 11 duplicates).
+        ledger = None
         try:
             async with open_session(account) as session:
                 driver = EitaaDriver(session)
@@ -885,52 +923,105 @@ class JobManager:
                 via_bridge = 0      # sent through Eitaa's own engine (fast path)
                 via_fallback = 0    # sent through the proven UI path
                 reinits = 0         # times the in-page upload state was rebuilt
+                ui_file_sends = 0   # file sends that had to re-upload per recipient
+                waited_for_server = 0.0  # seconds spent honouring FLOOD_WAIT
                 where = "send_file" if is_file else "send_text"
                 text_body = content.get("text", "")
                 caption_body = content.get("caption", "")
-                for i, (name, peer_id) in enumerate(recipient_items, start=1):
-                    if job.stop:
-                        break
-                    limited = False
-                    try:
-                        res = None
-                        used_bridge = False
-                        # Fast path: send via Eitaa's own engine using peer_id.
-                        # Text -> __MKWL_send; file -> reuse the once-uploaded doc.
-                        if peer_id:
-                            b = None
-                            if is_file and file_bridge_ready:
-                                b = await driver.bridge_file_send(peer_id, caption_body)
+
+                async def _fast(peer: str | None):
+                    """One fast-path (in-page API) send. No shared state, so a
+                    batch of these can safely run concurrently."""
+                    if not peer:
+                        return None
+                    if is_file:
+                        if not file_bridge_ready:
+                            return None
+                        return await driver.bridge_file_send(peer, caption_body)
+                    return await driver.bridge_send(peer, text_body)
+
+                # `conc` recipients are attempted at once on the fast path. The
+                # UI fallback below stays strictly sequential because it drives a
+                # single browser page. conc=1 reproduces the old behaviour byte
+                # for byte, which is why it stays the default.
+                i = 0
+                pos = 0
+                limited = False
+                while pos < total and not job.stop and not limited:
+                    batch = recipient_items[pos:pos + conc]
+                    pos += len(batch)
+                    # Always via gather, even for a single recipient: it is the
+                    # only form that turns an exception into a value instead of
+                    # killing the job (and with it the unflushed ledger).
+                    attempts = await asyncio.gather(
+                        *[_fast(p) for _, p in batch], return_exceptions=True)
+
+                    for (name, peer_id), b in zip(batch, attempts):
+                        # NOTE: do NOT skip the rest of the batch on stop/limit.
+                        # Those sends already reached the server, so dropping
+                        # their results here would under-count them and deliver
+                        # the same message again on the next run.
+                        if (job.stop or limited) and not (
+                                isinstance(b, dict) and b.get("ok")):
+                            continue
+                        if job.stop or limited:
+                            # A success that landed after the stop: bank it so it
+                            # is never sent twice, then stop.
+                            sent += 1
+                            via_bridge += 1
+                            ledger.mark(name, peer_id)
+                            continue
+                        i += 1
+                        if isinstance(b, BaseException):
+                            b = {"ok": False, "code": f"{type(b).__name__}: {b}"}
+                        try:
+                            res = None
+                            used_bridge = False
+
+                            # A server-declared wait is an instruction, not a
+                            # failure: honour short ones and carry on instead of
+                            # abandoning the rest of the list.
+                            if b is not None and b.get("limit"):
+                                wait_s = _flood_wait(b.get("code"), b.get("wait"))
+                                if wait_s and wait_s <= config.MAX_FLOOD_WAIT:
+                                    print(f"[send] server asked for {wait_s}s; waiting",
+                                          flush=True)
+                                    waited_for_server += wait_s
+                                    if await job.wait(wait_s):
+                                        break
+                                    b = await _fast(peer_id)
+                                    if isinstance(b, BaseException):
+                                        b = {"ok": False, "code": type(b).__name__}
+
+                            if is_file and b is not None and not b.get("ok") \
+                                    and not b.get("limit") \
+                                    and "not initialized" in str(b.get("code", "")) \
+                                    and reinits < _MAX_FILE_REINITS:
                                 # The uploaded document lives in the page, so a
-                                # reload wipes it. Rebuild it ONCE and retry
-                                # instead of re-uploading per recipient through
-                                # the UI, which measured ~25s each and then
-                                # failed anyway.
-                                if (b is not None and not b.get("ok")
-                                        and not b.get("limit")
-                                        and "not initialized" in str(b.get("code", ""))
-                                        and reinits < _MAX_FILE_REINITS):
-                                    reinits += 1
-                                    print(f"[send] upload state lost; re-initialising "
-                                          f"(attempt {reinits})", flush=True)
-                                    again = await driver.bridge_file_init(
-                                        content.get("file_path", ""), caption_body)
-                                    if again.get("ok"):
-                                        print(f"[send] re-uploaded ONCE "
-                                              f"(msg_id={again.get('msg_id')})", flush=True)
-                                        b = await driver.bridge_file_send(peer_id, caption_body)
-                                    else:
-                                        file_bridge_ready = False
-                                        await report(cards.error_card(
-                                            "file_reinit", account,
-                                            code="bridge_file_reinit",
-                                            detail=str(again.get("code")),
-                                            trace_id=job.job_id))
-                            elif not is_file:
-                                b = await driver.bridge_send(peer_id, text_body)
+                                # reload wipes it. Rebuild ONCE and retry instead
+                                # of re-uploading per recipient through the UI,
+                                # which measured ~25s each and failed anyway.
+                                reinits += 1
+                                print(f"[send] upload state lost; re-initialising "
+                                      f"(attempt {reinits})", flush=True)
+                                again = await driver.bridge_file_init(
+                                    content.get("file_path", ""), caption_body)
+                                if again.get("ok"):
+                                    print(f"[send] re-uploaded ONCE "
+                                          f"(msg_id={again.get('msg_id')})", flush=True)
+                                    b = await _fast(peer_id)
+                                    if isinstance(b, BaseException):
+                                        b = {"ok": False, "code": type(b).__name__}
+                                else:
+                                    file_bridge_ready = False
+                                    await report(cards.error_card(
+                                        "file_reinit", account,
+                                        code="bridge_file_reinit",
+                                        detail=str(again.get("code")),
+                                        trace_id=job.job_id))
+
                             if b is not None:
                                 if b.get("limit"):
-                                    # Server itself reported a flood/limit.
                                     await report(cards.restriction_card(
                                         account, f"server: {b.get('code')}", sent))
                                     limited = True
@@ -942,80 +1033,112 @@ class JobManager:
                                 else:
                                     print(f"[send] bridge miss for {name[:18]!r} "
                                           f"({b.get('code')}); UI fallback", flush=True)
-                        # Fallback: proven UI send (covers no-peer_id, a bridge
-                        # miss, or an unavailable file bridge).
-                        if not limited and res is None:
-                            if is_file:
-                                res = await driver.send_file(
-                                    content.get("file_path", ""),
-                                    caption=caption_body, query=name)
-                            else:
-                                res = await driver.send_text(name, text_body, verify=True)
 
-                        if limited:
-                            # A server-reported limit was already surfaced above;
-                            # do not count it as a per-send failure.
-                            pass
-                        elif res is not None and res.ok:
-                            sent += 1
-                            consecutive_failures = 0
-                            ledger.mark(name, peer_id)
-                            if used_bridge:
-                                via_bridge += 1
+                            # Fallback: proven UI send (covers no-peer_id, a
+                            # bridge miss, or an unavailable file bridge). Always
+                            # sequential -- it types into one page.
+                            if not limited and res is None:
+                                if is_file:
+                                    res = await driver.send_file(
+                                        content.get("file_path", ""),
+                                        caption=caption_body, query=name)
+                                else:
+                                    res = await driver.send_text(name, text_body, verify=True)
+
+                            if limited:
+                                # Already surfaced above; not a per-send failure.
+                                pass
+                            elif res is not None and res.ok:
+                                sent += 1
+                                consecutive_failures = 0
+                                ledger.mark(name, peer_id)
+                                if used_bridge:
+                                    via_bridge += 1
+                                else:
+                                    via_fallback += 1
+                                    if is_file and peer_id:
+                                        # A file that goes through the UI path is
+                                        # re-uploaded for THIS recipient alone.
+                                        ui_file_sends += 1
                             else:
-                                via_fallback += 1
-                        else:
+                                failed += 1
+                                consecutive_failures += 1
+                                detail = res.detail if res is not None else "send produced no result"
+                                # Surface EXACTLY why the send failed (capped to
+                                # avoid spam).
+                                if error_cards < 12:
+                                    await report(cards.error_card(
+                                        where, account, target=name, code="send_failed",
+                                        detail=detail, trace_id=job.job_id))
+                                    error_cards += 1
+                                if _is_limit(detail):
+                                    await report(cards.restriction_card(account, detail, sent))
+                                    limited = True
+                        except Exception as exc:  # noqa: BLE001
                             failed += 1
                             consecutive_failures += 1
-                            detail = res.detail if res is not None else "send produced no result"
-                            # Surface EXACTLY why the send failed (capped to
-                            # avoid spam; the brake stops us after a few anyway).
                             if error_cards < 12:
                                 await report(cards.error_card(
-                                    where, account, target=name, code="send_failed",
-                                    detail=detail, trace_id=job.job_id))
+                                    where, account, target=name,
+                                    code=type(exc).__name__, detail=str(exc),
+                                    trace_id=job.job_id))
                                 error_cards += 1
-                            if _is_limit(detail):
-                                await report(cards.restriction_card(account, detail, sent))
-                                limited = True
-                    except Exception as exc:  # noqa: BLE001
-                        failed += 1
-                        consecutive_failures += 1
-                        if error_cards < 12:
-                            await report(cards.error_card(
-                                where, account, target=name,
-                                code=type(exc).__name__, detail=str(exc),
-                                trace_id=job.job_id))
-                            error_cards += 1
-                    if limited:
+
+                        if limited:
+                            # Do NOT break here: the remaining replies in this
+                            # batch are already-completed sends, and the guard at
+                            # the top of the loop banks them so nobody is sent to
+                            # twice. The while-loop below is what stops the run.
+                            continue
+
+                        # Guard against the silent disaster: the fast upload is
+                        # gone for good and every remaining recipient would be
+                        # served by a full ~25s re-upload. Stop and say why --
+                        # the ledger means a re-run continues from here.
+                        if is_file and ui_file_sends >= _MAX_UI_FILE_FALLBACKS:
+                            await report(cards.card(
+                                "🛑 SEND STOPPED — SLOW PATH",
+                                [("Phone", phone),
+                                 ("Sent", f"{sent:,} of {total:,}"),
+                                 ("Reason", f"the shared upload could not be reused for "
+                                            f"{ui_file_sends} recipients")],
+                                footer="Each of those had to re-upload the whole file "
+                                       "(~25s each), so the run was stopped instead of "
+                                       "crawling through the rest. Press Send again to "
+                                       "resume from here; nobody gets it twice."))
+                            limited = True
+                            break
+
+                        # The brake used to trip at 5 consecutive failures, which
+                        # killed a 1,099-contact run at recipient 300 over a
+                        # recoverable page hiccup. A real restriction is caught
+                        # by _is_limit above and stops instantly; this is only
+                        # the "session is clearly broken" guard, so it needs a
+                        # threshold a short rough patch cannot reach.
+                        if consecutive_failures >= _FAILURE_BRAKE:
+                            await report(cards.paused_card(
+                                account,
+                                f"{consecutive_failures} consecutive failures "
+                                f"(sent {sent} of {total}; re-run to resume from here)",
+                                sent))
+                            limited = True
+                            break
+
+                        if live is not None or agg is not None:
+                            await self._send_progress(
+                                live, agg, account, phone, sent=sent, failed=failed,
+                                total=total, elapsed=time.time() - start,
+                                status="🟢 Sending", state="running",
+                                engine=engine, kind=kind)
+                        elif i % log_every == 0:
+                            await report(cards.send_progress(
+                                sent, failed, skipped, total - i, time.time() - start))
+
+                    if limited or job.stop:
                         break
-
-                    # The brake used to trip at 5 consecutive failures, which
-                    # killed a 1,099-contact run at recipient 300 over a
-                    # recoverable page hiccup. A real restriction is caught by
-                    # _is_limit above and stops instantly; this is only the "the
-                    # session is clearly broken" guard, so it needs a threshold
-                    # that a short rough patch cannot reach.
-                    if consecutive_failures >= _FAILURE_BRAKE:
-                        await report(cards.paused_card(
-                            account,
-                            f"{consecutive_failures} consecutive failures "
-                            f"(sent {sent} of {total}; re-run to resume from here)",
-                            sent))
-                        break
-
-                    if live is not None or agg is not None:
-                        await self._send_progress(
-                            live, agg, account, phone, sent=sent, failed=failed,
-                            total=total, elapsed=time.time() - start,
-                            status="🟢 Sending", state="running",
-                            engine=engine, kind=kind)
-                    elif i % log_every == 0:
-                        await report(cards.send_progress(
-                            sent, failed, skipped, total - i, time.time() - start))
-
-                    # Interruptible: a stop wakes this immediately instead of
-                    # waiting out the whole delay.
+                    # One pace interval per batch: with conc>1 that is the whole
+                    # point, `conc` messages per `delay` instead of one.
+                    # Interruptible: a stop wakes this immediately.
                     if await job.wait(delay):
                         break
 
@@ -1026,29 +1149,52 @@ class JobManager:
                 # fallback) so alternative methods stay observable at a glance.
                 print(f"[send] path summary: via_bridge={via_bridge} "
                       f"via_fallback={via_fallback} reinits={reinits} sent={sent} "
-                      f"failed={failed} skipped={skipped} "
+                      f"failed={failed} skipped={skipped} conc={conc} "
+                      f"server_wait={int(waited_for_server)}s "
                       f"({'file' if is_file else 'text'})", flush=True)
                 job.summary = {"sent": sent, "failed": failed, "skipped": skipped,
                                "total": total, "via_bridge": via_bridge,
-                               "via_fallback": via_fallback}
+                               "via_fallback": via_fallback, "reinits": reinits,
+                               "concurrency": conc}
+                # Remember the outcome so the home card shows a real last result
+                # instead of nothing once the job is gone.
+                try:
+                    from bot.store import store as _store
+                    _store.set_last_run(account=phone, kind=kind, sent=sent,
+                                        failed=failed, skipped=skipped, total=total,
+                                        elapsed=time.time() - start,
+                                        stopped=bool(job.stop))
+                except Exception:  # noqa: BLE001 - reporting must never break a job
+                    pass
+                stopped_early = bool(job.stop) or limited
                 await self._send_progress(
                     live, agg, account, phone, sent=sent, failed=failed,
                     total=total, elapsed=time.time() - start,
-                    status="🛑 Stopped" if job.stop else "✅ Done",
-                    state="stopped" if job.stop else "done",
+                    status="🛑 Stopped" if stopped_early else "✅ Done",
+                    state="stopped" if stopped_early else "done",
                     engine=engine, kind=kind, force=True)
                 # In a multi-account run the combined summary is posted once by
                 # the supervisor, so skip the per-account finish card.
                 if agg is None:
+                    # `limited` covers a server restriction, the failure brake
+                    # and the dead-upload guard. Reporting those as a clean
+                    # "FINISHED" would hide that the list was cut short.
                     await report(cards.send_finished(
                         account, kind, sent, failed, skipped, total,
-                        time.time() - start, stopped=job.stop))
+                        time.time() - start, stopped=bool(job.stop) or limited))
         except Exception as exc:  # noqa: BLE001
             if agg is not None:
                 await agg.update(account, state="failed", force=True)
             await report(cards.error_card("send_job", account, code=type(exc).__name__,
                                           detail=str(exc), trace_id=job.job_id))
         finally:
+            # Runs on the cancellation path too, so a Force Stop keeps its
+            # delivered-to record and the re-run does not repeat those sends.
+            if ledger is not None:
+                try:
+                    ledger.flush()
+                except Exception:  # noqa: BLE001
+                    pass
             self._busy.discard(account)
 
     # ---- peer harvesting (what the browser-free sender needs) ----

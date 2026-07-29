@@ -10,6 +10,7 @@ that the high-level Playwright events do not always fully expose.
 
 from __future__ import annotations
 
+import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncIterator
@@ -46,15 +47,42 @@ class BrowserSession:
         self.page: Page | None = None
         self.cdp: CDPSession | None = None
 
+    def _profile_in_use(self) -> int | None:
+        """PID of a LIVE process already using this profile, else None.
+
+        Deleting a lock that a running Chromium still holds would corrupt that
+        browser's session, so the leftover-lock cleanup below must never guess.
+        """
+        target = str(self.profile_dir.resolve())
+        try:
+            pids = [p for p in os.listdir("/proc") if p.isdigit()]
+        except OSError:
+            return None  # not Linux / no procfs -> treat as "cannot prove it is dead"
+        for pid in pids:
+            try:
+                with open(f"/proc/{pid}/cmdline", "rb") as f:
+                    cmd = f.read().replace(b"\x00", b" ").decode("utf-8", "ignore")
+            except OSError:
+                continue
+            if not cmd or "chrome" not in cmd.lower():
+                continue
+            if target in cmd or f"--user-data-dir={self.profile_dir}" in cmd:
+                return int(pid)
+        return None
+
     def _clear_stale_locks(self) -> list[str]:
-        """Remove leftover Chromium singleton locks from a crashed run.
+        """Remove leftover Chromium singleton locks from a CRASHED run.
 
         A killed browser (OOM, force stop, service restart) leaves these behind
-        and the next launch dies with "Opening in existing browser session",
-        taking the whole job with it. They are safe to delete when no Chromium is
-        actually using the profile, which is the case here: this session is the
-        only owner of the profile and it has not launched yet.
+        and the next launch dies with "profile appears to be in use", taking the
+        whole job with it. Only removed once no live process is using the
+        profile -- verified through /proc, not assumed.
         """
+        alive = self._profile_in_use()
+        if alive is not None:
+            print(f"[browser] profile {self.account} is really in use by pid "
+                  f"{alive}; leaving its lock alone", flush=True)
+            return []
         removed = []
         for name in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
             p = self.profile_dir / name
@@ -66,32 +94,48 @@ class BrowserSession:
                 pass
         return removed
 
+    @staticmethod
+    def _is_lock_error(exc: BaseException) -> bool:
+        msg = str(exc).lower()
+        return any(s in msg for s in (
+            "already in use", "existing browser session", "profile appears to be in use",
+            "singletonlock", "cannot create a file when that file already exists"))
+
     async def start(self) -> "BrowserSession":
         self.profile_dir.mkdir(parents=True, exist_ok=True)
         self._pw = await async_playwright().start()
         try:
             self.context = await self._launch()
         except Exception as exc:  # noqa: BLE001
-            if "already in use" not in str(exc) and "existing browser session" not in str(exc):
+            if not self._is_lock_error(exc):
                 await self._stop_playwright()
                 raise
             removed = self._clear_stale_locks()
-            print(f"[browser] profile {self.account} was locked; cleared "
-                  f"{removed or 'nothing'} and retrying", flush=True)
+            if not removed:
+                await self._stop_playwright()
+                raise
+            print(f"[browser] profile {self.account} had a stale lock; cleared "
+                  f"{removed} and retrying", flush=True)
             try:
                 self.context = await self._launch()
             except Exception:  # noqa: BLE001
                 await self._stop_playwright()
                 raise
-        # Inject instrumentation BEFORE any page script runs (deep capture).
-        if self.init_script_path and self.init_script_path.is_file():
-            await self.context.add_init_script(
-                script=self.init_script_path.read_text(encoding="utf-8")
-            )
-        # Reuse an existing page if the profile restored one, else open a page.
-        pages = self.context.pages
-        self.page = pages[0] if pages else await self.context.new_page()
-        self.cdp = await self.context.new_cdp_session(self.page)
+        # From here a REAL browser is running: any failure must close it, or the
+        # process survives holding the profile lock and blocks every later job.
+        try:
+            # Inject instrumentation BEFORE any page script runs (deep capture).
+            if self.init_script_path and self.init_script_path.is_file():
+                await self.context.add_init_script(
+                    script=self.init_script_path.read_text(encoding="utf-8")
+                )
+            # Reuse an existing page if the profile restored one, else open one.
+            pages = self.context.pages
+            self.page = pages[0] if pages else await self.context.new_page()
+            self.cdp = await self.context.new_cdp_session(self.page)
+        except Exception:  # noqa: BLE001
+            await self.close()
+            raise
         return self
 
     async def goto(self, url: str | None = None) -> None:

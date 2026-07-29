@@ -42,12 +42,20 @@ def sanitize(text: str, limit: int = 300) -> str:
 
 
 def _rows(pairs: Iterable[tuple[str, object]]) -> list[str]:
-    """Format key/value pairs with aligned keys as `• Key   : value`."""
-    pairs = [(str(k), v) for k, v in pairs if v is not None]
-    if not pairs:
-        return []
-    width = max(len(k) for k, _ in pairs)
-    return [f"• {k.ljust(width)} : {v}" for k, v in pairs]
+    """Format key/value pairs as `• Key: value`.
+
+    Keys are NOT padded to a common width any more. Telegram renders card text
+    in a proportional font, so space padding does not line anything up -- on a
+    phone it just produced ragged rows with random gaps. Callers may still pass
+    padded labels (many do); the padding is stripped here so every card gets the
+    same tidy output without touching every call site.
+    """
+    out = []
+    for k, v in pairs:
+        if v is None:
+            continue
+        out.append(f"• {str(k).strip()}: {v}")
+    return out
 
 
 def card(title: str, pairs: Iterable[tuple[str, object]] | None = None,
@@ -305,23 +313,63 @@ def _ping_mark(ping_ms: int | None) -> str:
     return f"🔴 {ping_ms} ms"
 
 
-def panel_home(version: str, accounts: int, active: str | None,
+def _ago(ts: float | None) -> str:
+    """How long ago a timestamp was, in words."""
+    if not ts:
+        return "never"
+    d = max(0, time.time() - float(ts))
+    if d < 90:
+        return "just now"
+    if d < 3600:
+        return f"{int(d / 60)}m ago"
+    if d < 172800:
+        return f"{int(d / 3600)}h ago"
+    return f"{int(d / 86400)}d ago"
+
+
+def panel_home(accounts: int, ready: int, active: str | None,
                engine: str | None = None, ping_ms: int | None = None,
-               bot_online: bool = True, contacts: int | None = None,
-               running: int = 0, content: str | None = None) -> str:
-    """Home screen: what's connected, what's loaded, what's running."""
+               contacts: int | None = None, running: int = 0,
+               content: str | None = None, last_run: dict | None = None) -> str:
+    """Home screen: what can send, what is loaded, what happened last.
+
+    Deliberately does NOT show "Bot: online" (if it were offline no card would
+    arrive), a version string, or a progress bar. Every row here is something the
+    owner can act on.
+    """
+    acc_txt = None
+    if accounts:
+        missing = max(0, accounts - max(0, ready))
+        acc_txt = f"{accounts}"
+        if ready:
+            acc_txt += f" ({ready} ready"
+            acc_txt += f" · {missing} without contacts)" if missing else ")"
+        elif missing:
+            acc_txt += f" ({missing} without contacts)"
+    lr = last_run or {}
+    lr_txt = None
+    if lr:
+        bits = [f"{int(lr.get('sent', 0)):,} sent"]
+        if lr.get("failed"):
+            bits.append(f"{int(lr['failed']):,} failed")
+        if lr.get("skipped"):
+            bits.append(f"{int(lr['skipped']):,} skipped")
+        if lr.get("elapsed"):
+            bits.append(fmt_duration(float(lr["elapsed"])))
+        lr_txt = " · ".join(bits) + f" ({_ago(lr.get('at'))})"
+
     lines = [
         "🤖 EITAA MANAGER",
         DIVIDER,
         *_rows([
-            ("Bot     ", "🟢 online" if bot_online else "🔴 offline"),
-            ("Eitaa   ", _ping_mark(ping_ms)),
-            ("Accounts", accounts if accounts else "none yet"),
-            ("Contacts", f"{contacts:,}" if contacts else None),
-            ("Active  ", active or "—"),
-            ("Running ", f"⏳ {running} job(s)" if running else "idle"),
-            ("Content ", content),
-            ("Version ", version),
+            ("Eitaa", _ping_mark(ping_ms)),
+            ("Accounts", acc_txt or "none yet"),
+            ("Contacts", f"{contacts:,} sendable" if contacts else "none saved yet"),
+            ("Active", active or "—"),
+            ("Job", f"⏳ {running} running" if running else "idle"),
+            ("Content", content or "nothing set"),
+            ("Last run", lr_txt),
+            ("Engine", engine),
         ]),
         DIVIDER,
         "Pick a section below.",
@@ -348,7 +396,8 @@ def account_added(account: str, phone: str, contacts: int | None, pvs: int | Non
 
 def account_panel(account: str, phone: str, contacts: int | None, pvs: int | None,
                   engine: str | None, busy: bool, peers: int | None = None,
-                  saved: int | None = None, saved_age: float | None = None) -> str:
+                  saved: int | None = None, saved_age: float | None = None,
+                  meta_age: float | None = None, pending: int | None = None) -> str:
     """One account's panel.
 
     `saved` is how many contacts are in the local cache -- that is what a send
@@ -374,16 +423,26 @@ def account_panel(account: str, phone: str, contacts: int | None, pvs: int | Non
     else:
         footer = f"Ready to send to {saved:,} saved contact(s)."
 
+    # "On Eitaa" is a snapshot from the last measurement, so it says WHEN it was
+    # taken. Without that this row silently disagreed with reality (it showed
+    # 1,414 for an account that had 1,094) and nothing explained why.
+    on_eitaa = None
+    if isinstance(contacts, int) and contacts >= 0:
+        on_eitaa = f"{contacts:,}"
+        if meta_age:
+            on_eitaa += f" (measured {_ago(time.time() - meta_age * 3600)})"
+
     return card(
         "👤 ACCOUNT",
         [
-            ("Phone    ", phone),
-            ("State    ", "⏳ busy" if busy else "🟢 idle"),
-            ("Saved    ", f"{saved:,} contacts ({age})" if saved else "none"),
-            ("On Eitaa ", f"{contacts:,}" if isinstance(contacts, int) and contacts >= 0 else "—"),
-            ("Chats    ", pvs if isinstance(pvs, int) and pvs >= 0 else "—"),
+            ("Phone", phone),
+            ("State", "⏳ busy" if busy else "🟢 idle"),
+            ("Saved", f"{saved:,} contacts ({age})" if saved else "none"),
+            ("On Eitaa", on_eitaa or "—"),
+            ("Chats", pvs if isinstance(pvs, int) and pvs >= 0 else None),
+            ("Already sent", f"{pending:,} got the current content" if pending else None),
             # Only meaningful while the browser-free engine is enabled.
-            ("Peers    ", peers if (peers and engine == "direct") else None),
+            ("Peers", peers if (peers and engine == "direct") else None),
         ],
         footer=footer,
     )

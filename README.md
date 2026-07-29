@@ -128,14 +128,23 @@ python cli.py campaign-stop   --job <job_id>     # stops after the current recip
 DISPLAY=:99 python cli.py campaign --account test1 --resume <job_id>
 ```
 
-### Rate limiting (in .env)
+### Send pacing (in .env)
+
+The Telegram panel and the CLI campaign have SEPARATE pacing settings.
 
 ```
+# panel (bot/runner.py)
+TEXT_SEND_DELAY=3          # seconds between sends (between batches when SEND_CONCURRENCY > 1)
+SEND_CONCURRENCY=1         # recipients in flight at once on the fast path (1-10)
+MAX_FLOOD_WAIT=90          # obey a server-declared wait up to this, then continue
+
+# CLI campaign only (jobs/campaign.py) - the panel ignores these
 SEND_MIN_DELAY=8
 SEND_MAX_DELAY=18
 SEND_BATCH_SIZE=20
 SEND_BATCH_COOLDOWN=90
-MAX_CONSECUTIVE_FAILURES=5
+
+MAX_CONSECUTIVE_FAILURES=5 # both
 ```
 
 The campaign is restart-safe: if the server reboots or the process is killed,

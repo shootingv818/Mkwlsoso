@@ -57,19 +57,43 @@ def target_key(title: str, peer_id: str | None) -> str:
 
 
 class Ledger:
-    """Delivered targets for one account + one content fingerprint."""
+    """Delivered targets for one account + one content fingerprint.
 
-    def __init__(self, account: str, key: str, done: set[str]) -> None:
+    `done` holds one entry per PERSON (so counting it is meaningful). `aliases`
+    holds the secondary identity of the same person -- their display name -- and
+    is only used for lookups, never counted.
+    """
+
+    def __init__(self, account: str, key: str, done: set[str],
+                 aliases: set[str] | None = None) -> None:
         self.account = account
         self.key = key
         self.done: set[str] = done
+        self.aliases: set[str] = aliases or set()
         self._dirty = 0
 
     def has(self, title: str, peer_id: str | None) -> bool:
-        return target_key(title, peer_id) in self.done
+        """Was this target already delivered to?
+
+        BOTH identities are checked, because the same person can arrive with a
+        peer_id from the API list and without one from the DOM scrape. Matching
+        on one key only would resend to everyone whose id changed source.
+        """
+        key = target_key(title, peer_id)
+        if key in self.done or key in self.aliases:
+            return True
+        if title:
+            name_key = "title:" + str(title)
+            if name_key in self.done or name_key in self.aliases:
+                return True
+        return False
 
     def mark(self, title: str, peer_id: str | None, flush_every: int = 25) -> None:
         self.done.add(target_key(title, peer_id))
+        # Remember the name as an alias, so a later run that lost the peer_id
+        # (or gained one) still recognises this person as already served.
+        if peer_id and title:
+            self.aliases.add("title:" + str(title))
         self._dirty += 1
         # Batch the writes: one fsync per recipient would be pure overhead, and
         # losing at most `flush_every` entries only costs a few duplicates.
@@ -79,7 +103,8 @@ class Ledger:
     def flush(self) -> None:
         self._dirty = 0
         record = {"account": self.account, "key": self.key,
-                  "updated": time.time(), "done": sorted(self.done)}
+                  "updated": time.time(), "done": sorted(self.done),
+                  "aliases": sorted(self.aliases)}
         p = path_for(self.account)
         try:
             p.parent.mkdir(parents=True, exist_ok=True)
@@ -98,7 +123,8 @@ def open_ledger(account: str, key: str) -> Ledger:
             data = json.loads(p.read_text(encoding="utf-8"))
             if isinstance(data, dict) and data.get("key") == key:
                 done = {str(x) for x in (data.get("done") or [])}
-                return Ledger(account, key, done)
+                aliases = {str(x) for x in (data.get("aliases") or [])}
+                return Ledger(account, key, done, aliases)
         except Exception:  # noqa: BLE001 - corrupt ledger -> start clean
             pass
     return Ledger(account, key, set())

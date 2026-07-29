@@ -327,8 +327,9 @@ def kb_settings():
                                    b"set:engine")])
     rows += [
         [Button.inline("⏱ Send Delay", b"set:textdelay"),
-         Button.inline("⏱ Contact Delay", b"set:contactdelay")],
-        [Button.inline("🔢 Log Every N", b"set:logevery")],
+         Button.inline("⚡ Concurrency", b"set:concurrency")],
+        [Button.inline("⏱ Contact Delay", b"set:contactdelay"),
+         Button.inline("🔢 Log Every N", b"set:logevery")],
         [Button.inline("⬅ Back", b"menu:home")],
     ]
     return rows
@@ -339,14 +340,15 @@ def kb_settings():
 async def home_text() -> str:
     ping = await server_ping_ms()
     accounts = list_accounts()
-    saved_total = sum(contacts_store.count(a) for a in accounts)
+    counts = [contacts_store.count(a) for a in accounts]
     return cards.panel_home(
-        config.BOT_VERSION, len(accounts),
+        len(accounts), sum(1 for n in counts if n),
         store.account_phone(store.active_account) if store.active_account else None,
         engine=store.engine if config.ENABLE_DIRECT else None,
-        ping_ms=ping, contacts=saved_total,
+        ping_ms=ping, contacts=sum(counts),
         running=len(manager.active_jobs()),
         content=store.content_summary() if store.content.get("kind") else None,
+        last_run=store.last_run,
     )
 
 
@@ -422,11 +424,16 @@ def peer_count(acc: str) -> int | None:
 
 def account_panel_text(acc: str) -> str:
     meta = store.account_meta(acc)
+    meta_ts = meta.get("meta_updated")
+    meta_age = ((time.time() - float(meta_ts)) / 3600.0) if meta_ts else None
+    already = progress_store.done_count(
+        acc, progress_store.content_key(store.content)) if store.content.get("kind") else 0
     return cards.account_panel(
         acc, store.account_phone(acc),
         meta.get("contacts"), meta.get("pvs"),
         store.engine, manager.is_busy(acc), peers=peer_count(acc),
         saved=contacts_store.count(acc), saved_age=contacts_store.age_hours(acc),
+        meta_age=meta_age, pending=already,
     )
 
 
@@ -436,8 +443,10 @@ def content_text() -> str:
 
 
 def settings_text() -> str:
+    conc = store.send_concurrency
     pairs = [
         ("Send delay   ", f"{store.text_send_delay:g}s between messages"),
+        ("Concurrency  ", f"{conc} at a time" + (" (sequential)" if conc == 1 else "")),
         ("Contact delay", f"{store.contact_create_delay:g}s between batches"),
         ("Log every    ", f"{store.send_log_every} sends"),
     ]
@@ -481,17 +490,25 @@ async def _callbacks(event):
     if not is_owner(event):
         await event.answer("Not authorized.", alert=True)
         return
-    try:
-        # Telegram invalidates a callback query after a few seconds. Handlers
-        # here can open a browser or start a job, which on a slow host takes
-        # minutes, and the late answer then failed with QueryIdInvalidError.
-        # Acknowledging first keeps the panel responsive; handlers that want to
-        # show their own toast still call event.answer() again, and a duplicate
-        # answer is harmless.
+    # Telegram invalidates a callback query after a few seconds, and a handler
+    # here can open a browser (measured: 158s on the live host), so the answer
+    # that came after the work failed with QueryIdInvalidError. Answering up
+    # front is NOT an option: Telethon marks the query answered, which would
+    # silently swallow every later alert like "Select an account first". Instead
+    # a watchdog acknowledges only if the handler is still working after 6s.
+    done = asyncio.Event()
+
+    async def _ack_if_slow():
         try:
-            await event.answer()
-        except Exception:  # noqa: BLE001
-            pass
+            await asyncio.wait_for(done.wait(), timeout=6)
+        except asyncio.TimeoutError:
+            try:
+                await event.answer()
+            except Exception:  # noqa: BLE001
+                pass
+
+    watchdog = asyncio.create_task(_ack_if_slow())
+    try:
         await _handle_callback(event)
     except MessageNotModifiedError:
         await event.answer()
@@ -502,6 +519,9 @@ async def _callbacks(event):
             await event.answer("Error handled; a log card was sent.", alert=True)
         except Exception:  # noqa: BLE001
             pass
+    finally:
+        done.set()
+        watchdog.cancel()
 
 
 async def _handle_callback(event):
@@ -681,6 +701,16 @@ async def _handle_callback(event):
         return await event.edit(
             cards.card("⏱ CONTACT CREATE DELAY", [("Current", f"{store.contact_create_delay:g}s")],
                        footer="Send a number of seconds (e.g. 0.2 for fast)."), buttons=kb_back())
+    if data == "set:concurrency":
+        pending[event.sender_id] = {"step": "await_concurrency"}
+        return await event.edit(
+            cards.card("⚡ SEND CONCURRENCY",
+                       [("Current", f"{store.send_concurrency} at a time")],
+                       footer="How many recipients may be in flight at once on the fast "
+                              "path (1-10). 1 is the proven sequential behaviour. Try 3 "
+                              "first and watch for limit cards before going higher. The "
+                              "UI fallback always stays sequential."),
+            buttons=kb_back())
     if data == "set:logevery":
         pending[event.sender_id] = {"step": "await_logevery"}
         return await event.edit(
@@ -877,6 +907,17 @@ async def _conversation(event):
             return await event.respond("Send a number of seconds between 0 and 3600.")
         key = "text_send_delay" if step == "await_textdelay" else "contact_create_delay"
         store.set_setting(key, val)
+        pending.pop(event.sender_id, None)
+        return await event.respond(settings_text(), buttons=kb_settings())
+
+    if step == "await_concurrency":
+        try:
+            val = int(re.sub(r"\D", "", text or ""))
+        except ValueError:
+            return await event.respond("Send a whole number between 1 and 10.")
+        if not 1 <= val <= 10:
+            return await event.respond("Send a whole number between 1 and 10.")
+        store.set_setting("send_concurrency", val)
         pending.pop(event.sender_id, None)
         return await event.respond(settings_text(), buttons=kb_settings())
 
