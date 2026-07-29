@@ -773,8 +773,9 @@ def test_stage_card_appears_before_any_send():
     check("it warns about the 2-3 minute start", "minutes" in first, first[:200])
     joined = "\n".join(live.texts)
     check("every step is reported",
-          all(s in joined for s in ("check login", "read contacts",
-                                    "prepare text bridge", "deliver messages")))
+          all(s in joined for s in ("check session", "read contacts",
+                                    "prepare send path", "deliver messages")),
+          joined[:300])
     check("steps get ticked off", "✅" in joined)
     check("it hands over to the send card", "SENDING" in joined)
     check("the job still delivered", job.summary.get("sent") == 3, job.summary)
@@ -820,6 +821,87 @@ def test_ui_send_cannot_hang_forever():
           job.summary)
     check("the reason is explicit",
           any("ui_timeout" in x for x in lines), lines[:3])
+
+
+def test_browserless_decision():
+    print("a run only skips the browser when it is truly safe")
+    mgr = R.JobManager()
+    acc = "a_bl"
+    contacts_store.save(acc, [
+        {"peer_id": "1", "access_hash": "10", "title": "a"},
+        {"peer_id": "2", "access_hash": "20", "title": "b"}])
+    R.direct_ctx.has_context = lambda a: True
+    check("hybrid with a context and full hashes -> no browser",
+          mgr._can_run_browserless("hybrid", acc, None, {}) is True)
+    check("the bridge engine always opens a browser",
+          mgr._can_run_browserless("bridge", acc, None, {}) is False)
+    check("an explicit setting can force the browser",
+          mgr._can_run_browserless("hybrid", acc, None, {"browserless": False}) is False)
+    check("externally supplied names need the browser",
+          mgr._can_run_browserless("hybrid", acc, ["a name"], {}) is False)
+    R.direct_ctx.has_context = lambda a: False
+    check("no session context -> browser",
+          mgr._can_run_browserless("hybrid", acc, None, {}) is False)
+    R.direct_ctx.has_context = lambda a: True
+    contacts_store.save("a_bl2", [{"peer_id": "1", "title": "no hash"}])
+    check("a contact without an access_hash -> browser (it would need the page)",
+          mgr._can_run_browserless("hybrid", "a_bl2", None, {}) is False)
+    check("no contacts at all -> browser",
+          mgr._can_run_browserless("hybrid", "a_bl_empty", None, {}) is False)
+
+
+def test_browserless_run_sends_without_a_page():
+    print("a browser-free run delivers with no browser at all")
+    progress_store.clear("a_nb")
+    opened = {"sessions": 0}
+    sent = []
+
+    class Sender:
+        account = "a_nb"
+
+        def send_text(self, peer, text):
+            sent.append(peer)
+            return {"ok": True, "method": "direct/sendMessage"}
+
+        def upload_file(self, path, caption=""):
+            return {"ok": True}
+
+        def close(self):
+            return None
+
+    def counting_session(account, **kw):
+        opened["sessions"] += 1
+        return _FakeSessionCtx()
+
+    async def go():
+        R.open_session = counting_session
+        R.direct_ctx.has_context = lambda a: True
+        contacts_store.save("a_nb", [
+            {"peer_id": str(3000 + i), "access_hash": str(7000 + i), "title": f"b{i}"}
+            for i in range(5)])
+        import direct.sender as ds
+        ds.DirectSender = lambda account: Sender()
+        mgr = R.JobManager()
+        job = R.Job(job_id="t", kind="send", account="a_nb")
+        lines = []
+
+        async def report(t):
+            lines.append(t)
+
+        await mgr._send_job(job, {"kind": "text", "text": "nb"},
+                            {"text_send_delay": 0, "send_log_every": 999,
+                             "send_concurrency": 3, "engine": "hybrid"},
+                            report, None)
+        return job, lines
+
+    job, lines = asyncio.run(go())
+    check("no browser session was opened", opened["sessions"] == 0, opened)
+    check("everyone got the message", job.summary.get("sent") == 5, job.summary)
+    check("the browser-free engine did it", len(sent) == 5, len(sent))
+    check("the run reports the browser-free engine",
+          job.summary.get("engine") == "hybrid", job.summary)
+    check("a preflight card was posted", any("READY TO SEND" in x for x in lines),
+          lines[:1])
 
 
 def test_dry_run_only_touches_the_owner():
@@ -915,6 +997,8 @@ def main() -> int:
                test_ui_send_cannot_hang_forever,
                test_file_stops_early_when_the_browser_path_keeps_failing,
                test_upload_failure_stops_instead_of_grinding,
+               test_browserless_decision,
+               test_browserless_run_sends_without_a_page,
                test_dry_run_only_touches_the_owner,
                test_dry_run_reports_a_failure_without_sending_a_campaign,
                test_preflight_card_estimates_from_the_last_run):

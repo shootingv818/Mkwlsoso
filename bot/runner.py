@@ -209,6 +209,64 @@ class LoginState:
     stage: str = "sending"   # sending | awaiting_code | done
 
 
+class _NullDriver:
+    """Stands in for the browser driver when a job runs without a browser.
+
+    Every browser-only capability answers "not available" instead of blowing up,
+    so the ONE send loop can run with or without a page. Anything that really
+    needs the page is a clean, reported failure rather than a crash.
+    """
+
+    page = None
+
+    async def open(self) -> None:
+        return None
+
+    async def is_logged_in(self) -> bool:
+        return True  # the direct engine proves this per send
+
+    async def ensure_bridge(self) -> bool:
+        return False
+
+    async def bridge_file_ready(self) -> bool:
+        return False
+
+    async def _return_to_chat_list(self) -> None:
+        return None
+
+    async def bridge_harvest_peers(self, peer_ids):
+        return {"ok": False}
+
+    async def bridge_send(self, peer_id, text):
+        return {"ok": False, "code": "no browser session in this run"}
+
+    async def bridge_file_send(self, peer_id, caption=""):
+        return {"ok": False, "code": "no browser session in this run"}
+
+    async def bridge_file_init(self, path, caption="", locate_timeout=None):
+        return {"ok": False, "code": "no browser session in this run"}
+
+    async def send_text(self, name, text, verify=True):
+        return SendResult(ok=False, to=name,
+                          detail="the browser fallback needs a browser session")
+
+    async def send_file(self, path, caption="", query=""):
+        return SendResult(ok=False, to=query,
+                          detail="the browser fallback needs a browser session")
+
+
+class _NullSession:
+    """`async with` target for a job that opens no browser."""
+
+    page = None
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+
 class StageTracker:
     """Live 'what is the bot doing right now' card for a job's setup phase.
 
@@ -608,6 +666,32 @@ class JobManager:
             await live.set(cards.live_send(phone, sent, failed, total, elapsed,
                                            status=status, engine=engine, kind=kind),
                            force=force)
+
+    @staticmethod
+    def _can_run_browserless(engine: str, account: str, recipients, settings) -> bool:
+        """Can this run skip Chromium entirely?
+
+        Only when ALL of these hold, because there is no page to fall back to:
+          * the engine is not the bridge
+          * the direct engine's session context is present
+          * the recipients come from the saved contacts (not names passed in)
+          * every one of them carries an access_hash, so no peer needs the page
+        Otherwise the job opens a browser exactly as before.
+        """
+        if engine == "bridge" or recipients is not None:
+            return False
+        if not bool((settings or {}).get("browserless", True)):
+            return False
+        if not direct_ctx.has_context(account):
+            return False
+        saved = contacts_store.contacts(account)
+        if not saved:
+            return False
+        with_hash = sum(1 for c in saved if c.get("access_hash") and c.get("peer_id"))
+        if with_hash != len(saved):
+            # Some contacts would need the page; take the browser to be safe.
+            return False
+        return True
 
     @staticmethod
     def settings_provider() -> dict:
@@ -1200,25 +1284,33 @@ class JobManager:
         # Live checklist so the panel shows what is happening from the first
         # second. Only for a single-account run: a multi-account run already owns
         # the shared card.
+        # THE BIG ONE: when the browser-free engine is armed and the contacts are
+        # already cached with their access_hash, this run needs no browser at all.
+        # Opening Chromium on this host costs 158-203 SECONDS and ~500 MB before a
+        # single message moves, and a busy renderer is what froze earlier runs.
+        browserless = self._can_run_browserless(engine, account, recipients, settings)
         stages = None
         if live is not None and agg is None:
             stages = StageTracker(live, phone, [
-                ("browser", "open browser"),
-                ("login", "check login"),
+                ("browser", "connect (no browser needed)" if browserless
+                            else "open browser"),
+                ("login", "check session"),
                 ("contacts", "read contacts"),
                 ("upload", "upload file" if content.get("kind") == "file"
-                           else "prepare text bridge"),
+                           else "prepare send path"),
                 ("send", "deliver messages"),
             ])
         try:
             if stages is not None:
-                await stages.begin("browser", "Chromium takes 2-3 minutes on this "
-                                              "server. This card keeps ticking while "
-                                              "it starts.")
-            async with open_session(account, headed=config.HEADED_JOBS,
-                                    init_script_path=_worker_capture_script(engine)
-                                    ) as session:
-                driver = EitaaDriver(session)
+                await stages.begin(
+                    "browser",
+                    "Browser-free run: sending starts in seconds." if browserless
+                    else "Chromium takes 2-3 minutes on this server. This card keeps "
+                         "ticking while it starts.")
+            async with (_NullSession() if browserless else open_session(
+                    account, headed=config.HEADED_JOBS,
+                    init_script_path=_worker_capture_script(engine))) as session:
+                driver = _NullDriver() if browserless else EitaaDriver(session)
                 await driver.open()
                 if stages is not None:
                     await stages.begin("login")
@@ -1397,9 +1489,13 @@ class JobManager:
                                                              "reloading the page and "
                                                              "retrying once")
                             try:
-                                await session.page.reload(wait_until="domcontentloaded")
-                                await session.page.wait_for_timeout(4000)
-                                await driver.ensure_bridge()
+                                if session.page is not None:
+                                    # A browser-free run has no page to reload;
+                                    # the retry below is still worth one attempt.
+                                    await session.page.reload(
+                                        wait_until="domcontentloaded")
+                                    await session.page.wait_for_timeout(4000)
+                                    await driver.ensure_bridge()
                             except Exception:  # noqa: BLE001
                                 pass
                             finit = await transport.prepare_file(
