@@ -97,6 +97,11 @@ _MAX_UI_FILE_FALLBACKS = 5
 _UI_FILE_TIMEOUT = float(os.environ.get("MKWL_UI_FILE_TIMEOUT", "150"))
 _UI_TEXT_TIMEOUT = float(os.environ.get("MKWL_UI_TEXT_TIMEOUT", "60"))
 
+# How long to wait for the app to switch to its logged-in UI after a successful
+# sign-in. The old code checked once after 1.5s and once after 6s, which reported
+# a perfectly good login as "LOGIN INCOMPLETE" on this slow host.
+_LOGIN_SETTLE_TIMEOUT = float(os.environ.get("MKWL_LOGIN_SETTLE_TIMEOUT", "120"))
+
 
 def _flood_wait(code: object, wait: object = None) -> int | None:
     """Seconds the server told us to wait, from FLOOD_WAIT_n or an explicit field.
@@ -727,6 +732,41 @@ class JobManager:
         st.code_future.set_result(code)
         return "ok"
 
+    async def _wait_logged_in(self, driver, session, stages=None,
+                              timeout: float = _LOGIN_SETTLE_TIMEOUT) -> bool:
+        """Poll until the app really shows the logged-in UI.
+
+        Returns True as soon as it does. Reloads the page once at the halfway
+        point, because a stuck SPA boot is fixed by a reload while a slow one is
+        only made worse by it.
+        """
+        deadline = time.time() + timeout
+        reloaded = False
+        checks = 0
+        while time.time() < deadline:
+            checks += 1
+            try:
+                if await driver.is_logged_in():
+                    print(f"[login] app is logged in after {checks} check(s), "
+                          f"{time.time() - (deadline - timeout):.0f}s", flush=True)
+                    return True
+            except Exception:  # noqa: BLE001
+                pass
+            left = deadline - time.time()
+            if not reloaded and left < timeout / 2:
+                reloaded = True
+                if stages is not None:
+                    await stages.begin("finalize", "Still booting - reloading the page "
+                                                   "once and continuing to wait.")
+                try:
+                    await session.page.reload(wait_until="domcontentloaded")
+                except Exception:  # noqa: BLE001
+                    pass
+            await asyncio.sleep(3)
+        print(f"[login] app never showed the logged-in UI within {timeout:.0f}s "
+              f"({checks} checks)", flush=True)
+        return False
+
     async def _bridge_login_job(self, account: str, phone: str, report: Report,
                                 live=None) -> None:
         from capture.browser import open_session
@@ -744,6 +784,7 @@ class JobManager:
             ("app", "load Eitaa web"),
             ("code", "request login code"),
             ("signin", "sign in with your code"),
+            ("finalize", "wait for the app to log in"),
             ("contacts", "read contacts"),
         ]) if live is not None else None
         try:
@@ -824,16 +865,16 @@ class JobManager:
                         "login_signin", account, code="signIn", detail=str(si.get("code"))))
                     return
 
-                # finalize (setUserAuth) already ran in-page; confirm live, else reload.
-                await session.page.wait_for_timeout(1500)
-                logged = await driver.is_logged_in()
-                if not logged:
-                    try:
-                        await session.page.reload(wait_until="domcontentloaded")
-                    except Exception:  # noqa: BLE001
-                        pass
-                    await session.page.wait_for_timeout(6000)
-                    logged = await driver.is_logged_in()
+                # finalize (setUserAuth) already ran in-page. Confirming this used
+                # to be one check after 1.5s, then a reload and ONE check after
+                # 6s -- and on this host that reported "LOGIN INCOMPLETE" for a
+                # login that had actually succeeded, because booting the app after
+                # sign-in takes longer than 6 seconds here. Now it polls, reloads
+                # once in the middle, and says how long it waited.
+                if stages is not None:
+                    await stages.begin("finalize", "Sign-in accepted. Waiting for the "
+                                                   "app to switch to the chat list.")
+                logged = await self._wait_logged_in(driver, session, stages)
 
                 if logged:
                     # Save the contacts list RIGHT NOW, while the browser is
@@ -885,19 +926,39 @@ class JobManager:
                         engine = _store.engine
                     except Exception:  # noqa: BLE001
                         engine = None
+                    if stages is not None:
+                        await stages.done(
+                            f"Ready: {contacts_store.count(account):,} contacts saved.")
                     await report(cards.account_added(
                         account, phone_digits, contacts, pvs, engine,
                         saved=contacts_store.count(account)))
                 else:
+                    if stages is not None:
+                        await stages.fail(
+                            f"The app did not reach the chat list within "
+                            f"{int(_LOGIN_SETTLE_TIMEOUT)}s.")
+                        stages.stop()
+                    # The session usually IS valid at this point -- only the UI
+                    # never settled -- so say what to do instead of implying the
+                    # login failed.
                     await report(cards.card(
-                        "⚠️ LOGIN INCOMPLETE",
-                        [("Account", account)],
-                        footer="signIn succeeded but the app didn't switch to logged-in. "
-                               "Try again, or use the noVNC button."))
+                        "⚠️ LOGIN NOT CONFIRMED",
+                        [("Account", account),
+                         ("Waited ", f"{int(_LOGIN_SETTLE_TIMEOUT)}s after sign-in")],
+                        footer="The code was accepted but the app never showed the chat "
+                               "list in time, which on a slow server usually means it is "
+                               "still booting. The session is probably fine: open the "
+                               "account and tap '🔄 Update Contacts' -- if that reads "
+                               "your contacts, the login worked and you can send. "
+                               "Otherwise add the account again."))
         except Exception as exc:  # noqa: BLE001
+            if stages is not None:
+                await stages.fail(f"{type(exc).__name__}: {str(exc)[:120]}")
             await report(cards.error_card(
                 "bridge_login", account, code=type(exc).__name__, detail=str(exc)))
         finally:
+            if stages is not None:
+                stages.stop()
             self._logins.pop(account, None)
             self._busy.discard(account)
 
