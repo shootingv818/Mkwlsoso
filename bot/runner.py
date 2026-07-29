@@ -609,6 +609,15 @@ class JobManager:
                                            status=status, engine=engine, kind=kind),
                            force=force)
 
+    @staticmethod
+    def settings_provider() -> dict:
+        """Current panel settings, without importing the panel at module level."""
+        try:
+            from bot.store import store as _store
+            return dict(_store.settings)
+        except Exception:  # noqa: BLE001
+            return {}
+
     async def run_save_contacts(self, account: str, report: Report,
                                 account_phone: str | None = None) -> Job:
         """Collect the account's contacts ONCE and cache them.
@@ -665,6 +674,115 @@ class JobManager:
             return direct, "direct"
         return transports.HybridTransport(direct, bridge), "hybrid"
 
+    async def run_dry_run(self, account: str, content: dict, settings: dict,
+                          report: Report, account_phone: str | None = None,
+                          live=None) -> Job:
+        """Send the current content ONCE, to the account's own Saved Messages.
+
+        The whole pipeline gets exercised - engine, upload, caption - against a
+        recipient that is the owner themselves. Before this, the only way to find
+        out that a caption was wrong or a file would not upload was to discover it
+        halfway through a campaign.
+        """
+        job = self._new_job("dryrun", account)
+        job.task = asyncio.create_task(
+            self._dry_run_job(job, content, settings, report,
+                              account_phone or account, live))
+        return job
+
+    async def _dry_run_job(self, job: Job, content: dict, settings: dict,
+                           report: Report, phone: str, live=None) -> None:
+        account = job.account
+        engine = effective_engine(settings)
+        is_file = content.get("kind") == "file"
+        self._busy.add(account)
+        start = time.time()
+        stages = StageTracker(live, phone, [
+            ("browser", "open browser"),
+            ("login", "check login"),
+            ("upload", "upload file" if is_file else "prepare text bridge"),
+            ("send", "send to Saved Messages"),
+        ]) if live is not None else None
+        try:
+            if stages is not None:
+                await stages.begin("browser", "Test send: only you receive this.")
+            async with open_session(account, headed=config.HEADED_JOBS,
+                                   init_script_path=_worker_capture_script(engine)
+                                   ) as session:
+                driver = EitaaDriver(session)
+                await driver.open()
+                if stages is not None:
+                    await stages.begin("login")
+                if not await driver.is_logged_in():
+                    if stages is not None:
+                        await stages.fail("This account is not logged in.")
+                    await report(cards.error_card("dry_run", account,
+                                                  code="not_logged_in",
+                                                  detail="account is not logged in"))
+                    return
+                transport, engine = await self._build_transport(
+                    engine, driver, account, report, stages)
+                # Saved Messages = the account's own peer, which every engine can
+                # address without any contact relationship, so a PEER_FLOOD here
+                # would mean something genuinely wrong with the account.
+                self_peer = await driver.self_peer_id()
+                if not self_peer:
+                    await report(cards.error_card(
+                        "dry_run", account, code="no_self_peer",
+                        detail="could not resolve this account's own Saved Messages"))
+                    return
+                if stages is not None:
+                    await stages.begin("upload")
+                if is_file:
+                    finit = await transport.prepare_file(
+                        content.get("file_path", ""), content.get("caption", ""))
+                    if not finit.get("ok"):
+                        if stages is not None:
+                            await stages.fail(str(finit.get("code"))[:120])
+                        await report(cards.error_card(
+                            "dry_run", account, code="upload_failed",
+                            detail=str(finit.get("code"))))
+                        return
+                else:
+                    await driver.ensure_bridge()
+                if stages is not None:
+                    await stages.begin("send")
+                t0 = time.time()
+                if is_file:
+                    res = await transport.send_file(self_peer, content.get("caption", ""))
+                else:
+                    res = await transport.send_text(self_peer, content.get("text", ""))
+                took = time.time() - t0
+                if stages is not None:
+                    await stages.done("Delivered to your Saved Messages."
+                                      if res.get("ok") else "Failed - see the card.")
+                job.summary = {"ok": bool(res.get("ok")), "engine": engine,
+                               "seconds": round(took, 2)}
+                await report(cards.dry_run_card(
+                    phone, engine, "File" if is_file else "Text",
+                    bool(res.get("ok")), str(res.get("code") or res.get("method") or ""),
+                    took, time.time() - start))
+                try:
+                    await transport.close()
+                except Exception:  # noqa: BLE001
+                    pass
+        except Exception as exc:  # noqa: BLE001
+            if stages is not None:
+                await stages.fail(f"{type(exc).__name__}: {str(exc)[:120]}")
+            await report(cards.error_card("dry_run", account,
+                                          code=type(exc).__name__, detail=str(exc),
+                                          trace_id=job.job_id))
+        finally:
+            if stages is not None:
+                stages.stop()
+            flush = getattr(live, "flush", None)
+            if flush is not None:
+                try:
+                    await flush()
+                except Exception:  # noqa: BLE001
+                    pass
+            self._busy.discard(account)
+
     async def _collect_contacts(self, driver, account: str,
                                 should_stop: Callable[[], bool] | None = None,
                                 report: Report | None = None) -> tuple[list[dict], str]:
@@ -711,8 +829,14 @@ class JobManager:
         self._busy.add(account)
         start = time.time()
         before = contacts_store.count(account)
+        # If the browser-free engine is selected, grab its session context while
+        # this browser is open. That way "Update Contacts" alone is enough to make
+        # hybrid ready -- the owner never has to run a send just to arm it.
+        engine = effective_engine(self.settings_provider())
         try:
-            async with open_session(account, headed=config.HEADED_JOBS) as session:
+            async with open_session(account, headed=config.HEADED_JOBS,
+                                    init_script_path=_worker_capture_script(engine)
+                                    ) as session:
                 driver = EitaaDriver(session)
                 await driver.open()
                 if not await driver.is_logged_in():
@@ -744,6 +868,21 @@ class JobManager:
                 await report(cards.contacts_saved(
                     phone, record["count"], len(peer_ids),
                     time.time() - start, replaced=before))
+
+                if engine != "bridge":
+                    ref = await direct_ctx.refresh_from_driver(driver, account)
+                    print(f"[engine] context refresh after contacts: {ref}", flush=True)
+                    await report(cards.card(
+                        "⚡ BROWSER-FREE ENGINE" if ref.get("ok")
+                        else "⚠️ BROWSER-FREE ENGINE NOT READY",
+                        [("Phone  ", phone),
+                         ("Status ", "session captured, ready to send without a browser"
+                                     if ref.get("ok") else str(ref.get("code"))[:120]),
+                         ("Records", ref.get("kept") or None)],
+                        footer=("Sends can now go straight over HTTPS; the browser stays "
+                                "as the per-recipient safety net."
+                                if ref.get("ok") else
+                                "Sends will use the browser path until this succeeds.")))
         except Exception as exc:  # noqa: BLE001
             await report(cards.error_card("save_contacts", account,
                                           code=type(exc).__name__, detail=str(exc),
@@ -1192,7 +1331,25 @@ class JobManager:
                         await agg.update(account, sent=0, failed=0, total=0,
                                          state="no_targets", force=True)
                     return
-                await report(cards.send_started(account, kind, total, delay))
+                # What is about to happen, and how long it should take. The
+                # estimate reuses the last run's MEASURED per-message time,
+                # because a run that would take hours used to look exactly like
+                # one that would take three minutes.
+                last_per = None
+                try:
+                    from bot.store import store as _store
+                    last_per = ((_store.last_run or {}).get("timing") or {}).get("per_send")
+                except Exception:  # noqa: BLE001
+                    last_per = None
+                file_mb = None
+                if content.get("kind") == "file":
+                    try:
+                        file_mb = os.path.getsize(content.get("file_path", "")) / (1024 * 1024)
+                    except OSError:
+                        file_mb = None
+                await report(cards.preflight_card(
+                    phone, engine, kind, total, skipped, len(blocked.peers),
+                    conc, delay, last_per, file_mb))
 
                 # Opportunistically remember every peer we resolve here, so the
                 # browser-free engine can reach these same contacts later with
@@ -1644,6 +1801,7 @@ class JobManager:
                     _store.set_last_run(account=phone, kind=kind, sent=sent,
                                         failed=failed, skipped=skipped, total=total,
                                         elapsed=time.time() - start,
+                                        engine=engine, timing=timing,
                                         stopped=bool(job.stop))
                 except Exception:  # noqa: BLE001 - reporting must never break a job
                     pass

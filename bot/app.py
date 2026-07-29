@@ -312,7 +312,8 @@ def kb_account_panel(acc: str):
     busy = manager.is_busy(acc)
     rows = [
         [Button.inline("📤 Send", b"pnl:send"),
-         Button.inline("➕ Build Contacts", b"pnl:contacts")],
+         Button.inline("🧪 Test to Me", b"pnl:dryrun")],
+        [Button.inline("➕ Build Contacts", b"pnl:contacts")],
         # Contacts are saved automatically at login; this only re-reads them
         # when the account has gained new contacts since.
         [Button.inline("🔄 Update Contacts", b"pnl:save"),
@@ -731,6 +732,27 @@ async def _handle_callback(event):
                        footer="The next send treats every saved contact as new, so the "
                               "current content will be delivered again to all of them."),
             buttons=kb_account_panel(active))
+    if data == "pnl:dryrun":
+        if not active:
+            return await event.answer("Select an account first.", alert=True)
+        if store.content.get("kind") not in ("text", "file"):
+            return await event.answer("Set content first (Content menu).", alert=True)
+        if manager.is_busy(active):
+            return await event.answer("Account already has a running job.", alert=True)
+        await manager.run_dry_run(active, dict(store.content), dict(store.settings),
+                                  report, store.account_phone(active),
+                                  live=LiveCard(config.report_to()))
+        await event.answer("Test send started.")
+        return await event.edit(
+            cards.card("🧪 TEST SEND",
+                       [("Phone  ", store.account_phone(active)),
+                        ("Engine ", store.engine),
+                        ("Content", store.content_summary())],
+                       footer="Sending ONE copy to your own Saved Messages, using the "
+                              "same engine a campaign would. Nobody else receives it. "
+                              "A 🧪 TEST SEND card will follow with the result and the "
+                              "real per-message time."),
+            buttons=kb_back())
     if data == "pnl:resetblocked":
         if not active:
             return await event.answer("Select an account first.", alert=True)

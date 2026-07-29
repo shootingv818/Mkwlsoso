@@ -639,6 +639,64 @@ def error_card(where: str, account: str | None = None, target: str | None = None
     )
 
 
+def preflight_card(phone: str, engine: str, kind: str, total: int, skipped: int,
+                   refused: int, concurrency: int, delay: float,
+                   per_send: float | None, file_mb: float | None = None) -> str:
+    """What this run is about to do, and how long it should take.
+
+    Posted before the first message. Without it, a run that would take hours
+    looked exactly like one that would take three minutes, and there was no
+    moment left to press Stop and change a setting.
+
+    The estimate uses the LAST run's measured per-message time when there is one,
+    because a guessed constant was always wrong on this host:
+
+        seconds = total / (concurrency / (per_send + delay))
+    """
+    per = per_send if (per_send and per_send > 0) else 2.0
+    rate = max(0.01, concurrency / (per + max(0.0, delay)))
+    eta_s = total / rate
+    return card(
+        "🚦 READY TO SEND",
+        [
+            ("Phone      ", phone),
+            ("Engine     ", engine),
+            ("Type       ", kind + (f" ({file_mb:.1f} MB)" if file_mb else "")),
+            ("Recipients ", f"{total:,}"),
+            ("Skipping   ", (f"{skipped:,} already delivered" if skipped else None)),
+            ("Refused    ", (f"{refused:,} Eitaa won't accept" if refused else None)),
+            ("Pace       ", f"{concurrency} at a time, {delay:g}s between batches"),
+            ("Expected   ", f"~{fmt_duration(eta_s)} at {rate:.2f} msg/s"),
+        ],
+        footer=("Estimate based on the last run's measured speed."
+                if per_send else
+                "First run for this account, so the estimate assumes 2s per message."),
+    )
+
+
+def dry_run_card(phone: str, engine: str, kind: str, ok: bool, detail: str,
+                 send_seconds: float, total_seconds: float) -> str:
+    """Result of the one-message test send to the owner's own Saved Messages."""
+    return card(
+        "🧪 TEST SEND — OK" if ok else "🧪 TEST SEND — FAILED",
+        [
+            ("Phone     ", phone),
+            ("Engine    ", engine),
+            ("Type      ", kind),
+            ("Result    ", "delivered to your Saved Messages" if ok
+                           else sanitize(detail, 160)),
+            ("Send took ", f"{send_seconds:.1f}s"),
+            ("Whole test", fmt_duration(total_seconds)),
+        ],
+        footer=("Check it in your own Saved Messages: this is exactly what your "
+                "contacts would receive. 'Send took' is a real measurement of one "
+                "message with the current engine."
+                if ok else
+                "Nothing was sent to any contact. Fix this before starting a "
+                "campaign - it would fail the same way for everyone."),
+    )
+
+
 def timing_card(phone: str, engine: str, timing: dict, concurrency: int,
                 limits: int = 0, fallbacks: int = 0) -> str:
     """Where a run's time actually went.

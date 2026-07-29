@@ -822,6 +822,78 @@ def test_ui_send_cannot_hang_forever():
           any("ui_timeout" in x for x in lines), lines[:3])
 
 
+def test_dry_run_only_touches_the_owner():
+    print("the test send goes to Saved Messages only")
+
+    class SelfDriver(FakeDriver):
+        async def self_peer_id(self):
+            return "5551234"
+
+    d = SelfDriver()
+    install_driver(d)
+    live = _FakeLive()
+
+    async def go():
+        mgr = R.JobManager()
+        job = await mgr.run_dry_run("a_dry", {"kind": "text", "text": "hello me"},
+                                    {"engine": "bridge"}, lambda t: asyncio.sleep(0),
+                                    "98912", live=live)
+        await job.task
+        return job
+
+    job = asyncio.run(go())
+    check("it reported success", job.summary.get("ok") is True, job.summary)
+    check("exactly one send happened", d.calls["bridge"] == 1, d.calls)
+    check("it measured the real per-message time",
+          isinstance(job.summary.get("seconds"), float), job.summary)
+    joined = "\n".join(live.texts)
+    check("the checklist mentions Saved Messages",
+          "Saved Messages" in joined, joined[:200])
+
+
+def test_dry_run_reports_a_failure_without_sending_a_campaign():
+    print("a failing test send stops before any campaign")
+
+    class NoSelf(FakeDriver):
+        async def self_peer_id(self):
+            return None
+
+    d = NoSelf()
+    install_driver(d)
+    lines = []
+
+    async def go():
+        mgr = R.JobManager()
+        job = await mgr.run_dry_run("a_dry2", {"kind": "text", "text": "x"},
+                                    {"engine": "bridge"},
+                                    lambda t: lines.append(t) or asyncio.sleep(0),
+                                    "98912")
+        await job.task
+
+    asyncio.run(go())
+    check("nothing was sent", d.calls["bridge"] == 0, d.calls)
+    check("the problem was reported",
+          any("no_self_peer" in str(x) for x in lines), lines[:2])
+
+
+def test_preflight_card_estimates_from_the_last_run():
+    print("the preflight card estimates before anything is sent")
+    from bot import cards as C
+    fast = C.preflight_card("98912", "hybrid", "Text", 180, 0, 0, 3, 1, 1.9)
+    check("it shows the recipient count", "180" in fast, fast)
+    check("it shows the pace", "3 at a time" in fast, fast)
+    check("it estimates a rate", "msg/s" in fast, fast)
+    check("180 at ~1 msg/s is about 3 minutes", "00:02:5" in fast or "00:03:0" in fast,
+          fast)
+    slow = C.preflight_card("98912", "bridge", "File", 1000, 20, 140, 1, 3, 3.2, 9.5)
+    check("skipped and refused are shown",
+          "20 already delivered" in slow and "140" in slow, slow)
+    check("the file size is shown", "9.5 MB" in slow, slow)
+    first = C.preflight_card("98912", "bridge", "Text", 10, 0, 0, 1, 1, None)
+    check("a first run says the estimate is assumed",
+          "assumes 2s" in first, first)
+
+
 def main() -> int:
     for fn in (test_sequential_baseline, test_concurrency_overlaps,
                test_concurrency_is_faster, test_lost_upload_is_rebuilt,
@@ -842,7 +914,10 @@ def main() -> int:
                test_stage_card_shows_a_failure,
                test_ui_send_cannot_hang_forever,
                test_file_stops_early_when_the_browser_path_keeps_failing,
-               test_upload_failure_stops_instead_of_grinding):
+               test_upload_failure_stops_instead_of_grinding,
+               test_dry_run_only_touches_the_owner,
+               test_dry_run_reports_a_failure_without_sending_a_campaign,
+               test_preflight_card_estimates_from_the_last_run):
         fn()
     print()
     print(f"{_PASS} passed, {_FAIL} failed")
