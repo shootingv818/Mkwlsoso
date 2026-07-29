@@ -17,14 +17,19 @@ import re
 import time
 import uuid
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Awaitable, Callable
 
 from config import config
 from capture.browser import open_session
+from capture.pool import pool as session_pool
 from eitaa.driver import EitaaDriver, SendResult
+from bot import blocked_store          # noqa: F401 - used in the send loop
 from bot import cards
 from bot import contacts_store
+from bot import direct_ctx
 from bot import progress_store
+from bot import transports
 
 Report = Callable[[str], Awaitable[None]]
 
@@ -102,6 +107,24 @@ _UI_TEXT_TIMEOUT = float(os.environ.get("MKWL_UI_TEXT_TIMEOUT", "60"))
 # a perfectly good login as "LOGIN INCOMPLETE" on this slow host.
 _LOGIN_SETTLE_TIMEOUT = float(os.environ.get("MKWL_LOGIN_SETTLE_TIMEOUT", "120"))
 
+# How old the browser-free engine's session capture may be before a run insists on
+# opening a browser (which is the only thing that can refresh it).
+_CONTEXT_MAX_AGE_HOURS = float(os.environ.get("MKWL_CONTEXT_MAX_AGE_H", "12"))
+
+
+def _worker_capture_script(engine: str):
+    """The init script a session needs, or None.
+
+    The browser-free engine gets its session context from a dump of the app's own
+    worker traffic, and the hook has to wrap Worker BEFORE the app creates one -
+    so it must be an init script, decided at launch time. The bridge engine needs
+    nothing and pays nothing.
+    """
+    if engine == "bridge":
+        return None
+    p = Path(__file__).resolve().parents[1] / "eitaa" / "worker_capture.js"
+    return p if p.is_file() else None
+
 
 def _flood_wait(code: object, wait: object = None) -> int | None:
     """Seconds the server told us to wait, from FLOOD_WAIT_n or an explicit field.
@@ -128,18 +151,25 @@ def _is_limit(detail: str) -> bool:
     return any(pat in low for pat in _LIMIT_PATTERNS)
 
 
+#: Engines the panel offers. "hybrid" is the interesting one: it sends with the
+#: browser-free engine and keeps the proven page as a per-recipient safety net.
+ENGINES = ("bridge", "hybrid", "direct")
+
+
 def effective_engine(settings: dict) -> str:
     """The engine a job may actually use.
 
-    The panel is bridge-only, so "direct" is refused unless MKWL_ENABLE_DIRECT=1.
-    This is the single place every job asks, so a stale `engine: "direct"` left in
-    a saved settings file (or passed in by a caller) can never route work to the
-    browser-free engine behind the owner's back.
+    Single place every job asks, so an unknown or stale value can never route
+    work somewhere unexpected. "direct" (pure browser-free, no safety net) still
+    needs MKWL_ENABLE_DIRECT=1 because it has no fallback if its session context
+    goes stale; "hybrid" is always allowed since it falls back to the bridge.
     """
     engine = str((settings or {}).get("engine", config.ENGINE))
-    if engine == "direct" and not config.ENABLE_DIRECT:
+    if engine not in ENGINES:
         return "bridge"
-    return engine if engine in ("bridge", "direct") else "bridge"
+    if engine == "direct" and not config.ENABLE_DIRECT:
+        return "hybrid"
+    return engine
 
 
 @dataclass
@@ -182,6 +212,64 @@ class LoginState:
     phone: str
     code_future: asyncio.Future
     stage: str = "sending"   # sending | awaiting_code | done
+
+
+class _NullDriver:
+    """Stands in for the browser driver when a job runs without a browser.
+
+    Every browser-only capability answers "not available" instead of blowing up,
+    so the ONE send loop can run with or without a page. Anything that really
+    needs the page is a clean, reported failure rather than a crash.
+    """
+
+    page = None
+
+    async def open(self) -> None:
+        return None
+
+    async def is_logged_in(self) -> bool:
+        return True  # the direct engine proves this per send
+
+    async def ensure_bridge(self) -> bool:
+        return False
+
+    async def bridge_file_ready(self) -> bool:
+        return False
+
+    async def _return_to_chat_list(self) -> None:
+        return None
+
+    async def bridge_harvest_peers(self, peer_ids):
+        return {"ok": False}
+
+    async def bridge_send(self, peer_id, text):
+        return {"ok": False, "code": "no browser session in this run"}
+
+    async def bridge_file_send(self, peer_id, caption=""):
+        return {"ok": False, "code": "no browser session in this run"}
+
+    async def bridge_file_init(self, path, caption="", locate_timeout=None):
+        return {"ok": False, "code": "no browser session in this run"}
+
+    async def send_text(self, name, text, verify=True):
+        return SendResult(ok=False, to=name,
+                          detail="the browser fallback needs a browser session")
+
+    async def send_file(self, path, caption="", query=""):
+        return SendResult(ok=False, to=query,
+                          detail="the browser fallback needs a browser session")
+
+
+class _NullSession:
+    """`async with` target for a job that opens no browser."""
+
+    page = None
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
 
 
 class StageTracker:
@@ -584,6 +672,51 @@ class JobManager:
                                            status=status, engine=engine, kind=kind),
                            force=force)
 
+    @staticmethod
+    def _can_run_browserless(engine: str, account: str, recipients, settings) -> bool:
+        """Can this run skip Chromium entirely?
+
+        Only when ALL of these hold, because there is no page to fall back to:
+          * the engine is not the bridge
+          * the direct engine's session context is present
+          * the recipients come from the saved contacts (not names passed in)
+          * every one of them carries an access_hash, so no peer needs the page
+        Otherwise the job opens a browser exactly as before.
+        """
+        if engine == "bridge" or recipients is not None:
+            return False
+        # OFF unless the owner explicitly asks for it. A browser-free run has no
+        # page, so "hybrid" loses its per-recipient safety net - exactly the
+        # no-fallback situation MKWL_ENABLE_DIRECT exists to gate. Opt-in only.
+        if not bool((settings or {}).get("browserless", False)):
+            return False
+        ctx_age = direct_ctx.newest_capture_age_hours(account)
+        if not direct_ctx.has_context(account):
+            return False
+        # A stale capture cannot be refreshed without a page, so every send would
+        # fail until the brake stopped the run. Take the browser instead.
+        if ctx_age is None or ctx_age > _CONTEXT_MAX_AGE_HOURS:
+            print(f"[engine] context for {account} is {ctx_age}h old; taking the "
+                  f"browser so it can be refreshed", flush=True)
+            return False
+        saved = contacts_store.contacts(account)
+        if not saved:
+            return False
+        with_hash = sum(1 for c in saved if c.get("access_hash") and c.get("peer_id"))
+        if with_hash != len(saved):
+            # Some contacts would need the page; take the browser to be safe.
+            return False
+        return True
+
+    @staticmethod
+    def settings_provider() -> dict:
+        """Current panel settings, without importing the panel at module level."""
+        try:
+            from bot.store import store as _store
+            return dict(_store.settings)
+        except Exception:  # noqa: BLE001
+            return {}
+
     async def run_save_contacts(self, account: str, report: Report,
                                 account_phone: str | None = None) -> Job:
         """Collect the account's contacts ONCE and cache them.
@@ -597,6 +730,162 @@ class JobManager:
         job.task = asyncio.create_task(
             self._save_contacts_job(job, report, account_phone or account))
         return job
+
+    async def _build_transport(self, engine: str, driver, account: str,
+                               report: Report, stages=None):
+        """Return (transport, engine_actually_used).
+
+        Falls back to the bridge - loudly, never silently - when the browser-free
+        engine cannot be set up, because a campaign that silently changes engine
+        is impossible to reason about later.
+        """
+        bridge = transports.BridgeTransport(driver)
+        if engine == "bridge":
+            return bridge, "bridge"
+
+        # The direct engine needs a live session context; refresh it from the
+        # page we already have open, which is exactly what used to be missing.
+        refresh = await direct_ctx.refresh_from_driver(driver, account)
+        if not refresh.get("ok") and not direct_ctx.has_context(account):
+            await report(cards.error_card(
+                "engine", account, code="direct_context_missing",
+                detail=f"{refresh.get('code')} - sending with the bridge instead"))
+            return bridge, "bridge"
+        if refresh.get("ok"):
+            print(f"[engine] direct context refreshed: {refresh.get('kept')} "
+                  f"record(s), user_id={refresh.get('user_id')}", flush=True)
+
+        try:
+            from direct.sender import DirectSender
+            sender = await asyncio.to_thread(DirectSender, account)
+        except Exception as exc:  # noqa: BLE001
+            await report(cards.error_card(
+                "engine", account, code="direct_unavailable",
+                detail=f"{type(exc).__name__}: {str(exc)[:160]} - "
+                       f"sending with the bridge instead"))
+            return bridge, "bridge"
+
+        hashes = transports.access_hash_map(contacts_store.contacts(account))
+        direct = transports.DirectTransport(sender, hashes)
+        print(f"[engine] direct ready: {len(hashes)} peer(s) addressable without a "
+              f"browser", flush=True)
+        if engine == "direct":
+            return direct, "direct"
+        return transports.HybridTransport(direct, bridge), "hybrid"
+
+    async def run_dry_run(self, account: str, content: dict, settings: dict,
+                          report: Report, account_phone: str | None = None,
+                          live=None) -> Job:
+        """Send the current content ONCE, to the account's own Saved Messages.
+
+        The whole pipeline gets exercised - engine, upload, caption - against a
+        recipient that is the owner themselves. Before this, the only way to find
+        out that a caption was wrong or a file would not upload was to discover it
+        halfway through a campaign.
+        """
+        job = self._new_job("dryrun", account)
+        job.task = asyncio.create_task(
+            self._dry_run_job(job, content, settings, report,
+                              account_phone or account, live))
+        return job
+
+    async def _dry_run_job(self, job: Job, content: dict, settings: dict,
+                           report: Report, phone: str, live=None) -> None:
+        account = job.account
+        engine = effective_engine(settings)
+        is_file = content.get("kind") == "file"
+        self._busy.add(account)
+        start = time.time()
+        stages = StageTracker(live, phone, [
+            ("browser", "open browser"),
+            ("login", "check login"),
+            ("upload", "upload file" if is_file else "prepare text bridge"),
+            ("send", "send to Saved Messages"),
+        ]) if live is not None else None
+        try:
+            if stages is not None:
+                await stages.begin("browser", "Test send: only you receive this.")
+            async with session_pool.lease(account, headed=config.HEADED_JOBS,
+                                   init_script_path=_worker_capture_script(engine)
+                                   ) as session:
+                driver = EitaaDriver(session)
+                await driver.open()
+                if stages is not None:
+                    await stages.begin("login")
+                if not await driver.is_logged_in():
+                    if stages is not None:
+                        await stages.fail("This account is not logged in.")
+                    await report(cards.error_card("dry_run", account,
+                                                  code="not_logged_in",
+                                                  detail="account is not logged in"))
+                    return
+                transport, engine = await self._build_transport(
+                    engine, driver, account, report, stages)
+                # Saved Messages = the account's own peer, which every engine can
+                # address without any contact relationship, so a PEER_FLOOD here
+                # would mean something genuinely wrong with the account.
+                # The browser-free engines address Saved Messages through the
+                # capture's own self-peer, so the literal "self" is resolved by
+                # the transport; only the page needs a numeric id.
+                self_peer = ("self" if getattr(transport, "browserless", False)
+                             or isinstance(transport, transports.HybridTransport)
+                             else await driver.self_peer_id())
+                if not self_peer:
+                    await report(cards.error_card(
+                        "dry_run", account, code="no_self_peer",
+                        detail="could not resolve this account's own Saved Messages"))
+                    return
+                if stages is not None:
+                    await stages.begin("upload")
+                if is_file:
+                    finit = await transport.prepare_file(
+                        content.get("file_path", ""), content.get("caption", ""))
+                    if not finit.get("ok"):
+                        if stages is not None:
+                            await stages.fail(str(finit.get("code"))[:120])
+                        await report(cards.error_card(
+                            "dry_run", account, code="upload_failed",
+                            detail=str(finit.get("code"))))
+                        return
+                else:
+                    await driver.ensure_bridge()
+                if stages is not None:
+                    await stages.begin("send")
+                t0 = time.time()
+                if is_file:
+                    res = await transport.send_file(self_peer, content.get("caption", ""))
+                else:
+                    res = await transport.send_text(self_peer, content.get("text", ""))
+                took = time.time() - t0
+                if stages is not None:
+                    await stages.done("Delivered to your Saved Messages."
+                                      if res.get("ok") else "Failed - see the card.")
+                job.summary = {"ok": bool(res.get("ok")), "engine": engine,
+                               "seconds": round(took, 2)}
+                await report(cards.dry_run_card(
+                    phone, engine, "File" if is_file else "Text",
+                    bool(res.get("ok")), str(res.get("code") or res.get("method") or ""),
+                    took, time.time() - start))
+                try:
+                    await transport.close()
+                except Exception:  # noqa: BLE001
+                    pass
+        except Exception as exc:  # noqa: BLE001
+            if stages is not None:
+                await stages.fail(f"{type(exc).__name__}: {str(exc)[:120]}")
+            await report(cards.error_card("dry_run", account,
+                                          code=type(exc).__name__, detail=str(exc),
+                                          trace_id=job.job_id))
+        finally:
+            if stages is not None:
+                stages.stop()
+            flush = getattr(live, "flush", None)
+            if flush is not None:
+                try:
+                    await flush()
+                except Exception:  # noqa: BLE001
+                    pass
+            self._busy.discard(account)
 
     async def _collect_contacts(self, driver, account: str,
                                 should_stop: Callable[[], bool] | None = None,
@@ -644,8 +933,14 @@ class JobManager:
         self._busy.add(account)
         start = time.time()
         before = contacts_store.count(account)
+        # If the browser-free engine is selected, grab its session context while
+        # this browser is open. That way "Update Contacts" alone is enough to make
+        # hybrid ready -- the owner never has to run a send just to arm it.
+        engine = effective_engine(self.settings_provider())
         try:
-            async with open_session(account, headed=config.HEADED_JOBS) as session:
+            async with session_pool.lease(account, headed=config.HEADED_JOBS,
+                                    init_script_path=_worker_capture_script(engine)
+                                    ) as session:
                 driver = EitaaDriver(session)
                 await driver.open()
                 if not await driver.is_logged_in():
@@ -677,6 +972,21 @@ class JobManager:
                 await report(cards.contacts_saved(
                     phone, record["count"], len(peer_ids),
                     time.time() - start, replaced=before))
+
+                if engine != "bridge":
+                    ref = await direct_ctx.refresh_from_driver(driver, account)
+                    print(f"[engine] context refresh after contacts: {ref}", flush=True)
+                    await report(cards.card(
+                        "⚡ BROWSER-FREE ENGINE" if ref.get("ok")
+                        else "⚠️ BROWSER-FREE ENGINE NOT READY",
+                        [("Phone  ", phone),
+                         ("Status ", "session captured, ready to send without a browser"
+                                     if ref.get("ok") else str(ref.get("code"))[:120]),
+                         ("Records", ref.get("kept") or None)],
+                        footer=("Sends can now go straight over HTTPS; the browser stays "
+                                "as the per-recipient safety net."
+                                if ref.get("ok") else
+                                "Sends will use the browser path until this succeeds.")))
         except Exception as exc:  # noqa: BLE001
             await report(cards.error_card("save_contacts", account,
                                           code=type(exc).__name__, detail=str(exc),
@@ -769,7 +1079,7 @@ class JobManager:
 
     async def _bridge_login_job(self, account: str, phone: str, report: Report,
                                 live=None) -> None:
-        from capture.browser import open_session
+        from capture.browser import open_session  # noqa: F401 - legacy local import
         from eitaa.driver import EitaaDriver
         from eitaa.login_flow import (
             normalize_phone_intl, resolve_api_creds, send_code, sign_in,
@@ -791,7 +1101,7 @@ class JobManager:
             if stages is not None:
                 await stages.begin("browser", "Chromium takes 2-3 minutes on this "
                                               "server. This card keeps ticking.")
-            async with open_session(account, headed=config.HEADED_JOBS) as session:
+            async with session_pool.lease(account, headed=config.HEADED_JOBS) as session:
                 driver = EitaaDriver(session)
                 # NOTE: driver.open() navigates to Eitaa itself. This used to
                 # call session.goto() first as well, so the whole web app was
@@ -969,10 +1279,11 @@ class JobManager:
                         agg: AggregateProgress | None = None) -> None:
         account = job.account
         phone = account_phone or account
-        # This is the BRIDGE job: it drives Eitaa Web (tweb) in Chromium and
-        # uses Eitaa's own send engine via peer_id where possible. The
-        # browser-free path lives in _send_job_direct.
-        engine = "bridge"
+        # This job always opens a browser session (it is what reads contacts and
+        # what the safety net needs), but WHO actually delivers each message is
+        # decided by the transport built below: the page (bridge), plain HTTPS
+        # with no browser (direct), or direct-with-page-fallback (hybrid).
+        engine = effective_engine(settings)
         kind = "File" if content.get("kind") == "file" else "Text"
         delay = float(settings.get("text_send_delay", config.TEXT_SEND_DELAY))
         log_every = int(settings.get("send_log_every", config.SEND_LOG_EVERY))
@@ -989,26 +1300,38 @@ class JobManager:
         # Stop cancels this task, and a CancelledError skips every flush inside
         # the body (measured: 11 delivered, 0 recorded -> 11 duplicates).
         ledger = None
+        transport = None
+        blocked = None
         # Live checklist so the panel shows what is happening from the first
         # second. Only for a single-account run: a multi-account run already owns
         # the shared card.
+        # THE BIG ONE: when the browser-free engine is armed and the contacts are
+        # already cached with their access_hash, this run needs no browser at all.
+        # Opening Chromium on this host costs 158-203 SECONDS and ~500 MB before a
+        # single message moves, and a busy renderer is what froze earlier runs.
+        browserless = self._can_run_browserless(engine, account, recipients, settings)
         stages = None
         if live is not None and agg is None:
             stages = StageTracker(live, phone, [
-                ("browser", "open browser"),
-                ("login", "check login"),
+                ("browser", "connect (no browser needed)" if browserless
+                            else "open browser"),
+                ("login", "check session"),
                 ("contacts", "read contacts"),
                 ("upload", "upload file" if content.get("kind") == "file"
-                           else "prepare text bridge"),
+                           else "prepare send path"),
                 ("send", "deliver messages"),
             ])
         try:
             if stages is not None:
-                await stages.begin("browser", "Chromium takes 2-3 minutes on this "
-                                              "server. This card keeps ticking while "
-                                              "it starts.")
-            async with open_session(account, headed=config.HEADED_JOBS) as session:
-                driver = EitaaDriver(session)
+                await stages.begin(
+                    "browser",
+                    "Browser-free run: sending starts in seconds." if browserless
+                    else "Chromium takes 2-3 minutes on this server. This card keeps "
+                         "ticking while it starts.")
+            async with (_NullSession() if browserless else session_pool.lease(
+                    account, headed=config.HEADED_JOBS,
+                    init_script_path=_worker_capture_script(engine))) as session:
+                driver = _NullDriver() if browserless else EitaaDriver(session)
                 await driver.open()
                 if stages is not None:
                     await stages.begin("login")
@@ -1072,6 +1395,30 @@ class JobManager:
                                    "gets this message twice. Change the content to start "
                                    "a fresh run for everyone."))
 
+                # Skip peers Eitaa has already refused permanently. Measured
+                # live: half of one account's contacts answered PEER_FLOOD every
+                # single time, so retrying them doubled every run's length and
+                # produced hundreds of avoidable errors.
+                blocked = blocked_store.open_list(account)
+                if blocked.peers and recipients is None:  # noqa: SIM102
+                    before_block = len(recipient_items)
+                    recipient_items = [(n, p) for (n, p) in recipient_items
+                                       if not blocked.has(p)]
+                    n_blocked = before_block - len(recipient_items)
+                    if n_blocked:
+                        skipped += n_blocked
+                        print(f"[send] skipping {n_blocked} peer(s) Eitaa refuses "
+                              f"from this account", flush=True)
+                        await report(cards.card(
+                            "⛔ SKIPPING REFUSED PEERS",
+                            [("Phone    ", phone),
+                             ("Skipped  ", f"{n_blocked:,} previously refused"),
+                             ("Sending  ", f"{len(recipient_items):,}")],
+                            footer="Eitaa refused these recipients from this account "
+                                   "before (PEER_FLOOD and friends), and that does not "
+                                   "expire on a timer. Use 'Reset Refused' on the "
+                                   "account to try them again."))
+
                 total = len(recipient_items)
                 if total == 0 and skipped:
                     await report(cards.card(
@@ -1097,7 +1444,25 @@ class JobManager:
                         await agg.update(account, sent=0, failed=0, total=0,
                                          state="no_targets", force=True)
                     return
-                await report(cards.send_started(account, kind, total, delay))
+                # What is about to happen, and how long it should take. The
+                # estimate reuses the last run's MEASURED per-message time,
+                # because a run that would take hours used to look exactly like
+                # one that would take three minutes.
+                last_per = None
+                try:
+                    from bot.store import store as _store
+                    last_per = ((_store.last_run or {}).get("timing") or {}).get("per_send")
+                except Exception:  # noqa: BLE001
+                    last_per = None
+                file_mb = None
+                if content.get("kind") == "file":
+                    try:
+                        file_mb = os.path.getsize(content.get("file_path", "")) / (1024 * 1024)
+                    except OSError:
+                        file_mb = None
+                await report(cards.preflight_card(
+                    phone, engine, kind, total, skipped, len(blocked.peers),
+                    conc, delay, last_per, file_mb))
 
                 # Opportunistically remember every peer we resolve here, so the
                 # browser-free engine can reach these same contacts later with
@@ -1105,17 +1470,23 @@ class JobManager:
                 await self._harvest_peers(driver, account, report,
                                           [p for _, p in recipient_items if p])
 
+                # Build the transport for the chosen engine. Everything below is
+                # engine-agnostic from here on.
+                transport, engine = await self._build_transport(
+                    engine, driver, account, report, stages)
+
                 # Pre-warm the right bridge ONCE.
                 if stages is not None:
                     await stages.begin(
                         "upload",
-                        f"{total:,} recipient(s) ready" if total else None)
+                        f"{total:,} recipient(s) ready · engine {engine}"
+                        if total else None)
                 file_bridge_ready = False
                 if is_file:
                     # Upload the file a single time; every recipient then reuses
                     # that same uploaded document (no per-recipient re-upload ->
                     # no server strain).
-                    finit = await driver.bridge_file_init(
+                    finit = await transport.prepare_file(
                         content.get("file_path", ""), content.get("caption", ""))
                     if finit.get("ok"):
                         file_bridge_ready = True
@@ -1139,12 +1510,16 @@ class JobManager:
                                                              "reloading the page and "
                                                              "retrying once")
                             try:
-                                await session.page.reload(wait_until="domcontentloaded")
-                                await session.page.wait_for_timeout(4000)
-                                await driver.ensure_bridge()
+                                if session.page is not None:
+                                    # A browser-free run has no page to reload;
+                                    # the retry below is still worth one attempt.
+                                    await session.page.reload(
+                                        wait_until="domcontentloaded")
+                                    await session.page.wait_for_timeout(4000)
+                                    await driver.ensure_bridge()
                             except Exception:  # noqa: BLE001
                                 pass
-                            finit = await driver.bridge_file_init(
+                            finit = await transport.prepare_file(
                                 content.get("file_path", ""), content.get("caption", ""))
                             if finit.get("ok"):
                                 file_bridge_ready = True
@@ -1169,6 +1544,8 @@ class JobManager:
                                            "press Send again and it resumes."))
                                 return
                 else:
+                    # The page bridge is warmed even in hybrid mode: it is the
+                    # safety net for any recipient the direct engine misses.
                     await driver.ensure_bridge()
 
                 if stages is not None:
@@ -1195,16 +1572,31 @@ class JobManager:
                 text_body = content.get("text", "")
                 caption_body = content.get("caption", "")
 
+                # Timing instrumentation. 39 messages in 4 minutes (6.2s each) was
+                # measured while the transport itself answered in 1-2s, so the
+                # loop needs to be able to say WHERE the rest of the time went
+                # instead of leaving it to guesswork.
+                t_transport = 0.0
+                t_fallback = 0.0
+                n_transport = 0
+                t_wait = 0.0
+
                 async def _fast(peer: str | None):
                     """One fast-path (in-page API) send. No shared state, so a
                     batch of these can safely run concurrently."""
+                    nonlocal t_transport, n_transport
                     if not peer:
                         return None
-                    if is_file:
-                        if not file_bridge_ready:
-                            return None
-                        return await driver.bridge_file_send(peer, caption_body)
-                    return await driver.bridge_send(peer, text_body)
+                    if is_file and not file_bridge_ready:
+                        return None
+                    t0 = time.time()
+                    try:
+                        if is_file:
+                            return await transport.send_file(peer, caption_body)
+                        return await transport.send_text(peer, text_body)
+                    finally:
+                        t_transport += time.time() - t0
+                        n_transport += 1
 
                 # `conc` recipients are attempted at once on the fast path. The
                 # UI fallback below stays strictly sequential because it drives a
@@ -1270,7 +1662,7 @@ class JobManager:
                                 reinits += 1
                                 print(f"[send] upload state lost; re-initialising "
                                       f"(attempt {reinits})", flush=True)
-                                again = await driver.bridge_file_init(
+                                again = await transport.prepare_file(
                                     content.get("file_path", ""), caption_body)
                                 if again.get("ok"):
                                     print(f"[send] re-uploaded ONCE "
@@ -1294,6 +1686,9 @@ class JobManager:
                                     # the server usually refuses everyone),
                                     # False just reports and carries on.
                                     limit_hits += 1
+                                    # Remember a relationship-level refusal so
+                                    # later runs do not waste time on this peer.
+                                    blocked.add(peer_id, b.get("code"))
                                     if stop_on_limit:
                                         await report(cards.restriction_card(
                                             account, f"server: {b.get('code')}", sent))
@@ -1326,6 +1721,7 @@ class JobManager:
                             # minutes with no output at all.
                             if not limited and res is None:
                                 budget = _UI_FILE_TIMEOUT if is_file else _UI_TEXT_TIMEOUT
+                                t_fb = time.time()
                                 try:
                                     if is_file:
                                         res = await asyncio.wait_for(
@@ -1344,6 +1740,8 @@ class JobManager:
                                                f"(the slow browser path did not finish)")
                                     print(f"[send] UI path timed out for {name[:18]!r} "
                                           f"after {int(budget)}s; moving on", flush=True)
+                                finally:
+                                    t_fallback += time.time() - t_fb
 
                             if limited:
                                 # Already surfaced above; not a per-send failure.
@@ -1458,14 +1856,39 @@ class JobManager:
                     # One pace interval per batch: with conc>1 that is the whole
                     # point, `conc` messages per `delay` instead of one.
                     # Interruptible: a stop wakes this immediately.
-                    if await job.wait(delay):
+                    t_w = time.time()
+                    stop_now = await job.wait(delay)
+                    t_wait += time.time() - t_w
+                    if stop_now:
                         break
 
                 # Persist whatever was delivered, even on a stop or a crash path,
                 # so the next run resumes instead of re-sending.
                 ledger.flush()
+                hybrid_stats = None
+                if isinstance(transport, transports.HybridTransport):
+                    hybrid_stats = dict(transport.stats)
+                    print(f"[engine] hybrid split: direct={hybrid_stats['direct']} "
+                          f"bridge={hybrid_stats['bridge']} "
+                          f"fell_back={hybrid_stats['fell_back']}", flush=True)
                 # Evidence of which path carried the load (fast bridge vs the UI
                 # fallback) so alternative methods stay observable at a glance.
+                elapsed_total = max(0.001, time.time() - start)
+                other = max(0.0, elapsed_total - t_transport - t_fallback - t_wait)
+                timing = {
+                    "total": round(elapsed_total, 1),
+                    "transport": round(t_transport, 1),
+                    "fallback": round(t_fallback, 1),
+                    "pacing": round(t_wait, 1),
+                    "other": round(other, 1),
+                    "per_send": round(t_transport / n_transport, 2) if n_transport else None,
+                    "msg_per_s": round((sent / elapsed_total), 2),
+                }
+                print(f"[send] timing: total={timing['total']}s "
+                      f"transport={timing['transport']}s "
+                      f"fallback={timing['fallback']}s pacing={timing['pacing']}s "
+                      f"other={timing['other']}s per_send={timing['per_send']}s "
+                      f"rate={timing['msg_per_s']}/s", flush=True)
                 print(f"[send] path summary: via_bridge={via_bridge} "
                       f"via_fallback={via_fallback} reinits={reinits} sent={sent} "
                       f"failed={failed} skipped={skipped} conc={conc} "
@@ -1474,7 +1897,14 @@ class JobManager:
                 job.summary = {"sent": sent, "failed": failed, "skipped": skipped,
                                "total": total, "via_bridge": via_bridge,
                                "via_fallback": via_fallback, "reinits": reinits,
-                               "concurrency": conc}
+                               "concurrency": conc, "engine": engine,
+                               "limits": limit_hits, "timing": timing,
+                               "refused_added": blocked.added,
+                               "browserless": browserless,
+                               "hybrid": hybrid_stats}
+                if agg is None:
+                    await report(cards.timing_card(phone, engine, timing, conc,
+                                                   limit_hits, via_fallback))
                 # Remember the outcome so the home card shows a real last result
                 # instead of nothing once the job is gone.
                 try:
@@ -1482,6 +1912,7 @@ class JobManager:
                     _store.set_last_run(account=phone, kind=kind, sent=sent,
                                         failed=failed, skipped=skipped, total=total,
                                         elapsed=time.time() - start,
+                                        engine=engine, timing=timing,
                                         stopped=bool(job.stop))
                 except Exception:  # noqa: BLE001 - reporting must never break a job
                     pass
@@ -1513,11 +1944,34 @@ class JobManager:
                 # Also covers the Force Stop (cancellation) path, so the card
                 # never sits there pretending to still work.
                 stages.stop()
+            # The live card paints in the background now, so the final state has
+            # to be pushed out explicitly when the job ends.
+            for card_obj in (live, getattr(agg, "live", None)):
+                flush = getattr(card_obj, "flush", None)
+                if flush is not None:
+                    try:
+                        await flush()
+                    except Exception:  # noqa: BLE001
+                        pass
+            if transport is not None:
+                try:
+                    await transport.close()
+                except Exception:  # noqa: BLE001
+                    pass
             # Runs on the cancellation path too, so a Force Stop keeps its
             # delivered-to record and the re-run does not repeat those sends.
             if ledger is not None:
                 try:
                     ledger.flush()
+                except Exception:  # noqa: BLE001
+                    pass
+            # Refusals must survive a Force Stop too: without this, the peers
+            # learned during a cancelled run were forgotten and retried forever.
+            if blocked is not None and blocked.added:
+                try:
+                    blocked.flush()
+                    print(f"[send] {blocked.added} peer(s) added to the refused "
+                          f"list ({len(blocked.peers)} total)", flush=True)
                 except Exception:  # noqa: BLE001
                     pass
             self._busy.discard(account)
@@ -1770,7 +2224,7 @@ class JobManager:
         added = not_on = invalid = error = 0
         total = len(entries)
         try:
-            async with open_session(account, headed=config.HEADED_JOBS) as session:
+            async with session_pool.lease(account, headed=config.HEADED_JOBS) as session:
                 driver = EitaaDriver(session)
                 await driver.open()
                 if not await driver.is_logged_in():

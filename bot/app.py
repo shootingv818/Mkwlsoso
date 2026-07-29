@@ -20,11 +20,14 @@ from telethon import TelegramClient, events, Button
 from telethon.errors import MessageNotModifiedError
 
 from config import config
+from bot import blocked_store
 from bot import cards
 from bot import contacts_store
+from bot import direct_ctx
 from bot import progress_store
 from bot.store import store
 from bot.runner import manager, expand_range
+from capture.pool import pool as session_pool
 
 
 # ---- helpers -----------------------------------------------------------
@@ -172,30 +175,103 @@ async def report(text: str) -> None:
 
 
 class LiveCard:
-    """One Telegram message edited in place while a job runs (throttled)."""
+    """One Telegram message edited in place while a job runs.
+
+    IMPORTANT: `set()` does NOT wait for Telegram. It used to, and that put a
+    Telegram round trip (plus any edit rate limiting Telethon sleeps through)
+    directly inside the send loop - so a job that should pace itself by Eitaa's
+    speed was also paying for its own progress card. Now the newest text is
+    stashed and a single background painter delivers it.
+
+    Only the LATEST text matters, so intermediate updates are dropped instead of
+    queued; a card that is one tick behind is fine, a send loop that stalls is
+    not.
+    """
 
     def __init__(self, chat_id, min_interval: float = 2.0) -> None:
         self.chat_id = chat_id
         self.min_interval = min_interval
         self._msg = None
-        self._last = 0.0
-        self._lock = asyncio.Lock()
+        self._pending: str | None = None
+        self._sent_text: str | None = None
+        self._painter: asyncio.Task | None = None
+        self._wake = asyncio.Event()
+        # Serialises the painter and flush(): without it they raced and the card
+        # could end up showing an OLD state ('Sending 50/100' after 'Done').
+        self._paint_lock = asyncio.Lock()
+        self._closed = False
+        self.paints = 0
+        self.dropped = 0
 
     async def set(self, text: str, force: bool = False) -> None:
-        async with self._lock:
-            now = time.monotonic()
-            if not force and self._msg is not None and (now - self._last) < self.min_interval:
+        """Queue `text` for painting. Returns immediately (never blocks a job)."""
+        if self._closed:
+            return
+        if self._pending is not None:
+            self.dropped += 1
+        self._pending = text
+        self._wake.set()
+        if self._painter is None or self._painter.done():
+            self._painter = asyncio.create_task(self._paint_loop())
+        if force:
+            # Give the painter a chance to flush a final/important state without
+            # actually waiting on the network.
+            await asyncio.sleep(0)
+
+    async def _paint_loop(self) -> None:
+        try:
+            while not self._closed:
+                try:
+                    await asyncio.wait_for(self._wake.wait(), timeout=30)
+                except asyncio.TimeoutError:
+                    if self._pending is None:
+                        return
+                self._wake.clear()
+                async with self._paint_lock:
+                    text, self._pending = self._pending, None
+                    if text is None or text == self._sent_text:
+                        continue
+                    try:
+                        if self._msg is None:
+                            self._msg = await bot.send_message(self.chat_id, text)
+                        else:
+                            await self._msg.edit(text)
+                        self._sent_text = text
+                        self.paints += 1
+                    except MessageNotModifiedError:
+                        self._sent_text = text
+                    except Exception:  # noqa: BLE001 - never break a job
+                        pass
+                # Rate-limit ourselves so Telegram never has to.
+                await asyncio.sleep(self.min_interval)
+        except asyncio.CancelledError:
+            return
+
+    async def flush(self) -> None:
+        """Paint the last queued text now (used when a job ends).
+
+        Takes the same lock as the painter, so the final state can never be
+        overwritten by an in-flight older edit.
+        """
+        async with self._paint_lock:
+            text, self._pending = self._pending, None
+            if text is None or text == self._sent_text:
                 return
             try:
                 if self._msg is None:
                     self._msg = await bot.send_message(self.chat_id, text)
                 else:
                     await self._msg.edit(text)
-                self._last = now
-            except MessageNotModifiedError:
-                pass
+                self._sent_text = text
+                self.paints += 1
             except Exception:  # noqa: BLE001
                 pass
+
+    def close(self) -> None:
+        self._closed = True
+        if self._painter is not None:
+            self._painter.cancel()
+            self._painter = None
 
 
 # ---- keyboards ---------------------------------------------------------
@@ -246,7 +322,8 @@ def kb_account_panel(acc: str):
     busy = manager.is_busy(acc)
     rows = [
         [Button.inline("📤 Send", b"pnl:send"),
-         Button.inline("➕ Build Contacts", b"pnl:contacts")],
+         Button.inline("🧪 Test to Me", b"pnl:dryrun")],
+        [Button.inline("➕ Build Contacts", b"pnl:contacts")],
         # Contacts are saved automatically at login; this only re-reads them
         # when the account has gained new contacts since.
         [Button.inline("🔄 Update Contacts", b"pnl:save"),
@@ -256,8 +333,10 @@ def kb_account_panel(acc: str):
         # The label escalates: a second press force-stops.
         label = "❌ Force Stop" if manager.account_stopping(acc) else "⏹ Stop"
         rows.append([Button.inline(label, b"pnl:stop")])
-    # Clears the resume ledger, so the current content goes to everyone again.
-    rows.append([Button.inline("🧹 Reset Sent Log", b"pnl:resetlog")])
+    # Left: clears the resume ledger (current content goes to everyone again).
+    # Right: clears the refused-peer cache so Eitaa gets asked about them again.
+    rows.append([Button.inline("🧹 Reset Sent Log", b"pnl:resetlog"),
+                 Button.inline("⛔ Reset Refused", b"pnl:resetblocked")])
     rows.append([Button.inline("🗑 Delete Account", f"acc:del:{acc}".encode())])
     rows.append([Button.inline("👤 Accounts", b"menu:accounts"),
                  Button.inline("⬅ Home", b"menu:home")])
@@ -318,13 +397,13 @@ def kb_content():
 
 def kb_settings():
     rows = []
-    # The engine switch is hidden: the panel is bridge-only. direct/ is still in
-    # the source and MKWL_ENABLE_DIRECT=1 brings this button back.
-    if config.ENABLE_DIRECT:
-        eng = store.engine
-        other = "direct ⚡" if eng == "bridge" else "bridge 🌉"
-        rows.append([Button.inline(f"🔧 Engine: {eng}  →  switch to {other}",
-                                   b"set:engine")])
+    # The engine switch is back, now with three choices: bridge (proven page),
+    # hybrid (browser-free sends with the page as a per-recipient safety net) and
+    # direct (browser-free only, MKWL_ENABLE_DIRECT=1, no safety net).
+    _ENGINE_MARK = {"bridge": "🌉 bridge", "hybrid": "⚡ hybrid", "direct": "🚀 direct"}
+    rows.append([Button.inline(
+        f"🔧 Engine: {_ENGINE_MARK.get(store.engine, store.engine)} — tap to change",
+        b"set:engine")])
     rows += [
         [Button.inline("⏱ Send Delay", b"set:textdelay"),
          Button.inline("⚡ Concurrency", b"set:concurrency")],
@@ -333,6 +412,10 @@ def kb_settings():
             b"set:stoponlimit")],
         [Button.inline("⏱ Contact Delay", b"set:contactdelay"),
          Button.inline("🔢 Log Every N", b"set:logevery")],
+        [Button.inline("🏠 Browser Standby", b"set:pool"),
+         Button.inline(
+             f"🚀 No-browser sends: {'ON' if store.browserless else 'OFF'}",
+             b"set:browserless")],
         [Button.inline("⬅ Back", b"menu:home")],
     ]
     return rows
@@ -437,6 +520,8 @@ def account_panel_text(acc: str) -> str:
         store.engine, manager.is_busy(acc), peers=peer_count(acc),
         saved=contacts_store.count(acc), saved_age=contacts_store.age_hours(acc),
         meta_age=meta_age, pending=already,
+        refused=blocked_store.count(acc),
+        engine_ready=(direct_ctx.has_context(acc) if store.engine != "bridge" else None),
     )
 
 
@@ -455,13 +540,27 @@ def settings_text() -> str:
         ("Contact delay", f"{store.contact_create_delay:g}s between batches"),
         ("Log every    ", f"{store.send_log_every} sends"),
     ]
-    if config.ENABLE_DIRECT:
-        pairs.insert(0, ("Engine       ",
-                         "🌉 bridge (browser)" if store.engine == "bridge"
-                         else "⚡ direct (no browser)"))
+    eng = store.engine
+    eng_txt = {
+        "bridge": "🌉 bridge — every send goes through the browser page",
+        "hybrid": "⚡ hybrid — browser-free sends, page as the safety net",
+        "direct": "🚀 direct — browser-free only, no safety net",
+    }.get(eng, eng)
+    pairs.insert(0, ("Engine       ", eng_txt))
+    active = store.active_account
+    if active and eng != "bridge":
+        age = direct_ctx.newest_capture_age_hours(active)
+        pairs.insert(1, ("Engine ready ",
+                         ("yes, session captured " +
+                          ("just now" if age is not None and age < 1
+                           else f"{int(age)}h ago" if age is not None else ""))
+                         if direct_ctx.has_context(active)
+                         else "not yet — it is captured on the next browser job"))
     return cards.card(
         "⚙ SETTINGS", pairs,
-        footer="Longer delays are safer against Eitaa's rate limits.",
+        footer="Longer delays are safer against Eitaa's rate limits. Hybrid sends "
+               "without a browser and falls back to the page per recipient, so it is "
+               "the fast option that keeps the proven path.",
     )
 
 
@@ -647,6 +746,41 @@ async def _handle_callback(event):
                        footer="The next send treats every saved contact as new, so the "
                               "current content will be delivered again to all of them."),
             buttons=kb_account_panel(active))
+    if data == "pnl:dryrun":
+        if not active:
+            return await event.answer("Select an account first.", alert=True)
+        if store.content.get("kind") not in ("text", "file"):
+            return await event.answer("Set content first (Content menu).", alert=True)
+        if manager.is_busy(active):
+            return await event.answer("Account already has a running job.", alert=True)
+        await manager.run_dry_run(active, dict(store.content), dict(store.settings),
+                                  report, store.account_phone(active),
+                                  live=LiveCard(config.report_to()))
+        await event.answer("Test send started.")
+        return await event.edit(
+            cards.card("🧪 TEST SEND",
+                       [("Phone  ", store.account_phone(active)),
+                        ("Engine ", store.engine),
+                        ("Content", store.content_summary())],
+                       footer="Sending ONE copy to your own Saved Messages, using the "
+                              "same engine a campaign would. Nobody else receives it. "
+                              "A 🧪 TEST SEND card will follow with the result and the "
+                              "real per-message time."),
+            buttons=kb_back())
+    if data == "pnl:resetblocked":
+        if not active:
+            return await event.answer("Select an account first.", alert=True)
+        had = blocked_store.count(active)
+        blocked_store.clear(active)
+        await event.answer("Refused list cleared.")
+        return await event.edit(
+            cards.card("⛔ REFUSED LIST CLEARED",
+                       [("Phone   ", store.account_phone(active)),
+                        ("Cleared ", f"{had:,} peers" if had else "nothing to clear")],
+                       footer="Eitaa will be asked about these recipients again on the "
+                              "next run. If they were refused because there is no "
+                              "two-way contact, they will simply be refused again."),
+            buttons=kb_account_panel(active))
     if data == "pnl:send":
         return await _start_send(event)
     if data == "pnl:contacts":
@@ -693,7 +827,7 @@ async def _handle_callback(event):
 
     # ---- settings ----
     if data == "set:engine":
-        new = store.toggle_engine()
+        new = store.cycle_engine()
         await event.answer(f"Engine: {new}")
         return await event.edit(settings_text(), buttons=kb_settings())
     if data == "set:textdelay":
@@ -710,6 +844,21 @@ async def _handle_callback(event):
         now = store.toggle_stop_on_limit()
         await event.answer("Pause on limit: " + ("ON" if now else "OFF"))
         return await event.edit(settings_text(), buttons=kb_settings())
+    if data == "set:browserless":
+        now = store.toggle_browserless()
+        await event.answer("No-browser sends: " + ("ON" if now else "OFF"))
+        return await event.edit(settings_text(), buttons=kb_settings())
+    if data == "set:pool":
+        return await event.edit(
+            cards.pool_card(session_pool.status()),
+            buttons=[[Button.inline("🧹 Close standby sessions", b"set:poolclose")],
+                     [Button.inline("⬅ Back", b"menu:settings")]])
+    if data == "set:poolclose":
+        n = await session_pool.close_all()
+        await event.answer(f"Closed {n} standby session(s).")
+        return await event.edit(
+            cards.pool_card(session_pool.status()),
+            buttons=[[Button.inline("⬅ Back", b"menu:settings")]])
     if data == "set:concurrency":
         pending[event.sender_id] = {"step": "await_concurrency"}
         return await event.edit(

@@ -858,6 +858,33 @@ class EitaaDriver:
         except Exception:  # noqa: BLE001
             return False
 
+    async def self_peer_id(self) -> str | None:
+        """This account's own user id (its Saved Messages peer).
+
+        Used by the test send: Saved Messages is a recipient every engine can
+        address with no contact relationship, so it exercises the full pipeline
+        without touching anybody else.
+        """
+        js = """
+        () => {
+          const c = [];
+          try { c.push(window.appUsersManager && window.appUsersManager.getSelf
+                       && window.appUsersManager.getSelf().id); } catch (e) {}
+          try { c.push(window.appPeersManager && window.appPeersManager.peerId); } catch (e) {}
+          try { c.push(window.appImManager && window.appImManager.myId); } catch (e) {}
+          try { c.push(window.appUsersManager && window.appUsersManager.userId); } catch (e) {}
+          for (const v of c) {
+            if (v != null && String(v).length && !isNaN(+v) && +v > 0) return String(v);
+          }
+          return null;
+        }
+        """
+        try:
+            res = await self.page.evaluate(js)
+        except Exception:  # noqa: BLE001
+            return None
+        return str(res) if res else None
+
     async def bridge_file_ready(self) -> bool:
         """Is a previously uploaded document still reusable in this page?
 

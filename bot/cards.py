@@ -425,7 +425,9 @@ def account_added(account: str, phone: str, contacts: int | None, pvs: int | Non
 def account_panel(account: str, phone: str, contacts: int | None, pvs: int | None,
                   engine: str | None, busy: bool, peers: int | None = None,
                   saved: int | None = None, saved_age: float | None = None,
-                  meta_age: float | None = None, pending: int | None = None) -> str:
+                  meta_age: float | None = None, pending: int | None = None,
+                  refused: int | None = None,
+                  engine_ready: bool | None = None) -> str:
     """One account's panel.
 
     `saved` is how many contacts are in the local cache -- that is what a send
@@ -466,9 +468,17 @@ def account_panel(account: str, phone: str, contacts: int | None, pvs: int | Non
             ("Phone", phone),
             ("State", "⏳ busy" if busy else "🟢 idle"),
             ("Saved", f"{saved:,} contacts ({age})" if saved else "none"),
+            # What a send would ACTUALLY reach: saved minus the ones Eitaa keeps
+            # refusing from this account.
+            ("Reachable", f"{max(0, (saved or 0) - refused):,} of {saved:,}"
+                          if (saved and refused) else None),
+            ("Refused", f"{refused:,} (Eitaa won't deliver to them)" if refused else None),
             ("On Eitaa", on_eitaa or "—"),
             ("Chats", pvs if isinstance(pvs, int) and pvs >= 0 else None),
             ("Already sent", f"{pending:,} got the current content" if pending else None),
+            ("Engine", ("browser-free ready" if engine_ready
+                        else "browser-free not captured yet")
+                       if engine_ready is not None else None),
             # Only meaningful while the browser-free engine is enabled.
             ("Peers", peers if (peers and engine == "direct") else None),
         ],
@@ -626,6 +636,128 @@ def error_card(where: str, account: str | None = None, target: str | None = None
             ("Detail ", sanitize(detail, 400) if detail else None),
             ("Time   ", now_hms()),
         ],
+    )
+
+
+def preflight_card(phone: str, engine: str, kind: str, total: int, skipped: int,
+                   refused: int, concurrency: int, delay: float,
+                   per_send: float | None, file_mb: float | None = None) -> str:
+    """What this run is about to do, and how long it should take.
+
+    Posted before the first message. Without it, a run that would take hours
+    looked exactly like one that would take three minutes, and there was no
+    moment left to press Stop and change a setting.
+
+    The estimate uses the LAST run's measured per-message time when there is one,
+    because a guessed constant was always wrong on this host:
+
+        seconds = total / (concurrency / (per_send + delay))
+    """
+    per = per_send if (per_send and per_send > 0) else 2.0
+    rate = max(0.01, concurrency / (per + max(0.0, delay)))
+    eta_s = total / rate
+    return card(
+        "🚦 READY TO SEND",
+        [
+            ("Phone      ", phone),
+            ("Engine     ", engine),
+            ("Type       ", kind + (f" ({file_mb:.1f} MB)" if file_mb else "")),
+            ("Recipients ", f"{total:,}"),
+            ("Skipping   ", (f"{skipped:,} already delivered" if skipped else None)),
+            ("Refused    ", (f"{refused:,} Eitaa won't accept" if refused else None)),
+            ("Pace       ", f"{concurrency} at a time, {delay:g}s between batches"),
+            ("Expected   ", f"~{fmt_duration(eta_s)} at {rate:.2f} msg/s"),
+        ],
+        footer=("Estimate based on the last run's measured speed."
+                if per_send else
+                "First run for this account, so the estimate assumes 2s per message."),
+    )
+
+
+def dry_run_card(phone: str, engine: str, kind: str, ok: bool, detail: str,
+                 send_seconds: float, total_seconds: float) -> str:
+    """Result of the one-message test send to the owner's own Saved Messages."""
+    return card(
+        "🧪 TEST SEND — OK" if ok else "🧪 TEST SEND — FAILED",
+        [
+            ("Phone     ", phone),
+            ("Engine    ", engine),
+            ("Type      ", kind),
+            ("Result    ", "delivered to your Saved Messages" if ok
+                           else sanitize(detail, 160)),
+            ("Send took ", f"{send_seconds:.1f}s"),
+            ("Whole test", fmt_duration(total_seconds)),
+        ],
+        footer=("Check it in your own Saved Messages: this is exactly what your "
+                "contacts would receive. 'Send took' is a real measurement of one "
+                "message with the current engine."
+                if ok else
+                "Nothing was sent to any contact. Fix this before starting a "
+                "campaign - it would fail the same way for everyone."),
+    )
+
+
+def pool_card(status: dict) -> str:
+    """Standby browser sessions: what is warm and what it saved."""
+    accounts = status.get("accounts") or {}
+    lines = []
+    for acc, info in accounts.items():
+        state = "in use" if info.get("leased") else f"standby, idle {info.get('idle')}s"
+        lines.append(f"• {acc}: {state} · {info.get('uses')} use(s)")
+    saved = int(status.get("saved_launches") or 0)
+    return card(
+        "🏠 BROWSER STANDBY",
+        [
+            ("Enabled  ", "yes" if status.get("enabled") else "no (a browser per job)"),
+            ("Warm now ", f"{status.get('warm', 0)} of {status.get('max_open')} allowed"),
+            ("Idle close", f"after {int(status.get('idle_ttl') or 0)}s"),
+            ("Launches saved", saved or None),
+            ("Opened   ", status.get("created") or None),
+            ("Recycled ", status.get("recycled") or None),
+            ("Evicted  ", status.get("evicted") or None),
+            ("Discarded", status.get("discarded") or None),
+        ],
+        body="\n".join(lines) if lines else None,
+        footer=(f"Each saved launch is ~2-3 minutes not spent starting Chromium on "
+                f"this server ({saved} so far). Sessions are opened only when a job "
+                f"asks, closed when idle, and recycled so a long-lived browser cannot "
+                f"grow unchecked."),
+    )
+
+
+def timing_card(phone: str, engine: str, timing: dict, concurrency: int,
+                limits: int = 0, fallbacks: int = 0) -> str:
+    """Where a run's time actually went.
+
+    Added because a run measured 6.2s per message while the transport itself
+    answered in 1-2s, and nothing in the panel could say what the other 4s were.
+    """
+    total = float(timing.get("total") or 0) or 1.0
+
+    def share(key: str) -> str | None:
+        v = float(timing.get(key) or 0)
+        if v <= 0:
+            return None
+        return f"{v:.0f}s ({v / total * 100:.0f}%)"
+
+    return card(
+        "⏱ RUN TIMING",
+        [
+            ("Phone      ", phone),
+            ("Engine     ", f"{engine} · {concurrency} at a time"),
+            ("Total      ", fmt_duration(total)),
+            ("Sending    ", share("transport")),
+            ("Slow path  ", share("fallback")),
+            ("Pacing wait", share("pacing")),
+            ("Everything else", share("other")),
+            ("Per message", f"{timing.get('per_send')}s" if timing.get("per_send") else None),
+            ("Rate       ", f"{timing.get('msg_per_s')} msg/s"),
+            ("Refused    ", limits or None),
+            ("Browser fallbacks", fallbacks or None),
+        ],
+        footer="'Sending' is time Eitaa itself took. 'Pacing wait' is your Send Delay "
+               "setting. A big 'Everything else' means the server (CPU steal, swap) "
+               "rather than Eitaa or the settings.",
     )
 
 

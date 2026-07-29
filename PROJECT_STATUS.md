@@ -243,3 +243,86 @@ Panel changes (see `bot/README.md`):
 ---
 
 Latest branch: https://github.com/shootingv818/Mkwlsoso/tree/feat/eitaa-web-capture
+
+
+---
+
+## 2026-07-29 — engines unified, panel made honest, everything measured
+
+All of this was driven by measurements on the live host, not guesses:
+1 CPU core with **30-89% steal**, 961 MB RAM, **158-203s just to open Chromium**,
+and 1-3s per HTTPS request to Eitaa.
+
+### The three engines are now one code path
+
+`bot/transports.py` gives the send loop a single interface, so the browser-free
+engine stopped being a duplicated second loop that nobody maintained:
+
+| Engine | Sends through | Safety net |
+|---|---|---|
+| `bridge` | the real web app inside Chromium | — (it *is* the proven path) |
+| `hybrid` | plain HTTPS, no browser | the page, per recipient |
+| `direct` | plain HTTPS, no browser | none (needs `MKWL_ENABLE_DIRECT=1`) |
+
+The engine switch is back in Settings and cycles `bridge → hybrid → direct`.
+
+**Why the direct engine was unusable before, and what changed**
+
+* It needed a session context (two envelope tokens + the account's own peer) that
+  only a hand-run CLI capture produced, so it went stale and answered
+  "no browser-free session capture". `bot/direct_ctx.py` now dumps the app's own
+  worker traffic whenever a browser session is open anyway and saves it, so the
+  context refreshes itself.
+* It could only address peers that had been separately *harvested*. The API
+  contacts list provides `access_hash` for every contact, so any contact is now
+  addressable without a browser.
+* A recipient it cannot deliver to falls through to the page automatically. A
+  server **refusal** (PEER_FLOOD) does not: the server already answered, and the
+  page would only repeat it more slowly.
+
+### Refused recipients are remembered
+
+Measured on a healthy account: 12 contacts → **6 delivered, 6 PEER_FLOOD**, and
+the split was per RECIPIENT (identical sequentially at 3s and concurrently at 1s).
+PEER_FLOOD there means Eitaa will not deliver from this account to that person; it
+does not expire on a timer. `bot/blocked_store.py` remembers them, so later runs
+skip them instead of spending half the run collecting the same errors. Timed
+`FLOOD_WAIT_n` is never treated this way. Panel: `⛔ Reset Refused`, and the
+account card shows `Reachable: N of M`.
+
+### The panel no longer blocks the sending
+
+`LiveCard` used to `await` the Telegram edit **inside the send loop**, so every
+progress update put a Telegram round trip (and any edit rate limiting Telethon
+silently sleeps through) between two messages. It now stashes the newest text and
+a background painter delivers it; intermediate states are dropped, not queued.
+
+### Every run reports where its time went
+
+A run measured **6.2s per message while Eitaa answered in 1-2s** and nothing could
+say what the other 4s were. Each run now ends with a `⏱ RUN TIMING` card and a
+`[send] timing:` log line splitting total time into sending / slow path / pacing /
+everything else, plus the achieved msg/s.
+
+### Rate maths (measured, not theoretical)
+
+    rate = concurrency / (RTT + delay)
+
+With the measured RTT of ~1.9s: `conc=3, delay=1` → **~1.03 msg/s** (180 messages
+in under 3 minutes). `conc=3, delay=3` is *slower* than `conc=1, delay=1` - the
+delay and the round trip add up, they do not overlap.
+
+### Tests
+
+    python -m bot.tests.test_bot_logic     # panel/store/cards/guards
+    python -m bot.tests.test_send_loop     # the send loop against a fake Eitaa
+    python -m bot.tests.test_engines       # bridge/hybrid/direct + the new stores
+    python -m bot.tests.test_live_card     # the card never blocks a job
+    python -m bot.tests.test_login_settle  # confirming a login after sign-in
+    python -m direct.tests.test_direct     # wire-format tests (unchanged)
+
+### Rollback
+
+Tag `baseline-before-hybrid` is this branch's starting point;
+`baseline-before-optimizations` and branch `feat/fast-send-multi-account` are the
+older, known-good states.

@@ -107,6 +107,20 @@ class Store:
         return int(self._data["settings"].get("send_log_every", config.SEND_LOG_EVERY))
 
     @property
+    def browserless(self) -> bool:
+        """May a run skip Chromium entirely when the engine allows it?
+
+        OFF by default: without a page there is no per-recipient safety net, so
+        this is an explicit choice, not something that happens quietly.
+        """
+        return bool(self._data["settings"].get("browserless", False))
+
+    def toggle_browserless(self) -> bool:
+        new = not self.browserless
+        self.set_setting("browserless", new)
+        return new
+
+    @property
     def stop_on_limit(self) -> bool:
         """Whether a server restriction (e.g. PEER_FLOOD) pauses the run."""
         return bool(self._data["settings"].get("stop_on_limit", config.STOP_ON_LIMIT))
@@ -136,27 +150,41 @@ class Store:
         self._data["last_run"]["at"] = time.time()
         self.save()
 
+    #: bridge = the proven in-page path. hybrid = browser-free sends with the
+    #: page as a per-recipient safety net. direct = browser-free only (needs
+    #: MKWL_ENABLE_DIRECT=1, since it has no fallback).
+    ENGINES = ("bridge", "hybrid", "direct")
+
     @property
     def engine(self) -> str:
-        """The engine every job uses.
-
-        The panel is bridge-only, so this reports "bridge" no matter what is
-        stored -- unless MKWL_ENABLE_DIRECT=1 brings the switch back. The stored
-        value is left untouched so enabling the flag restores the old choice.
-        """
-        if not config.ENABLE_DIRECT:
-            return "bridge"
+        """The engine every job uses."""
         eng = str(self._data["settings"].get("engine", config.ENGINE))
-        return eng if eng in ("bridge", "direct") else "bridge"
+        if eng not in self.ENGINES:
+            return "bridge"
+        if eng == "direct" and not config.ENABLE_DIRECT:
+            return "hybrid"
+        return eng
 
     def set_engine(self, engine: str) -> None:
-        self._data["settings"]["engine"] = "direct" if engine == "direct" else "bridge"
+        self._data["settings"]["engine"] = (
+            engine if engine in self.ENGINES else "bridge")
         self.save()
 
+    def cycle_engine(self) -> str:
+        """bridge -> hybrid -> (direct if enabled) -> bridge."""
+        options = ["bridge", "hybrid"]
+        if config.ENABLE_DIRECT:
+            options.append("direct")
+        try:
+            nxt = options[(options.index(self.engine) + 1) % len(options)]
+        except ValueError:
+            nxt = "bridge"
+        self.set_engine(nxt)
+        return nxt
+
+    # Kept for older callers/tests.
     def toggle_engine(self) -> str:
-        new = "direct" if self.engine == "bridge" else "bridge"
-        self.set_engine(new)
-        return new
+        return self.cycle_engine()
 
     # ---- per-account metadata (phone / contacts / pvs) ----
     @property

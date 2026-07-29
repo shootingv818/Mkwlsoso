@@ -181,10 +181,23 @@ class _FakeSessionCtx:
         return False
 
 
-def install_driver(driver: FakeDriver):
-    """Point the runner at the fake driver/session for one test."""
+class _FakePool:
+    """Stands in for the standby session pool; counts how many leases happened."""
+
+    def __init__(self):
+        self.leases = 0
+
+    def lease(self, account, **kw):
+        self.leases += 1
+        return _FakeSessionCtx()
+
+
+def install_driver(driver: FakeDriver, pool: "_FakePool | None" = None):
+    """Point the runner at the fake driver/session/pool for one test."""
+    R.session_pool = pool or _FakePool()
     R.open_session = lambda account, **kw: _FakeSessionCtx()
     R.EitaaDriver = lambda session: driver
+    return R.session_pool
 
 
 async def run_send(driver: FakeDriver, *, account="acc", contacts=None,
@@ -620,6 +633,135 @@ class _FakeLive:
         self.texts.append(text)
 
 
+def test_hybrid_engine_end_to_end():
+    print("hybrid engine drives a real run through the loop")
+    progress_store.clear("a_hyb")
+    sent_direct = []
+
+    class FakeSender:
+        account = "a_hyb"
+
+        def upload_file(self, path, caption=""):
+            return {"ok": True}
+
+        def send_text(self, peer, text):
+            sent_direct.append(peer)
+            # Every third recipient is refused by the server.
+            if len(sent_direct) % 3 == 0:
+                return {"ok": False, "limit": True, "code": "PEER_FLOOD"}
+            return {"ok": True, "method": "direct/sendMessage"}
+
+        def send_uploaded_file(self, peer, caption=""):
+            sent_direct.append(peer)
+            return {"ok": True, "method": "direct/sendMedia"}
+
+        def close(self):
+            return None
+
+    d = FakeDriver()
+
+    async def go():
+        install_driver(d)
+        contacts_store.save("a_hyb", [
+            {"peer_id": str(2000 + i), "access_hash": str(9000 + i), "title": f"h{i}"}
+            for i in range(9)])
+        # Pretend the direct engine is set up and its context is fresh.
+        R.direct_ctx.refresh_from_driver = lambda drv, acc: _ok_refresh()
+        R.direct_ctx.has_context = lambda acc: True
+        import direct.sender as ds
+        ds.DirectSender = lambda account: FakeSender()
+        mgr = R.JobManager()
+        job = R.Job(job_id="t", kind="send", account="a_hyb")
+        lines = []
+
+        async def report(t):
+            lines.append(t)
+
+        await mgr._send_job(job, {"kind": "text", "text": "hy"},
+                            {"text_send_delay": 0, "send_log_every": 999,
+                             "send_concurrency": 3, "engine": "hybrid",
+                             "stop_on_limit": False},
+                            report, None)
+        return job, lines
+
+    async def _ok_refresh():
+        return {"ok": True, "kept": 3, "user_id": 1}
+
+    job, lines = asyncio.run(go())
+    check("the run used the hybrid engine", job.summary.get("engine") == "hybrid",
+          job.summary)
+    check("the browser-free engine did the sending", len(sent_direct) == 9,
+          len(sent_direct))
+    check("deliverable recipients got it", job.summary.get("sent") == 6, job.summary)
+    check("refused ones are counted, not retried", job.summary.get("failed") == 3,
+          job.summary)
+    check("the refusals were remembered",
+          R.blocked_store.count("a_hyb") == 3, R.blocked_store.count("a_hyb"))
+    check("timing was measured", (job.summary.get("timing") or {}).get("total") is not None,
+          job.summary.get("timing"))
+    check("a timing card was posted", any("RUN TIMING" in x for x in lines), lines[-1:])
+
+    # Second run: the refused peers must be skipped up front.
+    sent_direct.clear()
+    progress_store.clear("a_hyb")
+
+    async def go2():
+        import direct.sender as ds
+        ds.DirectSender = lambda account: FakeSender()
+        mgr = R.JobManager()
+        job2 = R.Job(job_id="t2", kind="send", account="a_hyb")
+        lines2 = []
+
+        async def report(t):
+            lines2.append(t)
+
+        await mgr._send_job(job2, {"kind": "text", "text": "hy2"},
+                            {"text_send_delay": 0, "send_log_every": 999,
+                             "send_concurrency": 3, "engine": "hybrid",
+                             "stop_on_limit": False},
+                            report, None)
+        return job2, lines2
+
+    job2, lines2 = asyncio.run(go2())
+    check("refused peers are skipped on the next run",
+          job2.summary.get("total") == 6, job2.summary)
+    check("and the skip is announced",
+          any("SKIPPING REFUSED" in x.upper() for x in lines2), lines2[:3])
+
+
+def test_engine_falls_back_loudly_when_direct_is_unavailable():
+    print("an unusable direct engine falls back to the bridge, loudly")
+    progress_store.clear("a_nodirect")
+    d = FakeDriver()
+
+    async def go():
+        install_driver(d)
+        contacts_store.save("a_nodirect", peers(4))
+        R.direct_ctx.refresh_from_driver = lambda drv, acc: _bad()
+        R.direct_ctx.has_context = lambda acc: False
+        mgr = R.JobManager()
+        job = R.Job(job_id="t", kind="send", account="a_nodirect")
+        lines = []
+
+        async def report(t):
+            lines.append(t)
+
+        await mgr._send_job(job, {"kind": "text", "text": "x"},
+                            {"text_send_delay": 0, "send_log_every": 999,
+                             "engine": "hybrid"}, report, None)
+        return job, lines
+
+    async def _bad():
+        return {"ok": False, "code": "no envelope in the dump"}
+
+    job, lines = asyncio.run(go())
+    check("it still delivered via the bridge", job.summary.get("sent") == 4, job.summary)
+    check("the engine reported is the one actually used",
+          job.summary.get("engine") == "bridge", job.summary)
+    check("the switch was announced, not silent",
+          any("direct_context_missing" in x for x in lines), lines[:2])
+
+
 def test_stage_card_appears_before_any_send():
     print("the live checklist appears from the first second")
     progress_store.clear("a_stage")
@@ -644,8 +786,9 @@ def test_stage_card_appears_before_any_send():
     check("it warns about the 2-3 minute start", "minutes" in first, first[:200])
     joined = "\n".join(live.texts)
     check("every step is reported",
-          all(s in joined for s in ("check login", "read contacts",
-                                    "prepare text bridge", "deliver messages")))
+          all(s in joined for s in ("check session", "read contacts",
+                                    "prepare send path", "deliver messages")),
+          joined[:300])
     check("steps get ticked off", "✅" in joined)
     check("it hands over to the send card", "SENDING" in joined)
     check("the job still delivered", job.summary.get("sent") == 3, job.summary)
@@ -693,6 +836,168 @@ def test_ui_send_cannot_hang_forever():
           any("ui_timeout" in x for x in lines), lines[:3])
 
 
+def test_browserless_decision():
+    print("a run only skips the browser when it is truly safe")
+    mgr = R.JobManager()
+    acc = "a_bl"
+    contacts_store.save(acc, [
+        {"peer_id": "1", "access_hash": "10", "title": "a"},
+        {"peer_id": "2", "access_hash": "20", "title": "b"}])
+    R.direct_ctx.has_context = lambda a: True
+    R.direct_ctx.newest_capture_age_hours = lambda a: 0.5
+    on = {"browserless": True}
+    check("OFF by default: a browser-free run must be asked for",
+          mgr._can_run_browserless("hybrid", acc, None, {}) is False)
+    check("opted in, context fresh, all hashes -> no browser",
+          mgr._can_run_browserless("hybrid", acc, None, on) is True)
+    check("the bridge engine always opens a browser",
+          mgr._can_run_browserless("bridge", acc, None, on) is False)
+    check("externally supplied names need the browser",
+          mgr._can_run_browserless("hybrid", acc, ["a name"], on) is False)
+    R.direct_ctx.newest_capture_age_hours = lambda a: 99.0
+    check("a stale context -> browser (only a page can refresh it)",
+          mgr._can_run_browserless("hybrid", acc, None, on) is False)
+    R.direct_ctx.newest_capture_age_hours = lambda a: 0.5
+    R.direct_ctx.has_context = lambda a: False
+    check("no session context -> browser",
+          mgr._can_run_browserless("hybrid", acc, None, on) is False)
+    R.direct_ctx.has_context = lambda a: True
+    contacts_store.save("a_bl2", [{"peer_id": "1", "title": "no hash"}])
+    check("a contact without an access_hash -> browser (it would need the page)",
+          mgr._can_run_browserless("hybrid", "a_bl2", None, on) is False)
+    check("no contacts at all -> browser",
+          mgr._can_run_browserless("hybrid", "a_bl_empty", None, on) is False)
+
+
+def test_browserless_run_sends_without_a_page():
+    print("a browser-free run delivers with no browser at all")
+    progress_store.clear("a_nb")
+    opened = {"sessions": 0}
+    sent = []
+
+    class Sender:
+        account = "a_nb"
+
+        def send_text(self, peer, text):
+            sent.append(peer)
+            return {"ok": True, "method": "direct/sendMessage"}
+
+        def upload_file(self, path, caption=""):
+            return {"ok": True}
+
+        def close(self):
+            return None
+
+    class CountingPool(_FakePool):
+        def lease(self, account, **kw):
+            opened["sessions"] += 1
+            return _FakeSessionCtx()
+
+    async def go():
+        R.session_pool = CountingPool()
+        R.direct_ctx.has_context = lambda a: True
+        R.direct_ctx.newest_capture_age_hours = lambda a: 0.2
+        contacts_store.save("a_nb", [
+            {"peer_id": str(3000 + i), "access_hash": str(7000 + i), "title": f"b{i}"}
+            for i in range(5)])
+        import direct.sender as ds
+        ds.DirectSender = lambda account: Sender()
+        mgr = R.JobManager()
+        job = R.Job(job_id="t", kind="send", account="a_nb")
+        lines = []
+
+        async def report(t):
+            lines.append(t)
+
+        await mgr._send_job(job, {"kind": "text", "text": "nb"},
+                            {"text_send_delay": 0, "send_log_every": 999,
+                             "send_concurrency": 3, "engine": "hybrid",
+                             "browserless": True},
+                            report, None)
+        return job, lines
+
+    job, lines = asyncio.run(go())
+    check("no browser session was opened", opened["sessions"] == 0, opened)
+    check("everyone got the message", job.summary.get("sent") == 5, job.summary)
+    check("the browser-free engine did it", len(sent) == 5, len(sent))
+    check("the run reports the browser-free engine",
+          job.summary.get("engine") == "hybrid", job.summary)
+    check("a preflight card was posted", any("READY TO SEND" in x for x in lines),
+          lines[:1])
+
+
+def test_dry_run_only_touches_the_owner():
+    print("the test send goes to Saved Messages only")
+
+    class SelfDriver(FakeDriver):
+        async def self_peer_id(self):
+            return "5551234"
+
+    d = SelfDriver()
+    install_driver(d)
+    live = _FakeLive()
+
+    async def go():
+        mgr = R.JobManager()
+        job = await mgr.run_dry_run("a_dry", {"kind": "text", "text": "hello me"},
+                                    {"engine": "bridge"}, lambda t: asyncio.sleep(0),
+                                    "98912", live=live)
+        await job.task
+        return job
+
+    job = asyncio.run(go())
+    check("it reported success", job.summary.get("ok") is True, job.summary)
+    check("exactly one send happened", d.calls["bridge"] == 1, d.calls)
+    check("it measured the real per-message time",
+          isinstance(job.summary.get("seconds"), float), job.summary)
+    joined = "\n".join(live.texts)
+    check("the checklist mentions Saved Messages",
+          "Saved Messages" in joined, joined[:200])
+
+
+def test_dry_run_reports_a_failure_without_sending_a_campaign():
+    print("a failing test send stops before any campaign")
+
+    class NoSelf(FakeDriver):
+        async def self_peer_id(self):
+            return None
+
+    d = NoSelf()
+    install_driver(d)
+    lines = []
+
+    async def go():
+        mgr = R.JobManager()
+        job = await mgr.run_dry_run("a_dry2", {"kind": "text", "text": "x"},
+                                    {"engine": "bridge"},
+                                    lambda t: lines.append(t) or asyncio.sleep(0),
+                                    "98912")
+        await job.task
+
+    asyncio.run(go())
+    check("nothing was sent", d.calls["bridge"] == 0, d.calls)
+    check("the problem was reported",
+          any("no_self_peer" in str(x) for x in lines), lines[:2])
+
+
+def test_preflight_card_estimates_from_the_last_run():
+    print("the preflight card estimates before anything is sent")
+    from bot import cards as C
+    fast = C.preflight_card("98912", "hybrid", "Text", 180, 0, 0, 3, 1, 1.9)
+    check("it shows the recipient count", "180" in fast, fast)
+    check("it shows the pace", "3 at a time" in fast, fast)
+    check("it estimates a rate", "msg/s" in fast, fast)
+    check("180 at ~1 msg/s is about 3 minutes", "00:02:5" in fast or "00:03:0" in fast,
+          fast)
+    slow = C.preflight_card("98912", "bridge", "File", 1000, 20, 140, 1, 3, 3.2, 9.5)
+    check("skipped and refused are shown",
+          "20 already delivered" in slow and "140" in slow, slow)
+    check("the file size is shown", "9.5 MB" in slow, slow)
+    first = C.preflight_card("98912", "bridge", "Text", 10, 0, 0, 1, 1, None)
+    check("a first run says the estimate is assumed",
+          "assumes 2s" in first, first)
+
+
 def main() -> int:
     for fn in (test_sequential_baseline, test_concurrency_overlaps,
                test_concurrency_is_faster, test_lost_upload_is_rebuilt,
@@ -707,11 +1012,18 @@ def main() -> int:
                test_batch_results_are_not_discarded_on_limit,
                test_truncated_list_cannot_shrink_the_cache,
                test_ledger_survives_losing_peer_ids,
+               test_hybrid_engine_end_to_end,
+               test_engine_falls_back_loudly_when_direct_is_unavailable,
                test_stage_card_appears_before_any_send,
                test_stage_card_shows_a_failure,
                test_ui_send_cannot_hang_forever,
                test_file_stops_early_when_the_browser_path_keeps_failing,
-               test_upload_failure_stops_instead_of_grinding):
+               test_upload_failure_stops_instead_of_grinding,
+               test_browserless_decision,
+               test_browserless_run_sends_without_a_page,
+               test_dry_run_only_touches_the_owner,
+               test_dry_run_reports_a_failure_without_sending_a_campaign,
+               test_preflight_card_estimates_from_the_last_run):
         fn()
     print()
     print(f"{_PASS} passed, {_FAIL} failed")
