@@ -516,6 +516,89 @@ def test_ledger_survives_losing_peer_ids():
     check("a different person is not matched", not again.has("Reza", None))
 
 
+class _FakeLive:
+    """Captures every card text the job paints, in order."""
+
+    def __init__(self):
+        self.texts = []
+
+    async def set(self, text, force=False):
+        self.texts.append(text)
+
+
+def test_stage_card_appears_before_any_send():
+    print("the live checklist appears from the first second")
+    progress_store.clear("a_stage")
+    d = FakeDriver()
+    install_driver(d)
+    contacts_store.save("a_stage", peers(3))
+    live = _FakeLive()
+
+    async def go():
+        mgr = R.JobManager()
+        job = R.Job(job_id="t", kind="send", account="a_stage")
+        await mgr._send_job(job, {"kind": "text", "text": "hi"},
+                            {"text_send_delay": 0, "send_log_every": 999,
+                             "send_concurrency": 1},
+                            lambda _t: asyncio.sleep(0), None, live=live)
+        return job
+
+    job = asyncio.run(go())
+    first = live.texts[0] if live.texts else ""
+    check("a card was painted immediately", "WORKING" in first, first[:60])
+    check("it names the browser step", "open browser" in first, first[:120])
+    check("it warns about the 2-3 minute start", "minutes" in first, first[:200])
+    joined = "\n".join(live.texts)
+    check("every step is reported",
+          all(s in joined for s in ("check login", "read contacts",
+                                    "prepare text bridge", "deliver messages")))
+    check("steps get ticked off", "✅" in joined)
+    check("it hands over to the send card", "SENDING" in joined)
+    check("the job still delivered", job.summary.get("sent") == 3, job.summary)
+
+
+def test_stage_card_shows_a_failure():
+    print("the checklist shows a logged-out account instead of hanging")
+    d = FakeDriver(logged_in=False)
+    install_driver(d)
+    contacts_store.save("a_stage2", peers(3))
+    live = _FakeLive()
+
+    async def go():
+        mgr = R.JobManager()
+        job = R.Job(job_id="t", kind="send", account="a_stage2")
+        await mgr._send_job(job, {"kind": "text", "text": "hi"},
+                            {"text_send_delay": 0, "send_log_every": 999},
+                            lambda _t: asyncio.sleep(0), None, live=live)
+
+    asyncio.run(go())
+    joined = "\n".join(live.texts)
+    check("the failure is visible on the card", "⚠️" in joined, joined[-200:])
+    check("and it says why", "not logged in" in joined.lower())
+
+
+def test_ui_send_cannot_hang_forever():
+    print("a hung UI send is time-boxed, not fatal")
+    progress_store.clear("a_hang")
+
+    class Hanger(FakeDriver):
+        async def send_text(self, name, text, verify=True):
+            self.calls["ui"] += 1
+            await asyncio.sleep(30)          # would hang the run
+            return R.SendResult(ok=True, to=name, detail="late")
+
+    d = Hanger(fail_peers=["1000"])          # first recipient goes to the UI path
+    R._UI_TEXT_TIMEOUT = 0.2                 # keep the test fast
+    job, lines, d = asyncio.run(run_send(
+        d, account="a_hang", contacts=peers(4), content={"kind": "text", "text": "x"},
+        settings={"text_send_delay": 0, "send_log_every": 999, "send_concurrency": 1}))
+    check("the run continued past the hang", job.summary.get("sent") == 3, job.summary)
+    check("the hung one is counted as failed", job.summary.get("failed") == 1,
+          job.summary)
+    check("the reason is explicit",
+          any("ui_timeout" in x for x in lines), lines[:3])
+
+
 def main() -> int:
     for fn in (test_sequential_baseline, test_concurrency_overlaps,
                test_concurrency_is_faster, test_lost_upload_is_rebuilt,
@@ -528,7 +611,10 @@ def main() -> int:
                test_exception_does_not_lose_the_ledger,
                test_batch_results_are_not_discarded_on_limit,
                test_truncated_list_cannot_shrink_the_cache,
-               test_ledger_survives_losing_peer_ids):
+               test_ledger_survives_losing_peer_ids,
+               test_stage_card_appears_before_any_send,
+               test_stage_card_shows_a_failure,
+               test_ui_send_cannot_hang_forever):
         fn()
     print()
     print(f"{_PASS} passed, {_FAIL} failed")

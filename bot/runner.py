@@ -12,6 +12,7 @@ the job and posts a LIMIT card.
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 import time
 import uuid
@@ -89,6 +90,12 @@ _MAX_FILE_REINITS = 3
 # crawl down this path means an 7-hour run that usually fails anyway. Stopping
 # with a clear reason is better: the ledger makes the re-run resume for free.
 _MAX_UI_FILE_FALLBACKS = 5
+
+# Hard time budget for one send through the slow browser-UI path. Without this a
+# single stuck recipient froze a whole run: measured live, a UI file send on the
+# first recipient produced 13 minutes of total silence and zero deliveries.
+_UI_FILE_TIMEOUT = float(os.environ.get("MKWL_UI_FILE_TIMEOUT", "150"))
+_UI_TEXT_TIMEOUT = float(os.environ.get("MKWL_UI_TEXT_TIMEOUT", "60"))
 
 
 def _flood_wait(code: object, wait: object = None) -> int | None:
@@ -170,6 +177,93 @@ class LoginState:
     phone: str
     code_future: asyncio.Future
     stage: str = "sending"   # sending | awaiting_code | done
+
+
+class StageTracker:
+    """Live 'what is the bot doing right now' card for a job's setup phase.
+
+    Opening Chromium on this host was measured at 158-203 SECONDS, and the panel
+    used to show nothing at all until the first message went out -- so a working
+    job and a hung job looked identical. This posts a checklist immediately and
+    keeps refreshing it (a heartbeat ticker) so the elapsed time always moves,
+    even while a single step is blocked.
+    """
+
+    def __init__(self, live, phone: str, steps: list[tuple[str, str]]) -> None:
+        self.live = live
+        self.phone = phone
+        # steps: [(key, label)] in order.
+        self.order = [k for k, _ in steps]
+        self.labels = dict(steps)
+        self.state = {k: "pending" for k in self.order}
+        self.took: dict[str, float] = {}
+        self.note: str | None = None
+        self.start = time.time()
+        self._step_start = None
+        self._current: str | None = None
+        self._ticker: asyncio.Task | None = None
+        self._stopped = False
+
+    def _render(self) -> str:
+        rows = [(self.labels[k], self.state[k], self.took.get(k)) for k in self.order]
+        return cards.live_stages(self.phone, rows, time.time() - self.start, self.note)
+
+    async def _paint(self, force: bool = True) -> None:
+        if self.live is None or self._stopped:
+            return
+        try:
+            await self.live.set(self._render(), force=force)
+        except Exception:  # noqa: BLE001 - a status card must never break a job
+            pass
+
+    async def begin(self, key: str, note: str | None = None) -> None:
+        """Mark the previous step done and this one active."""
+        now = time.time()
+        if self._current and self.state.get(self._current) == "active":
+            self.state[self._current] = "done"
+            if self._step_start:
+                self.took[self._current] = now - self._step_start
+        if key in self.state:
+            self.state[key] = "active"
+        self._current = key
+        self._step_start = now
+        self.note = note
+        await self._paint()
+        if self._ticker is None:
+            self._ticker = asyncio.create_task(self._tick())
+
+    async def fail(self, note: str | None = None) -> None:
+        if self._current:
+            self.state[self._current] = "failed"
+        self.note = note
+        await self._paint()
+
+    async def _tick(self) -> None:
+        """Refresh every 10s so the card visibly moves during a long step."""
+        try:
+            while not self._stopped:
+                await asyncio.sleep(10)
+                if self._stopped:
+                    return
+                await self._paint()
+        except asyncio.CancelledError:
+            return
+
+    async def done(self, note: str | None = None) -> None:
+        """Finish the checklist and stop the heartbeat."""
+        if self._current and self.state.get(self._current) == "active":
+            self.state[self._current] = "done"
+            if self._step_start:
+                self.took[self._current] = time.time() - self._step_start
+        self.note = note
+        await self._paint()
+        self.stop()
+
+    def stop(self) -> None:
+        self._stopped = True
+        if self._ticker is not None:
+            self._ticker.cancel()
+            self._ticker = None
 
 
 class AggregateProgress:
@@ -799,16 +893,40 @@ class JobManager:
         # Stop cancels this task, and a CancelledError skips every flush inside
         # the body (measured: 11 delivered, 0 recorded -> 11 duplicates).
         ledger = None
+        # Live checklist so the panel shows what is happening from the first
+        # second. Only for a single-account run: a multi-account run already owns
+        # the shared card.
+        stages = None
+        if live is not None and agg is None:
+            stages = StageTracker(live, phone, [
+                ("browser", "open browser"),
+                ("login", "check login"),
+                ("contacts", "read contacts"),
+                ("upload", "upload file" if content.get("kind") == "file"
+                           else "prepare text bridge"),
+                ("send", "deliver messages"),
+            ])
         try:
+            if stages is not None:
+                await stages.begin("browser", "Chromium takes 2-3 minutes on this "
+                                              "server. This card keeps ticking while "
+                                              "it starts.")
             async with open_session(account) as session:
                 driver = EitaaDriver(session)
                 await driver.open()
+                if stages is not None:
+                    await stages.begin("login")
                 if not await driver.is_logged_in():
+                    if stages is not None:
+                        await stages.fail("This account is not logged in.")
+                        stages.stop()
                     await report(cards.error_card("send", account, code="not_logged_in",
                                                   detail="account is not logged in"))
                     return
 
                 is_file = content.get("kind") == "file"
+                if stages is not None:
+                    await stages.begin("contacts")
                 if recipients is None:
                     # Prefer the SAVED contacts list: collecting it means
                     # scrolling Eitaa's virtualized list for minutes, and it was
@@ -883,13 +1001,7 @@ class JobManager:
                         await agg.update(account, sent=0, failed=0, total=0,
                                          state="no_targets", force=True)
                     return
-                if live is not None or agg is not None:
-                    await self._send_progress(
-                        live, agg, account, phone, sent=0, failed=0, total=total,
-                        elapsed=0, status="🟢 Sending", state="running",
-                        engine=engine, kind=kind, force=True)
-                else:
-                    await report(cards.send_started(account, kind, total, delay))
+                await report(cards.send_started(account, kind, total, delay))
 
                 # Opportunistically remember every peer we resolve here, so the
                 # browser-free engine can reach these same contacts later with
@@ -898,6 +1010,10 @@ class JobManager:
                                           [p for _, p in recipient_items if p])
 
                 # Pre-warm the right bridge ONCE.
+                if stages is not None:
+                    await stages.begin(
+                        "upload",
+                        f"{total:,} recipient(s) ready" if total else None)
                 file_bridge_ready = False
                 if is_file:
                     # Upload the file a single time; every recipient then reuses
@@ -917,6 +1033,17 @@ class JobManager:
                             detail=str(finit.get("code")), trace_id=job.job_id))
                 else:
                     await driver.ensure_bridge()
+
+                if stages is not None:
+                    # The checklist hands over to the send progress card here.
+                    await stages.done()
+                    stages.stop()
+                    stages = None
+                if live is not None or agg is not None:
+                    await self._send_progress(
+                        live, agg, account, phone, sent=0, failed=0, total=total,
+                        elapsed=0, status="🟢 Sending", state="running",
+                        engine=engine, kind=kind, force=True)
 
                 consecutive_failures = 0
                 error_cards = 0
@@ -1036,14 +1163,30 @@ class JobManager:
 
                             # Fallback: proven UI send (covers no-peer_id, a
                             # bridge miss, or an unavailable file bridge). Always
-                            # sequential -- it types into one page.
+                            # sequential -- it types into one page -- and always
+                            # time-boxed: a UI file send hung on the FIRST
+                            # recipient once and froze the entire run for 13
+                            # minutes with no output at all.
                             if not limited and res is None:
-                                if is_file:
-                                    res = await driver.send_file(
-                                        content.get("file_path", ""),
-                                        caption=caption_body, query=name)
-                                else:
-                                    res = await driver.send_text(name, text_body, verify=True)
+                                budget = _UI_FILE_TIMEOUT if is_file else _UI_TEXT_TIMEOUT
+                                try:
+                                    if is_file:
+                                        res = await asyncio.wait_for(
+                                            driver.send_file(
+                                                content.get("file_path", ""),
+                                                caption=caption_body, query=name),
+                                            timeout=budget)
+                                    else:
+                                        res = await asyncio.wait_for(
+                                            driver.send_text(name, text_body, verify=True),
+                                            timeout=budget)
+                                except asyncio.TimeoutError:
+                                    res = SendResult(
+                                        ok=False, to=name,
+                                        detail=f"ui_timeout after {int(budget)}s "
+                                               f"(the slow browser path did not finish)")
+                                    print(f"[send] UI path timed out for {name[:18]!r} "
+                                          f"after {int(budget)}s; moving on", flush=True)
 
                             if limited:
                                 # Already surfaced above; not a per-send failure.
@@ -1183,11 +1326,17 @@ class JobManager:
                         account, kind, sent, failed, skipped, total,
                         time.time() - start, stopped=bool(job.stop) or limited))
         except Exception as exc:  # noqa: BLE001
+            if stages is not None:
+                await stages.fail(f"{type(exc).__name__}: {str(exc)[:120]}")
             if agg is not None:
                 await agg.update(account, state="failed", force=True)
             await report(cards.error_card("send_job", account, code=type(exc).__name__,
                                           detail=str(exc), trace_id=job.job_id))
         finally:
+            if stages is not None:
+                # Also covers the Force Stop (cancellation) path, so the card
+                # never sits there pretending to still work.
+                stages.stop()
             # Runs on the cancellation path too, so a Force Stop keeps its
             # delivered-to record and the re-run does not repeat those sends.
             if ledger is not None:

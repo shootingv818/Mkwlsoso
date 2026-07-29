@@ -145,6 +145,34 @@ def live_contacts(phone: str, prefix: str, found: int, probed: int, total: int,
     return "\n".join(lines)
 
 
+def live_stages(phone: str, stages: list[tuple[str, str, float | None]],
+                elapsed: float, note: str | None = None) -> str:
+    """Checklist card shown from the moment Send is pressed.
+
+    Before this existed the panel showed nothing for the first few minutes of a
+    job -- and on this host just opening Chromium takes 150-200 seconds, so there
+    was no way to tell a working bot from a stuck one.
+
+    stages: [(label, state, seconds)] where state is done | active | pending |
+    failed. `seconds` is how long a finished step took.
+    """
+    mark = {"done": "✅", "active": "⏳", "pending": "◻️", "failed": "⚠️"}
+    rows = []
+    for label, state, secs in stages:
+        line = f"{mark.get(state, '◻️')} {label}"
+        if state == "done" and secs:
+            line += f"  ({secs:.0f}s)"
+        elif state == "active":
+            line += "  …"
+        rows.append(line)
+    lines = ["⚙️ WORKING — Live", DIVIDER, f"📱 {phone}", *rows,
+             f"⏱ total {fmt_duration(elapsed)}"]
+    if note:
+        lines.append(note)
+    lines.append(f"🕒 {now_hms()}")
+    return "\n".join(lines)
+
+
 def live_send(phone: str, sent: int, failed: int, total: int, elapsed: float,
               status: str = "🟢 Sending", engine: str | None = None,
               kind: str | None = None) -> str:
