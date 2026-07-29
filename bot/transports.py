@@ -106,6 +106,10 @@ class DirectTransport(Transport):
         """The 20-byte peer for this recipient, from the contacts list or store."""
         if not peer_id:
             return None
+        # "self" = the account's own Saved Messages, which the capture already
+        # revealed. The test send needs this; contacts never carry it.
+        if str(peer_id) == "self":
+            return getattr(self.sender, "self_peer", None)
         ah = self.access_hashes.get(str(peer_id))
         if ah:
             try:
@@ -168,8 +172,13 @@ class HybridTransport(Transport):
         self.direct = direct
         self.bridge = bridge
         self.stats = {"direct": 0, "bridge": 0, "fell_back": 0}
+        # Remembered so the page can upload the same file on demand: it cannot
+        # send a document that the direct engine uploaded.
+        self._file_path: str | None = None
+        self._caption = ""
 
     async def prepare_file(self, file_path: str, caption: str = "") -> dict:
+        self._file_path, self._caption = file_path, caption
         res = await self.direct.prepare_file(file_path, caption)
         if res.get("ok"):
             return res
@@ -216,6 +225,15 @@ class HybridTransport(Transport):
         return await self._both("send_text", peer_id, text)
 
     async def send_file(self, peer_id: str, caption: str = "") -> dict:
+        # The bridge can only deliver a file it uploaded ITSELF. If the direct
+        # engine owns the upload and this recipient needs the page, the page has
+        # to upload once first - otherwise it was asked to send a document it
+        # never had.
+        if not await self.bridge.file_ready() and self._file_path is not None:
+            prep = await self.bridge.prepare_file(self._file_path, self._caption)
+            if not prep.get("ok"):
+                # No page-side upload: the direct engine is all there is.
+                return await self.direct.send_file(peer_id, caption)
         return await self._both("send_file", peer_id, caption)
 
     async def close(self) -> None:

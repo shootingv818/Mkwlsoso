@@ -27,6 +27,7 @@ from bot import direct_ctx
 from bot import progress_store
 from bot.store import store
 from bot.runner import manager, expand_range
+from capture.pool import pool as session_pool
 
 
 # ---- helpers -----------------------------------------------------------
@@ -195,6 +196,9 @@ class LiveCard:
         self._sent_text: str | None = None
         self._painter: asyncio.Task | None = None
         self._wake = asyncio.Event()
+        # Serialises the painter and flush(): without it they raced and the card
+        # could end up showing an OLD state ('Sending 50/100' after 'Done').
+        self._paint_lock = asyncio.Lock()
         self._closed = False
         self.paints = 0
         self.dropped = 0
@@ -223,39 +227,45 @@ class LiveCard:
                     if self._pending is None:
                         return
                 self._wake.clear()
-                text, self._pending = self._pending, None
-                if text is None or text == self._sent_text:
-                    continue
-                try:
-                    if self._msg is None:
-                        self._msg = await bot.send_message(self.chat_id, text)
-                    else:
-                        await self._msg.edit(text)
-                    self._sent_text = text
-                    self.paints += 1
-                except MessageNotModifiedError:
-                    self._sent_text = text
-                except Exception:  # noqa: BLE001 - a card must never break a job
-                    pass
+                async with self._paint_lock:
+                    text, self._pending = self._pending, None
+                    if text is None or text == self._sent_text:
+                        continue
+                    try:
+                        if self._msg is None:
+                            self._msg = await bot.send_message(self.chat_id, text)
+                        else:
+                            await self._msg.edit(text)
+                        self._sent_text = text
+                        self.paints += 1
+                    except MessageNotModifiedError:
+                        self._sent_text = text
+                    except Exception:  # noqa: BLE001 - never break a job
+                        pass
                 # Rate-limit ourselves so Telegram never has to.
                 await asyncio.sleep(self.min_interval)
         except asyncio.CancelledError:
             return
 
     async def flush(self) -> None:
-        """Paint the last queued text now (used when a job ends)."""
-        text, self._pending = self._pending, None
-        if text is None or text == self._sent_text:
-            return
-        try:
-            if self._msg is None:
-                self._msg = await bot.send_message(self.chat_id, text)
-            else:
-                await self._msg.edit(text)
-            self._sent_text = text
-            self.paints += 1
-        except Exception:  # noqa: BLE001
-            pass
+        """Paint the last queued text now (used when a job ends).
+
+        Takes the same lock as the painter, so the final state can never be
+        overwritten by an in-flight older edit.
+        """
+        async with self._paint_lock:
+            text, self._pending = self._pending, None
+            if text is None or text == self._sent_text:
+                return
+            try:
+                if self._msg is None:
+                    self._msg = await bot.send_message(self.chat_id, text)
+                else:
+                    await self._msg.edit(text)
+                self._sent_text = text
+                self.paints += 1
+            except Exception:  # noqa: BLE001
+                pass
 
     def close(self) -> None:
         self._closed = True
@@ -402,6 +412,10 @@ def kb_settings():
             b"set:stoponlimit")],
         [Button.inline("⏱ Contact Delay", b"set:contactdelay"),
          Button.inline("🔢 Log Every N", b"set:logevery")],
+        [Button.inline("🏠 Browser Standby", b"set:pool"),
+         Button.inline(
+             f"🚀 No-browser sends: {'ON' if store.browserless else 'OFF'}",
+             b"set:browserless")],
         [Button.inline("⬅ Back", b"menu:home")],
     ]
     return rows
@@ -830,6 +844,21 @@ async def _handle_callback(event):
         now = store.toggle_stop_on_limit()
         await event.answer("Pause on limit: " + ("ON" if now else "OFF"))
         return await event.edit(settings_text(), buttons=kb_settings())
+    if data == "set:browserless":
+        now = store.toggle_browserless()
+        await event.answer("No-browser sends: " + ("ON" if now else "OFF"))
+        return await event.edit(settings_text(), buttons=kb_settings())
+    if data == "set:pool":
+        return await event.edit(
+            cards.pool_card(session_pool.status()),
+            buttons=[[Button.inline("🧹 Close standby sessions", b"set:poolclose")],
+                     [Button.inline("⬅ Back", b"menu:settings")]])
+    if data == "set:poolclose":
+        n = await session_pool.close_all()
+        await event.answer(f"Closed {n} standby session(s).")
+        return await event.edit(
+            cards.pool_card(session_pool.status()),
+            buttons=[[Button.inline("⬅ Back", b"menu:settings")]])
     if data == "set:concurrency":
         pending[event.sender_id] = {"step": "await_concurrency"}
         return await event.edit(

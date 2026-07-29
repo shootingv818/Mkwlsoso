@@ -181,10 +181,23 @@ class _FakeSessionCtx:
         return False
 
 
-def install_driver(driver: FakeDriver):
-    """Point the runner at the fake driver/session for one test."""
+class _FakePool:
+    """Stands in for the standby session pool; counts how many leases happened."""
+
+    def __init__(self):
+        self.leases = 0
+
+    def lease(self, account, **kw):
+        self.leases += 1
+        return _FakeSessionCtx()
+
+
+def install_driver(driver: FakeDriver, pool: "_FakePool | None" = None):
+    """Point the runner at the fake driver/session/pool for one test."""
+    R.session_pool = pool or _FakePool()
     R.open_session = lambda account, **kw: _FakeSessionCtx()
     R.EitaaDriver = lambda session: driver
+    return R.session_pool
 
 
 async def run_send(driver: FakeDriver, *, account="acc", contacts=None,
@@ -831,23 +844,29 @@ def test_browserless_decision():
         {"peer_id": "1", "access_hash": "10", "title": "a"},
         {"peer_id": "2", "access_hash": "20", "title": "b"}])
     R.direct_ctx.has_context = lambda a: True
-    check("hybrid with a context and full hashes -> no browser",
-          mgr._can_run_browserless("hybrid", acc, None, {}) is True)
+    R.direct_ctx.newest_capture_age_hours = lambda a: 0.5
+    on = {"browserless": True}
+    check("OFF by default: a browser-free run must be asked for",
+          mgr._can_run_browserless("hybrid", acc, None, {}) is False)
+    check("opted in, context fresh, all hashes -> no browser",
+          mgr._can_run_browserless("hybrid", acc, None, on) is True)
     check("the bridge engine always opens a browser",
-          mgr._can_run_browserless("bridge", acc, None, {}) is False)
-    check("an explicit setting can force the browser",
-          mgr._can_run_browserless("hybrid", acc, None, {"browserless": False}) is False)
+          mgr._can_run_browserless("bridge", acc, None, on) is False)
     check("externally supplied names need the browser",
-          mgr._can_run_browserless("hybrid", acc, ["a name"], {}) is False)
+          mgr._can_run_browserless("hybrid", acc, ["a name"], on) is False)
+    R.direct_ctx.newest_capture_age_hours = lambda a: 99.0
+    check("a stale context -> browser (only a page can refresh it)",
+          mgr._can_run_browserless("hybrid", acc, None, on) is False)
+    R.direct_ctx.newest_capture_age_hours = lambda a: 0.5
     R.direct_ctx.has_context = lambda a: False
     check("no session context -> browser",
-          mgr._can_run_browserless("hybrid", acc, None, {}) is False)
+          mgr._can_run_browserless("hybrid", acc, None, on) is False)
     R.direct_ctx.has_context = lambda a: True
     contacts_store.save("a_bl2", [{"peer_id": "1", "title": "no hash"}])
     check("a contact without an access_hash -> browser (it would need the page)",
-          mgr._can_run_browserless("hybrid", "a_bl2", None, {}) is False)
+          mgr._can_run_browserless("hybrid", "a_bl2", None, on) is False)
     check("no contacts at all -> browser",
-          mgr._can_run_browserless("hybrid", "a_bl_empty", None, {}) is False)
+          mgr._can_run_browserless("hybrid", "a_bl_empty", None, on) is False)
 
 
 def test_browserless_run_sends_without_a_page():
@@ -869,13 +888,15 @@ def test_browserless_run_sends_without_a_page():
         def close(self):
             return None
 
-    def counting_session(account, **kw):
-        opened["sessions"] += 1
-        return _FakeSessionCtx()
+    class CountingPool(_FakePool):
+        def lease(self, account, **kw):
+            opened["sessions"] += 1
+            return _FakeSessionCtx()
 
     async def go():
-        R.open_session = counting_session
+        R.session_pool = CountingPool()
         R.direct_ctx.has_context = lambda a: True
+        R.direct_ctx.newest_capture_age_hours = lambda a: 0.2
         contacts_store.save("a_nb", [
             {"peer_id": str(3000 + i), "access_hash": str(7000 + i), "title": f"b{i}"}
             for i in range(5)])
@@ -890,7 +911,8 @@ def test_browserless_run_sends_without_a_page():
 
         await mgr._send_job(job, {"kind": "text", "text": "nb"},
                             {"text_send_delay": 0, "send_log_every": 999,
-                             "send_concurrency": 3, "engine": "hybrid"},
+                             "send_concurrency": 3, "engine": "hybrid",
+                             "browserless": True},
                             report, None)
         return job, lines
 

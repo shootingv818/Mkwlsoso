@@ -697,6 +697,34 @@ def dry_run_card(phone: str, engine: str, kind: str, ok: bool, detail: str,
     )
 
 
+def pool_card(status: dict) -> str:
+    """Standby browser sessions: what is warm and what it saved."""
+    accounts = status.get("accounts") or {}
+    lines = []
+    for acc, info in accounts.items():
+        state = "in use" if info.get("leased") else f"standby, idle {info.get('idle')}s"
+        lines.append(f"• {acc}: {state} · {info.get('uses')} use(s)")
+    saved = int(status.get("saved_launches") or 0)
+    return card(
+        "🏠 BROWSER STANDBY",
+        [
+            ("Enabled  ", "yes" if status.get("enabled") else "no (a browser per job)"),
+            ("Warm now ", f"{status.get('warm', 0)} of {status.get('max_open')} allowed"),
+            ("Idle close", f"after {int(status.get('idle_ttl') or 0)}s"),
+            ("Launches saved", saved or None),
+            ("Opened   ", status.get("created") or None),
+            ("Recycled ", status.get("recycled") or None),
+            ("Evicted  ", status.get("evicted") or None),
+            ("Discarded", status.get("discarded") or None),
+        ],
+        body="\n".join(lines) if lines else None,
+        footer=(f"Each saved launch is ~2-3 minutes not spent starting Chromium on "
+                f"this server ({saved} so far). Sessions are opened only when a job "
+                f"asks, closed when idle, and recycled so a long-lived browser cannot "
+                f"grow unchecked."),
+    )
+
+
 def timing_card(phone: str, engine: str, timing: dict, concurrency: int,
                 limits: int = 0, fallbacks: int = 0) -> str:
     """Where a run's time actually went.

@@ -22,6 +22,7 @@ from typing import Awaitable, Callable
 
 from config import config
 from capture.browser import open_session
+from capture.pool import pool as session_pool
 from eitaa.driver import EitaaDriver, SendResult
 from bot import blocked_store          # noqa: F401 - used in the send loop
 from bot import cards
@@ -105,6 +106,10 @@ _UI_TEXT_TIMEOUT = float(os.environ.get("MKWL_UI_TEXT_TIMEOUT", "60"))
 # sign-in. The old code checked once after 1.5s and once after 6s, which reported
 # a perfectly good login as "LOGIN INCOMPLETE" on this slow host.
 _LOGIN_SETTLE_TIMEOUT = float(os.environ.get("MKWL_LOGIN_SETTLE_TIMEOUT", "120"))
+
+# How old the browser-free engine's session capture may be before a run insists on
+# opening a browser (which is the only thing that can refresh it).
+_CONTEXT_MAX_AGE_HOURS = float(os.environ.get("MKWL_CONTEXT_MAX_AGE_H", "12"))
 
 
 def _worker_capture_script(engine: str):
@@ -680,9 +685,19 @@ class JobManager:
         """
         if engine == "bridge" or recipients is not None:
             return False
-        if not bool((settings or {}).get("browserless", True)):
+        # OFF unless the owner explicitly asks for it. A browser-free run has no
+        # page, so "hybrid" loses its per-recipient safety net - exactly the
+        # no-fallback situation MKWL_ENABLE_DIRECT exists to gate. Opt-in only.
+        if not bool((settings or {}).get("browserless", False)):
             return False
+        ctx_age = direct_ctx.newest_capture_age_hours(account)
         if not direct_ctx.has_context(account):
+            return False
+        # A stale capture cannot be refreshed without a page, so every send would
+        # fail until the brake stopped the run. Take the browser instead.
+        if ctx_age is None or ctx_age > _CONTEXT_MAX_AGE_HOURS:
+            print(f"[engine] context for {account} is {ctx_age}h old; taking the "
+                  f"browser so it can be refreshed", flush=True)
             return False
         saved = contacts_store.contacts(account)
         if not saved:
@@ -790,7 +805,7 @@ class JobManager:
         try:
             if stages is not None:
                 await stages.begin("browser", "Test send: only you receive this.")
-            async with open_session(account, headed=config.HEADED_JOBS,
+            async with session_pool.lease(account, headed=config.HEADED_JOBS,
                                    init_script_path=_worker_capture_script(engine)
                                    ) as session:
                 driver = EitaaDriver(session)
@@ -809,7 +824,12 @@ class JobManager:
                 # Saved Messages = the account's own peer, which every engine can
                 # address without any contact relationship, so a PEER_FLOOD here
                 # would mean something genuinely wrong with the account.
-                self_peer = await driver.self_peer_id()
+                # The browser-free engines address Saved Messages through the
+                # capture's own self-peer, so the literal "self" is resolved by
+                # the transport; only the page needs a numeric id.
+                self_peer = ("self" if getattr(transport, "browserless", False)
+                             or isinstance(transport, transports.HybridTransport)
+                             else await driver.self_peer_id())
                 if not self_peer:
                     await report(cards.error_card(
                         "dry_run", account, code="no_self_peer",
@@ -918,7 +938,7 @@ class JobManager:
         # hybrid ready -- the owner never has to run a send just to arm it.
         engine = effective_engine(self.settings_provider())
         try:
-            async with open_session(account, headed=config.HEADED_JOBS,
+            async with session_pool.lease(account, headed=config.HEADED_JOBS,
                                     init_script_path=_worker_capture_script(engine)
                                     ) as session:
                 driver = EitaaDriver(session)
@@ -1059,7 +1079,7 @@ class JobManager:
 
     async def _bridge_login_job(self, account: str, phone: str, report: Report,
                                 live=None) -> None:
-        from capture.browser import open_session
+        from capture.browser import open_session  # noqa: F401 - legacy local import
         from eitaa.driver import EitaaDriver
         from eitaa.login_flow import (
             normalize_phone_intl, resolve_api_creds, send_code, sign_in,
@@ -1081,7 +1101,7 @@ class JobManager:
             if stages is not None:
                 await stages.begin("browser", "Chromium takes 2-3 minutes on this "
                                               "server. This card keeps ticking.")
-            async with open_session(account, headed=config.HEADED_JOBS) as session:
+            async with session_pool.lease(account, headed=config.HEADED_JOBS) as session:
                 driver = EitaaDriver(session)
                 # NOTE: driver.open() navigates to Eitaa itself. This used to
                 # call session.goto() first as well, so the whole web app was
@@ -1281,6 +1301,7 @@ class JobManager:
         # the body (measured: 11 delivered, 0 recorded -> 11 duplicates).
         ledger = None
         transport = None
+        blocked = None
         # Live checklist so the panel shows what is happening from the first
         # second. Only for a single-account run: a multi-account run already owns
         # the shared card.
@@ -1307,7 +1328,7 @@ class JobManager:
                     "Browser-free run: sending starts in seconds." if browserless
                     else "Chromium takes 2-3 minutes on this server. This card keeps "
                          "ticking while it starts.")
-            async with (_NullSession() if browserless else open_session(
+            async with (_NullSession() if browserless else session_pool.lease(
                     account, headed=config.HEADED_JOBS,
                     init_script_path=_worker_capture_script(engine))) as session:
                 driver = _NullDriver() if browserless else EitaaDriver(session)
@@ -1379,7 +1400,7 @@ class JobManager:
                 # single time, so retrying them doubled every run's length and
                 # produced hundreds of avoidable errors.
                 blocked = blocked_store.open_list(account)
-                if blocked.peers and recipients is None:
+                if blocked.peers and recipients is None:  # noqa: SIM102
                     before_block = len(recipient_items)
                     recipient_items = [(n, p) for (n, p) in recipient_items
                                        if not blocked.has(p)]
@@ -1844,20 +1865,12 @@ class JobManager:
                 # Persist whatever was delivered, even on a stop or a crash path,
                 # so the next run resumes instead of re-sending.
                 ledger.flush()
-                if blocked.added:
-                    blocked.flush()
-                    print(f"[send] {blocked.added} peer(s) added to the refused "
-                          f"list ({len(blocked.peers)} total)", flush=True)
+                hybrid_stats = None
                 if isinstance(transport, transports.HybridTransport):
-                    st = transport.stats
-                    print(f"[engine] hybrid split: direct={st['direct']} "
-                          f"bridge={st['bridge']} fell_back={st['fell_back']}",
-                          flush=True)
-                    job.summary["hybrid"] = dict(st)
-                try:
-                    await transport.close()
-                except Exception:  # noqa: BLE001
-                    pass
+                    hybrid_stats = dict(transport.stats)
+                    print(f"[engine] hybrid split: direct={hybrid_stats['direct']} "
+                          f"bridge={hybrid_stats['bridge']} "
+                          f"fell_back={hybrid_stats['fell_back']}", flush=True)
                 # Evidence of which path carried the load (fast bridge vs the UI
                 # fallback) so alternative methods stay observable at a glance.
                 elapsed_total = max(0.001, time.time() - start)
@@ -1886,7 +1899,9 @@ class JobManager:
                                "via_fallback": via_fallback, "reinits": reinits,
                                "concurrency": conc, "engine": engine,
                                "limits": limit_hits, "timing": timing,
-                               "refused_added": blocked.added}
+                               "refused_added": blocked.added,
+                               "browserless": browserless,
+                               "hybrid": hybrid_stats}
                 if agg is None:
                     await report(cards.timing_card(phone, engine, timing, conc,
                                                    limit_hits, via_fallback))
@@ -1948,6 +1963,15 @@ class JobManager:
             if ledger is not None:
                 try:
                     ledger.flush()
+                except Exception:  # noqa: BLE001
+                    pass
+            # Refusals must survive a Force Stop too: without this, the peers
+            # learned during a cancelled run were forgotten and retried forever.
+            if blocked is not None and blocked.added:
+                try:
+                    blocked.flush()
+                    print(f"[send] {blocked.added} peer(s) added to the refused "
+                          f"list ({len(blocked.peers)} total)", flush=True)
                 except Exception:  # noqa: BLE001
                     pass
             self._busy.discard(account)
@@ -2200,7 +2224,7 @@ class JobManager:
         added = not_on = invalid = error = 0
         total = len(entries)
         try:
-            async with open_session(account, headed=config.HEADED_JOBS) as session:
+            async with session_pool.lease(account, headed=config.HEADED_JOBS) as session:
                 driver = EitaaDriver(session)
                 await driver.open()
                 if not await driver.is_logged_in():

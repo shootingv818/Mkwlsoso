@@ -107,6 +107,20 @@ class Store:
         return int(self._data["settings"].get("send_log_every", config.SEND_LOG_EVERY))
 
     @property
+    def browserless(self) -> bool:
+        """May a run skip Chromium entirely when the engine allows it?
+
+        OFF by default: without a page there is no per-recipient safety net, so
+        this is an explicit choice, not something that happens quietly.
+        """
+        return bool(self._data["settings"].get("browserless", False))
+
+    def toggle_browserless(self) -> bool:
+        new = not self.browserless
+        self.set_setting("browserless", new)
+        return new
+
+    @property
     def stop_on_limit(self) -> bool:
         """Whether a server restriction (e.g. PEER_FLOOD) pauses the run."""
         return bool(self._data["settings"].get("stop_on_limit", config.STOP_ON_LIMIT))

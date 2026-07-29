@@ -100,6 +100,26 @@ def test_set_does_not_block():
     check("far fewer paints than updates", card.paints < 20, card.paints)
 
 
+def test_flush_wins_over_an_in_flight_paint():
+    print("the final state is never overwritten by an older edit")
+    fake = FakeBot(latency=0.15)      # slow edits, so they really overlap
+    LiveCard = load_live_card(fake)
+
+    async def go():
+        card = LiveCard(1, min_interval=0.01)
+        await card.set("Sending 50/100")
+        await asyncio.sleep(0.02)          # painter is mid-edit
+        await card.set("DONE 100/100")
+        await card.flush()
+        await asyncio.sleep(0.4)
+        card.close()
+        return fake.sends + fake.edits
+
+    painted = asyncio.run(go())
+    check(f"the last painted state is the final one ({painted[-1:]})",
+          painted and painted[-1] == "DONE 100/100", painted)
+
+
 def test_final_state_is_painted():
     print("the last state always reaches Telegram")
     fake = FakeBot(latency=0.01)
@@ -141,8 +161,8 @@ def test_painter_survives_telegram_errors():
 
 
 def main() -> int:
-    for fn in (test_set_does_not_block, test_final_state_is_painted,
-               test_painter_survives_telegram_errors):
+    for fn in (test_set_does_not_block, test_flush_wins_over_an_in_flight_paint,
+               test_final_state_is_painted, test_painter_survives_telegram_errors):
         fn()
     print()
     print(f"{_PASS} passed, {_FAIL} failed")
