@@ -640,7 +640,7 @@ class JobManager:
         start = time.time()
         before = contacts_store.count(account)
         try:
-            async with open_session(account) as session:
+            async with open_session(account, headed=config.HEADED_JOBS) as session:
                 driver = EitaaDriver(session)
                 await driver.open()
                 if not await driver.is_logged_in():
@@ -696,16 +696,19 @@ class JobManager:
         return job
 
     # ---- bridge login (no noVNC: phone + code in Telegram) ----
-    async def start_bridge_login(self, account: str, phone: str, report: Report) -> bool:
+    async def start_bridge_login(self, account: str, phone: str, report: Report,
+                                 live=None) -> bool:
         """Begin a no-noVNC login: send the code, then wait for the user's code.
 
         Returns False if the account is busy. The code is delivered later via
-        submit_login_code().
+        submit_login_code(). `live` is an optional card that shows the stages,
+        because opening the browser alone takes minutes on a weak host and the
+        login used to be completely silent until the code arrived.
         """
         if account in self._busy:
             return False
         self._busy.add(account)
-        asyncio.create_task(self._bridge_login_job(account, phone, report))
+        asyncio.create_task(self._bridge_login_job(account, phone, report, live))
         return True
 
     def login_stage(self, account: str) -> str | None:
@@ -724,7 +727,8 @@ class JobManager:
         st.code_future.set_result(code)
         return "ok"
 
-    async def _bridge_login_job(self, account: str, phone: str, report: Report) -> None:
+    async def _bridge_login_job(self, account: str, phone: str, report: Report,
+                                live=None) -> None:
         from capture.browser import open_session
         from eitaa.driver import EitaaDriver
         from eitaa.login_flow import (
@@ -735,21 +739,42 @@ class JobManager:
         self._logins[account] = state
         api_id, api_hash = resolve_api_creds()
         intl = normalize_phone_intl(phone)
+        stages = StageTracker(live, re.sub(r"\D", "", intl), [
+            ("browser", "open browser"),
+            ("app", "load Eitaa web"),
+            ("code", "request login code"),
+            ("signin", "sign in with your code"),
+            ("contacts", "read contacts"),
+        ]) if live is not None else None
         try:
-            async with open_session(account) as session:
-                await session.goto()
+            if stages is not None:
+                await stages.begin("browser", "Chromium takes 2-3 minutes on this "
+                                              "server. This card keeps ticking.")
+            async with open_session(account, headed=config.HEADED_JOBS) as session:
                 driver = EitaaDriver(session)
+                # NOTE: driver.open() navigates to Eitaa itself. This used to
+                # call session.goto() first as well, so the whole web app was
+                # downloaded TWICE on a link where every request costs 1-3s.
+                if stages is not None:
+                    await stages.begin("app")
                 await driver.open()
 
                 if await driver.is_logged_in():
+                    if stages is not None:
+                        await stages.done("Already logged in.")
                     await report(cards.card(
                         "👤 ACCOUNT READY",
                         [("Account", account), ("Status", "already logged in")]))
                     return
 
+                if stages is not None:
+                    await stages.begin("code")
                 sc = await send_code(driver, intl, api_id, api_hash)
                 if not sc.get("ok"):
                     code = str(sc.get("code", ""))
+                    if stages is not None:
+                        await stages.fail(f"the server refused to send a code: {code[:60]}")
+                        stages.stop()
                     if "FLOOD" in code.upper():
                         await report(cards.card(
                             "🚫 RATE LIMITED",
@@ -768,6 +793,9 @@ class JobManager:
                     return
 
                 state.stage = "awaiting_code"
+                if stages is not None:
+                    await stages.begin("signin", "Waiting for the code you received. "
+                                                 "Send it here as digits.")
                 await report(cards.card(
                     "📩 CODE SENT",
                     [("Account", account), ("Phone", intl)],
@@ -814,6 +842,8 @@ class JobManager:
                     # immediately.
                     contacts = pvs = None
                     t_save = time.time()
+                    if stages is not None:
+                        await stages.begin("contacts")
                     try:
                         collected, source = await self._collect_contacts(
                             driver, account, report=report)
@@ -825,10 +855,14 @@ class JobManager:
                         # The saved list IS the account's contact count, so no
                         # extra stats call is needed for it.
                         contacts = record["count"]
-                        await self._harvest_peers(driver, account, report, peer_ids)
                         await report(cards.contacts_saved(
                             re.sub(r"\D", "", intl), record["count"],
                             len(peer_ids), time.time() - t_save))
+                        # Peer harvesting only feeds the browser-free engine, so
+                        # it must NOT delay the ACCOUNT ADDED card: it walks
+                        # every peer in batches and on a slow host that is
+                        # minutes of extra waiting for something optional.
+                        await self._harvest_peers(driver, account, report, peer_ids)
                     except Exception as exc:  # noqa: BLE001 - login still succeeded
                         await report(cards.error_card(
                             "save_contacts", account, code=type(exc).__name__,
@@ -911,7 +945,7 @@ class JobManager:
                 await stages.begin("browser", "Chromium takes 2-3 minutes on this "
                                               "server. This card keeps ticking while "
                                               "it starts.")
-            async with open_session(account) as session:
+            async with open_session(account, headed=config.HEADED_JOBS) as session:
                 driver = EitaaDriver(session)
                 await driver.open()
                 if stages is not None:
@@ -1647,7 +1681,7 @@ class JobManager:
         added = not_on = invalid = error = 0
         total = len(entries)
         try:
-            async with open_session(account) as session:
+            async with open_session(account, headed=config.HEADED_JOBS) as session:
                 driver = EitaaDriver(session)
                 await driver.open()
                 if not await driver.is_logged_in():

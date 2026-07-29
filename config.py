@@ -50,7 +50,13 @@ class Config:
     EITAA_WEB_URL: str = os.environ.get("EITAA_WEB_URL", "https://web.eitaa.com")
     PROFILES_DIR: Path = Path(os.environ.get("PROFILES_DIR", "./profiles"))
     ARTIFACTS_DIR: Path = Path(os.environ.get("ARTIFACTS_DIR", "./artifacts"))
+    # HEADED shows a real window (needed only for a manual noVNC login).
+    # HEADED_JOBS decides whether the BOT's own jobs use one. Automated jobs
+    # never need pixels -- they drive Eitaa through its own API inside the page --
+    # and a headless Chromium starts faster and uses far less RAM, which matters
+    # on a 1-core / 1 GB host where launching took 158-203 seconds.
     HEADED: bool = _get_bool("HEADED", True)
+    HEADED_JOBS: bool = _get_bool("MKWL_HEADED_JOBS", False)
     BASELINE_SECONDS: int = _get_int("BASELINE_SECONDS", 12)
     ACTION_TRAIL_SECONDS: int = _get_int("ACTION_TRAIL_SECONDS", 8)
     RAW_ENCRYPTION_KEY: str = os.environ.get("RAW_ENCRYPTION_KEY", "")

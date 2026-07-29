@@ -868,7 +868,10 @@ async def _conversation(event):
                 buttons=kb_back())
         if manager.is_busy(name):
             return await event.respond("That account already has a running job. Try again later.")
-        started = await manager.start_bridge_login(name, phone, report)
+        # A live stage card, because opening Chromium alone takes minutes here
+        # and the login used to be silent until the code arrived.
+        started = await manager.start_bridge_login(
+            name, phone, report, live=LiveCard(config.report_to()))
         if not started:
             pending.pop(event.sender_id, None)
             return await event.respond("That account is busy right now. Try again later.")

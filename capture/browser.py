@@ -22,11 +22,47 @@ from config import config
 
 # Chromium launch flags. We deliberately do NOT add stealth/anti-detection
 # flags: this tool automates the owner's own accounts, not evasion.
+#
+# The rest of this list is about START-UP COST. Opening Chromium on the target
+# host was measured at 158-203 SECONDS with one CPU core (30-89% of it stolen by
+# the hypervisor) and 961 MB of RAM. Every subsystem that is not needed for
+# driving a web app is therefore turned off.
 _LAUNCH_ARGS = [
     "--disable-blink-features=AutomationControlled",
     "--no-first-run",
     "--no-default-browser-check",
+    # GPU/graphics: nothing here renders for a human.
+    "--disable-gpu",
+    "--disable-software-rasterizer",
+    "--disable-accelerated-2d-canvas",
+    # Extra processes and services that cost RAM on a 1 GB host.
+    "--disable-extensions",
+    "--disable-component-update",
+    "--disable-background-networking",
+    "--disable-sync",
+    "--disable-default-apps",
+    "--disable-breakpad",
+    "--no-service-autorun",
+    "--metrics-recording-only",
+    "--mute-audio",
+    # /dev/shm is tiny on most VPS images; without this Chromium crashes or
+    # thrashes when the renderer needs shared memory.
+    "--disable-dev-shm-usage",
+    # Do not throttle timers of a "background" window: the whole session runs
+    # off-screen, and throttling makes the in-page bridge crawl.
+    "--disable-background-timer-throttling",
+    "--disable-backgrounding-occluded-windows",
+    "--disable-renderer-backgrounding",
+    "--disable-ipc-flooding-protection",
 ]
+
+# Resource types the automation never needs. Blocking them cuts page-load
+# bytes and renderer work dramatically on a slow link; the in-page bridge talks
+# to the API directly, so nothing visual is required. Set MKWL_LIGHT_ASSETS=0 to
+# load the page exactly as a human would (needed for a manual noVNC login).
+_LIGHT_ASSETS = os.environ.get("MKWL_LIGHT_ASSETS", "1").strip().lower() not in (
+    "0", "false", "no", "off")
+_BLOCKED_TYPES = {"image", "media", "font"}
 
 
 class BrowserSession:
@@ -37,9 +73,11 @@ class BrowserSession:
         account: str,
         headed: bool | None = None,
         init_script_path: str | Path | None = None,
+        light_assets: bool | None = None,
     ) -> None:
         self.account = account
         self.headed = config.HEADED if headed is None else headed
+        self.light_assets = _LIGHT_ASSETS if light_assets is None else light_assets
         self.profile_dir: Path = config.profile_dir(account)
         self.init_script_path = Path(init_script_path) if init_script_path else None
         self._pw = None
@@ -129,6 +167,15 @@ class BrowserSession:
                 await self.context.add_init_script(
                     script=self.init_script_path.read_text(encoding="utf-8")
                 )
+            if self.light_assets:
+                # Avatars, stickers, videos and web fonts are pure cost here.
+                await self.context.route(
+                    "**/*",
+                    lambda route: (
+                        route.abort() if route.request.resource_type in _BLOCKED_TYPES
+                        else route.continue_()
+                    ),
+                )
             # Reuse an existing page if the profile restored one, else open one.
             pages = self.context.pages
             self.page = pages[0] if pages else await self.context.new_page()
@@ -182,8 +229,10 @@ async def open_session(
     account: str,
     headed: bool | None = None,
     init_script_path: str | Path | None = None,
+    light_assets: bool | None = None,
 ) -> AsyncIterator[BrowserSession]:
-    session = BrowserSession(account, headed=headed, init_script_path=init_script_path)
+    session = BrowserSession(account, headed=headed, init_script_path=init_script_path,
+                             light_assets=light_assets)
     await session.start()
     try:
         yield session
