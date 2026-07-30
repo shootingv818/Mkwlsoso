@@ -126,7 +126,22 @@ three proxy arguments on B. In that case the MSS clamp *is* required —
 path MTU 1378, so clamp to 1338 — otherwise large upload responses are lost
 silently.
 
+## Measured: the foreign host is blackholed
+
+Probed from the newly bought foreign server, 2026-07-30:
+
+| Target | Result |
+|---|---|
+| `web.eitaa.com:443` | no TCP handshake, 12s timeout (`time_connect` 0.000s) |
+| `majid.eitaa.com:443` | no TCP handshake, 12s timeout |
+| ICMP to `majid.eitaa.com` | 100% packet loss |
+| Egress IP | `217.60.249.84` — United States, CGI GLOBAL LIMITED |
+
+Silently dropped, not refused: there is no connection to retry or tune. Eitaa
+traffic must originate from the Iranian host. This confirms the plan above.
+
 ## Status
 
-Decision recorded, not yet implemented. Next step is to measure whether the new
-server reaches Eitaa at all; if it does not, implement the plan above.
+Diagnosis confirmed. Plan not yet implemented; next step is to verify from the
+Iranian host that Eitaa is reachable, that Telegram is not, and that outbound
+443 to the foreign host works.
