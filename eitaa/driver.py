@@ -879,6 +879,36 @@ class EitaaDriver:
         except Exception:  # noqa: BLE001
             return False
 
+    async def has_auth_storage(self) -> bool:
+        """Is an authorised session present in the page's own storage?
+
+        This is the FASTEST honest proof of a successful login. `is_logged_in()`
+        looks for the rendered chat list, which on this host is the last thing to
+        appear - one measured login had the app itself take 272 seconds, so a
+        perfectly good sign-in was reported as "not confirmed". The auth keys land
+        in storage the instant sign-in returns.
+        """
+        js = """
+        () => {
+          try {
+            for (let i = 0; i < localStorage.length; i++) {
+              const k = localStorage.key(i) || '';
+              if (/user_auth|auth_key|dc\\d*_auth/i.test(k)) {
+                const v = localStorage.getItem(k) || '';
+                if (v && v !== 'null' && v.length > 8) return true;
+              }
+            }
+          } catch (e) {}
+          try { return !!(window.appUsersManager && window.appUsersManager.getSelf()); }
+          catch (e) {}
+          return false;
+        }
+        """
+        try:
+            return bool(await self.page.evaluate(js))
+        except Exception:  # noqa: BLE001
+            return False
+
     async def self_peer_id(self) -> str | None:
         """This account's own user id (its Saved Messages peer).
 

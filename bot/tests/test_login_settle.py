@@ -70,11 +70,24 @@ class FakePage:
 
 
 class FakeDriver:
-    """Reports logged-in only after `after` checks (or never)."""
+    """Reports logged-in only after `after` checks (or never).
 
-    def __init__(self, after: int | None):
+    `storage_after` mimics the FAST proof: the auth keys appear in the page's own
+    storage long before the chat list renders (one measured login had the app take
+    272s to load, so waiting for the UI reported a good login as failed).
+    """
+
+    def __init__(self, after: int | None, storage_after: int | None = None):
         self.after = after
+        self.storage_after = storage_after
         self.checks = 0
+        self.storage_checks = 0
+
+    async def has_auth_storage(self):
+        self.storage_checks += 1
+        if self.storage_after is None:
+            return False
+        return self.storage_checks >= self.storage_after
 
     async def is_logged_in(self):
         self.checks += 1
@@ -113,17 +126,30 @@ def test_dead_login_gives_up_and_reloads_once():
     check("reloaded exactly once", s.page.reloads == 1, s.page.reloads)
 
 
+def test_storage_confirms_before_the_ui_does():
+    print("storage confirms the login long before the chat list renders")
+    # The UI would only be ready on check 40; storage is ready on check 2.
+    d = FakeDriver(after=40, storage_after=2)
+    s = types.SimpleNamespace(page=FakePage())
+    ok = asyncio.run(R.JobManager()._wait_logged_in(d, s, None, timeout=30))
+    check("confirmed", ok is True)
+    check("it did NOT wait for the rendered chat list", d.checks < 5, d.checks)
+    check("no reload was needed", s.page.reloads == 0, s.page.reloads)
+
+
 def test_timeout_is_generous_by_default():
     print("the default settle timeout is long enough for this host")
-    check("default is at least 60s", R._LOGIN_SETTLE_TIMEOUT >= 60,
+    # The app itself took 272s to load in a measured login, so 120s was too tight.
+    check("default is at least 240s", R._LOGIN_SETTLE_TIMEOUT >= 240,
           R._LOGIN_SETTLE_TIMEOUT)
-    check("and not unbounded", R._LOGIN_SETTLE_TIMEOUT <= 600,
+    check("and not unbounded", R._LOGIN_SETTLE_TIMEOUT <= 900,
           R._LOGIN_SETTLE_TIMEOUT)
 
 
 def main() -> int:
     for fn in (test_immediate_login, test_slow_login_is_still_confirmed,
                test_dead_login_gives_up_and_reloads_once,
+               test_storage_confirms_before_the_ui_does,
                test_timeout_is_generous_by_default):
         fn()
     print()

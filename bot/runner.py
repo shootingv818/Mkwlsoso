@@ -105,7 +105,7 @@ _UI_TEXT_TIMEOUT = float(os.environ.get("MKWL_UI_TEXT_TIMEOUT", "60"))
 # How long to wait for the app to switch to its logged-in UI after a successful
 # sign-in. The old code checked once after 1.5s and once after 6s, which reported
 # a perfectly good login as "LOGIN INCOMPLETE" on this slow host.
-_LOGIN_SETTLE_TIMEOUT = float(os.environ.get("MKWL_LOGIN_SETTLE_TIMEOUT", "120"))
+_LOGIN_SETTLE_TIMEOUT = float(os.environ.get("MKWL_LOGIN_SETTLE_TIMEOUT", "300"))
 
 # How old the browser-free engine's session capture may be before a run insists on
 # opening a browser (which is the only thing that can refresh it).
@@ -1025,6 +1025,12 @@ class JobManager:
         """
         if self._prewarm is not None and not self._prewarm.done():
             return {"ok": True, "code": "already warming"}
+        # NEVER warm while another job holds a browser. Measured live: warming the
+        # template at the same moment a login started put TWO Chromiums on a
+        # 961 MB host and pushed 'load Eitaa web' from ~60s to 272s. One browser
+        # at a time is faster than two, always, on this machine.
+        if self._busy or self._logins:
+            return {"ok": False, "code": "busy - warm the template when idle"}
         self._prewarm = asyncio.create_task(self._prewarm_job(report))
         return {"ok": True, "code": "started"}
 
@@ -1065,6 +1071,16 @@ class JobManager:
         """
         if account in self._busy:
             return False
+        # A login must never race the template warmer for the one browser this
+        # host can afford.
+        if self._prewarm is not None and not self._prewarm.done():
+            print("[login] cancelling the template warm-up so this login gets the "
+                  "machine to itself", flush=True)
+            self._prewarm.cancel()
+            try:
+                await self._prewarm
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
         self._busy.add(account)
         asyncio.create_task(self._bridge_login_job(account, phone, report, live))
         return True
@@ -1099,6 +1115,14 @@ class JobManager:
         while time.time() < deadline:
             checks += 1
             try:
+                # Storage first: the auth key lands there the moment sign-in
+                # succeeds, while the chat list needs the whole UI to render -
+                # which is the LAST thing to finish on a CPU this starved (the app
+                # itself took 272s to load in one measured login).
+                if await driver.has_auth_storage():
+                    print(f"[login] auth found in storage after {checks} check(s)",
+                          flush=True)
+                    return True
                 if await driver.is_logged_in():
                     print(f"[login] app is logged in after {checks} check(s), "
                           f"{time.time() - (deadline - timeout):.0f}s", flush=True)

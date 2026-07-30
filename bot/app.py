@@ -412,6 +412,7 @@ def kb_settings():
             b"set:stoponlimit")],
         [Button.inline("⏱ Contact Delay", b"set:contactdelay"),
          Button.inline("🔢 Log Every N", b"set:logevery")],
+        [Button.inline("🔥 Warm Template", b"set:warm")],
         [Button.inline("🏠 Browser Standby", b"set:pool"),
          Button.inline(
              f"🚀 No-browser sends: {'ON' if store.browserless else 'OFF'}",
@@ -656,15 +657,11 @@ async def _handle_callback(event):
     if data == "acc:add":
         # No name step: the phone number IS the account, so that's all we ask.
         pending[event.sender_id] = {"step": "login_phone"}
-        # Warm a browser + the cached web app WHILE the owner types the number.
-        # On this host that is the difference between waiting 3 minutes after
-        # sending the number and waiting seconds.
-        await manager.prewarm_new_account(report)
         return await event.edit(
             cards.card("➕ ADD ACCOUNT",
                        footer="Send the phone number (e.g. 09304683887). Then I'll ask "
-                              "for the login code, right here. The browser is already "
-                              "warming up in the background while you type."),
+                              "for the login code, right here. Tip: Settings -> Warm Template "
+                              "once while idle makes future logins much faster."),
             buttons=kb_back())
 
     # ---- delete an account ----
@@ -853,6 +850,21 @@ async def _handle_callback(event):
         now = store.toggle_browserless()
         await event.answer("No-browser sends: " + ("ON" if now else "OFF"))
         return await event.edit(settings_text(), buttons=kb_settings())
+    if data == "set:warm":
+        res = await manager.prewarm_new_account(report)
+        await event.answer("Warming…" if res.get("ok") else str(res.get("code")))
+        from capture import template as _tpl
+        return await event.edit(
+            cards.card("🔥 WARM TEMPLATE",
+                       [("Started ", "yes" if res.get("ok") else "no"),
+                        ("Reason  ", res.get("code")),
+                        ("Template", _tpl.status())],
+                       footer="This loads Eitaa Web ONCE into a template profile that "
+                              "every new account is copied from, so a new login does not "
+                              "download the app again (272s in one measured login). Run "
+                              "it while nothing else is running - one browser at a time "
+                              "is what this server can afford."),
+            buttons=kb_back())
     if data == "set:pool":
         return await event.edit(
             cards.pool_card(session_pool.status()),

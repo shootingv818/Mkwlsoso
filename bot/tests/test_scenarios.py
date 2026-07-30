@@ -611,6 +611,37 @@ def s22_refusals_survive_a_force_stop():
     check(f"refusals learned before the cancel were saved ({n})", n > 0, n)
 
 
+def s23_pool_waits_instead_of_running_two_browsers():
+    scenario(23, "at the cap the pool WAITS; it never runs two browsers at once")
+    p = fresh_pool(max_open=1)
+    peak = {"n": 0, "now": 0}
+
+    async def go():
+        async def job(acc, hold):
+            async with p.lease(acc):
+                peak["now"] += 1
+                peak["n"] = max(peak["n"], peak["now"])
+                await asyncio.sleep(hold)
+                peak["now"] -= 1
+        # Two DIFFERENT accounts: this is the case that put two Chromiums on a
+        # 961 MB host and pushed 'load Eitaa web' from ~60s to 272s.
+        await asyncio.gather(job("a", 0.15), job("b", 0.05))
+
+    asyncio.run(go())
+    check(f"never more than one browser live (peak={peak['n']})", peak["n"] == 1, peak)
+    check("the pool stayed within its cap", p.status()["warm"] <= 1, p.status())
+
+
+def s24_prewarm_never_competes_with_a_login():
+    scenario(24, "the template warmer refuses to run while a job holds a browser")
+    mgr = R.JobManager()
+    mgr._busy.add("someacct")
+    res = asyncio.run(mgr.prewarm_new_account())
+    check("it refused", res.get("ok") is False, res)
+    check("and said why", "busy" in str(res.get("code")), res)
+    mgr._busy.discard("someacct")
+
+
 def main() -> int:
     for fn in (s01_nothing_is_opened_until_asked,
                s02_second_job_reuses_the_warm_session,
@@ -633,7 +664,9 @@ def main() -> int:
                s19_reaper_survives_a_slow_first_launch,
                s20_hybrid_file_fallback_uploads_on_the_page_first,
                s21_dry_run_addresses_saved_messages_without_contacts,
-               s22_refusals_survive_a_force_stop):
+               s22_refusals_survive_a_force_stop,
+               s23_pool_waits_instead_of_running_two_browsers,
+               s24_prewarm_never_competes_with_a_login):
         fn()
     print()
     print(f"{_SCENARIOS} scenarios · {_PASS} passed, {_FAIL} failed")

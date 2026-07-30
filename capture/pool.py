@@ -77,6 +77,12 @@ class SessionPool:
         self._entries: dict[str, _Entry] = {}          # account -> entry
         self._locks: dict[str, asyncio.Lock] = {}      # one lease per account
         self._reaper: asyncio.Task | None = None
+        # Hard cap on LIVE browsers, held for the whole lease. A count of
+        # `self._entries` was not enough: an entry is only registered after
+        # start() finishes, so two leases could both look at an empty pool and
+        # both launch - which is exactly how two Chromiums ended up on a 961 MB
+        # host and 'load Eitaa web' went from ~60s to 272s.
+        self._slots: asyncio.Semaphore | None = None
         self.stats = {"created": 0, "reused": 0, "expired": 0, "evicted": 0,
                       "recycled": 0, "discarded": 0, "saved_launches": 0}
 
@@ -113,6 +119,22 @@ class SessionPool:
         except Exception:  # noqa: BLE001
             return False
 
+    async def _wait_for_slot(self, keep: str, timeout: float = 600.0) -> None:
+        """Block until this host can afford another browser.
+
+        The cap used to be advisory: when every other session was leased,
+        `_make_room` gave up and the caller launched anyway. On 961 MB that
+        produced two Chromiums at once and 'load Eitaa web' went from ~60s to
+        272s. Waiting is faster than sharing.
+        """
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            await self._make_room(keep)
+            others = [a for a in self._entries if a != keep]
+            if len(others) < self.max_open:
+                return
+            await asyncio.sleep(1.0)
+
     async def _make_room(self, keep: str) -> None:
         while len([e for a, e in self._entries.items() if a != keep]) >= max(
                 0, self.max_open - 1) and len(self._entries) >= self.max_open:
@@ -141,8 +163,11 @@ class SessionPool:
         # The lock is held for the WHOLE lease, not just while picking a session.
         # Holding it only during acquisition let two jobs drive the same page at
         # the same time (caught by scenario 9 in bot/tests/test_scenarios.py).
+        if self._slots is None:
+            self._slots = asyncio.Semaphore(max(1, self.max_open))
         lock = self._lock(account)
         await lock.acquire()
+        slot_held = False
         try:
             self._start_reaper()
             entry = self._entries.get(account)
@@ -163,6 +188,9 @@ class SessionPool:
                 entry = None
 
             if entry is None:
+                # Wait for a real slot before launching anything.
+                await self._slots.acquire()
+                slot_held = True
                 await self._make_room(account)
                 session = BrowserSession(account, headed=headed,
                                          init_script_path=init_script_path)
@@ -171,6 +199,8 @@ class SessionPool:
                 self._entries[account] = entry
                 self.stats["created"] += 1
             else:
+                await self._slots.acquire()
+                slot_held = True
                 self.stats["reused"] += 1
                 self.stats["saved_launches"] += 1
 
@@ -191,6 +221,8 @@ class SessionPool:
                 entry.leased = False
                 entry.last_used = time.time()
         finally:
+            if slot_held:
+                self._slots.release()
             lock.release()
 
     # ---- housekeeping --------------------------------------------------
