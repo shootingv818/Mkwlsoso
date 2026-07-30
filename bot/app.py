@@ -656,10 +656,15 @@ async def _handle_callback(event):
     if data == "acc:add":
         # No name step: the phone number IS the account, so that's all we ask.
         pending[event.sender_id] = {"step": "login_phone"}
+        # Warm a browser + the cached web app WHILE the owner types the number.
+        # On this host that is the difference between waiting 3 minutes after
+        # sending the number and waiting seconds.
+        await manager.prewarm_new_account(report)
         return await event.edit(
             cards.card("➕ ADD ACCOUNT",
                        footer="Send the phone number (e.g. 09304683887). Then I'll ask "
-                              "for the login code, right here. No noVNC needed."),
+                              "for the login code, right here. The browser is already "
+                              "warming up in the background while you type."),
             buttons=kb_back())
 
     # ---- delete an account ----

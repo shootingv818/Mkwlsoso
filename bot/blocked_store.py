@@ -33,6 +33,7 @@ import time
 from pathlib import Path
 
 from config import config
+from bot import jsoncache
 
 #: Refusals that mean "not deliverable from this account", not "slow down".
 _PERMANENT = (
@@ -59,15 +60,11 @@ def path_for(account: str) -> Path:
 
 
 def load(account: str) -> dict:
-    p = path_for(account)
-    if p.is_file():
-        try:
-            data = json.loads(p.read_text(encoding="utf-8"))
-            if isinstance(data, dict) and isinstance(data.get("peers"), dict):
-                return data
-        except Exception:  # noqa: BLE001
-            pass
-    return {"account": account, "updated": 0.0, "peers": {}}
+    empty = lambda: {"account": account, "updated": 0.0, "peers": {}}
+    data = jsoncache.load_json(path_for(account), empty)
+    if isinstance(data, dict) and isinstance(data.get("peers"), dict):
+        return data
+    return empty()
 
 
 def peers(account: str) -> dict:
@@ -106,12 +103,8 @@ class Blocklist:
     def flush(self) -> None:
         record = {"account": self.account, "updated": time.time(),
                   "peers": self.peers}
-        p = path_for(self.account)
         try:
-            p.parent.mkdir(parents=True, exist_ok=True)
-            tmp = p.with_suffix(".json.tmp")
-            tmp.write_text(json.dumps(record, ensure_ascii=False), encoding="utf-8")
-            tmp.replace(p)
+            jsoncache.write_json(path_for(self.account), record)
         except OSError:
             pass  # a cache write must never break a send
 
@@ -125,6 +118,7 @@ def clear(account: str) -> bool:
     try:
         if p.is_file():
             p.unlink()
+            jsoncache.invalidate(p)
             return True
     except OSError:
         pass

@@ -263,6 +263,41 @@ def test_eitaa_methods():
     _check("extract self peer", ctx["self_peer"] == peer)
     _check("extract user_id", ctx["user_id"] == 50267193)
 
+    # --- the self-peer bug, reproduced ---------------------------------
+    # Live symptom: the reported user_id changed on every capture for one and the
+    # same account (3241453, 21620421, 40690201, 27579494), because the FIRST
+    # inputPeerUser in any body was taken as "self" - and those bodies are
+    # sendMessage calls to CONTACTS.
+    _check("own id comes from the routing token",
+           E.own_user_id("9179.c756a2d10f.e41c4e_50267193") == 50267193)
+    _check("a token with no id suffix yields nothing",
+           E.own_user_id("9179.c756a2d10f.e41c4e") is None)
+    _check("no token at all yields nothing", E.own_user_id(None) is None)
+
+    stranger = E.input_peer_self(999888777, 0x1122334455667788)
+    me = E.input_peer_self(50267193, 0x00000000449C7AEC)
+    # A capture where the FIRST peer is a contact and OUR peer appears later.
+    r1 = wrap_eitaa("9179.c756a2d10f.e41c4e_50267193", "mrtpgmi2y9fm222__web",
+                    E.send_message(stranger, "ad to a contact", random_id=7))
+    r2 = wrap_eitaa("9179.c756a2d10f.e41c4e_50267193", "mrtpgmi2y9fm222__web",
+                    E.send_message(me, "note to self", random_id=8))
+    ctx2 = E.extract_context({"a": [
+        {"kind": "fetch", "reqLen": len(r1), "reqHead": r1.hex()},
+        {"kind": "fetch", "reqLen": len(r2), "reqHead": r2.hex()},
+    ]})
+    _check("a contact's peer is NOT mistaken for self", ctx2["self_peer"] != stranger)
+    _check("the real self peer is found", ctx2["self_peer"] == me)
+    _check("user_id is the account's own", ctx2["user_id"] == 50267193)
+    _check("access_hash comes from the matching peer",
+           ctx2["access_hash"] == 0x00000000449C7AEC)
+
+    # Only a stranger in the capture -> honest "unknown", never a wrong peer.
+    ctx3 = E.extract_context({"a": [
+        {"kind": "fetch", "reqLen": len(r1), "reqHead": r1.hex()}]})
+    _check("no self peer is better than the wrong one", ctx3["self_peer"] is None)
+    _check("the id is still known from the token", ctx3["user_id"] == 50267193)
+    _check("no access_hash is invented", ctx3.get("access_hash") is None)
+
     ok = E.classify_response(bytes.fromhex("19ca4421") + b"\x00" * 8)  # rpc_error on wire (LE)
     _check("rpc_error classified not ok", ok["ok"] is False)
     ok = E.classify_response(bytes.fromhex("01e015909abcdef0"))

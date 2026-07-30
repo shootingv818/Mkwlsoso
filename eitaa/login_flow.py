@@ -93,6 +93,8 @@ async def ensure_login_bridge(driver: Any) -> bool:
         except Exception:  # noqa: BLE001
             return False
     # tweb builds the unauthorized DC auth_key shortly after load; wait for it.
+    # driver.open() already polls for this, so on a warm page the very first
+    # check below succeeds and the login proceeds immediately.
     for _ in range(30):
         try:
             if await driver.page.evaluate("() => !!(window.apiManager && window.apiManager.invokeApi)"):

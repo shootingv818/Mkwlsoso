@@ -22,6 +22,7 @@ import time
 from pathlib import Path
 
 from config import config
+from bot import jsoncache
 
 # The envelope every real Eitaa MTProto request starts with. Records that do not
 # start with it carry no session context and are dropped, which keeps the saved
@@ -63,7 +64,7 @@ def read_context(account: str) -> dict | None:
         return None
     try:
         from direct import eitaa_tl as E
-        data = json.loads(files[-1].read_text(encoding="utf-8"))
+        data = jsoncache.load_json(files[-1], dict)
         ctx = E.extract_context(data)
         return ctx if ctx.get("token1") else None
     except Exception:  # noqa: BLE001 - a stale/corrupt capture is simply unusable

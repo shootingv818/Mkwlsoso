@@ -26,6 +26,7 @@ import time
 from pathlib import Path
 
 from config import config
+from bot import jsoncache
 
 
 def path_for(account: str) -> Path:
@@ -34,15 +35,11 @@ def path_for(account: str) -> Path:
 
 def load(account: str) -> dict:
     """Read the cache. Never raises; missing/corrupt -> an empty record."""
-    p = path_for(account)
-    if p.is_file():
-        try:
-            data = json.loads(p.read_text(encoding="utf-8"))
-            if isinstance(data, dict) and isinstance(data.get("contacts"), list):
-                return data
-        except Exception:  # noqa: BLE001 - a corrupt cache must never break a job
-            pass
-    return {"account": account, "updated": 0, "count": 0, "contacts": []}
+    empty = lambda: {"account": account, "updated": 0, "count": 0, "contacts": []}
+    data = jsoncache.load_json(path_for(account), empty)
+    if isinstance(data, dict) and isinstance(data.get("contacts"), list):
+        return data
+    return empty()
 
 
 def save(account: str, contacts: list[dict]) -> dict:
@@ -90,11 +87,7 @@ def save(account: str, contacts: list[dict]) -> dict:
 
     record = {"account": account, "updated": time.time(),
               "count": len(clean), "contacts": clean}
-    p = path_for(account)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(p)
+    jsoncache.write_json(path_for(account), record)
     return record
 
 
@@ -130,6 +123,7 @@ def forget(account: str) -> bool:
     try:
         if p.is_file():
             p.unlink()
+            jsoncache.invalidate(p)
             return True
     except OSError:
         pass

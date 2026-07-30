@@ -31,6 +31,7 @@ import time
 from pathlib import Path
 
 from config import config
+from bot import jsoncache
 
 
 def path_for(account: str) -> Path:
@@ -105,12 +106,8 @@ class Ledger:
         record = {"account": self.account, "key": self.key,
                   "updated": time.time(), "done": sorted(self.done),
                   "aliases": sorted(self.aliases)}
-        p = path_for(self.account)
         try:
-            p.parent.mkdir(parents=True, exist_ok=True)
-            tmp = p.with_suffix(".json.tmp")
-            tmp.write_text(json.dumps(record, ensure_ascii=False), encoding="utf-8")
-            tmp.replace(p)
+            jsoncache.write_json(path_for(self.account), record)
         except OSError:
             pass  # a ledger write must never break a running send
 
@@ -120,7 +117,7 @@ def open_ledger(account: str, key: str) -> Ledger:
     p = path_for(account)
     if p.is_file():
         try:
-            data = json.loads(p.read_text(encoding="utf-8"))
+            data = jsoncache.load_json(p, dict)
             if isinstance(data, dict) and data.get("key") == key:
                 done = {str(x) for x in (data.get("done") or [])}
                 aliases = {str(x) for x in (data.get("aliases") or [])}
@@ -136,6 +133,7 @@ def clear(account: str) -> bool:
     try:
         if p.is_file():
             p.unlink()
+            jsoncache.invalidate(p)
             return True
     except OSError:
         pass
@@ -147,7 +145,7 @@ def done_count(account: str, key: str) -> int:
     if not p.is_file():
         return 0
     try:
-        data = json.loads(p.read_text(encoding="utf-8"))
+        data = jsoncache.load_json(p, dict)
         if isinstance(data, dict) and data.get("key") == key:
             return len(data.get("done") or [])
     except Exception:  # noqa: BLE001

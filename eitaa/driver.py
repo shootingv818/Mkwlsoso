@@ -111,10 +111,31 @@ class EitaaDriver:
         assert self.session.page is not None
         return self.session.page
 
-    async def open(self) -> None:
+    async def open(self, settle_timeout: float = 25.0) -> None:
+        """Navigate to Eitaa and wait until the app is ACTUALLY usable.
+
+        This used to be `goto()` plus a flat `wait_for_timeout(4000)`. A fixed 4s
+        is wrong in both directions: an app that booted in 0.8s still cost 4s
+        (paid on every navigation of every job), and one that needed 8s was used
+        too early. Now it polls a real readiness signal - Eitaa's own apiManager,
+        which is what every bridge call needs - and returns the moment it appears.
+        """
         await self.session.goto()
-        # Give the SPA time to boot and restore the session.
-        await self.page.wait_for_timeout(4000)
+        deadline = time.monotonic() + settle_timeout
+        # Poll fast at first (a warm profile is ready almost immediately), then
+        # back off so a slow boot does not burn CPU we do not have.
+        wait = 0.15
+        while time.monotonic() < deadline:
+            try:
+                if await self.page.evaluate(
+                        "() => !!(window.apiManager && window.apiManager.invokeApi)"):
+                    return
+            except Exception:  # noqa: BLE001 - navigation in flight
+                pass
+            await self.page.wait_for_timeout(int(wait * 1000))
+            wait = min(1.0, wait * 1.6)
+        # Not ready in time: callers already handle "not logged in" / bridge
+        # unavailable, so let them report it instead of hanging here.
 
     async def is_logged_in(self) -> bool:
         """Heuristic: the chat list / search input exists when logged in."""

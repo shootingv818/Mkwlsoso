@@ -461,6 +461,8 @@ class JobManager:
         self._jobs: dict[str, Job] = {}
         self._busy: set[str] = set()
         self._logins: dict[str, LoginState] = {}
+        # Background task that warms the template profile / browser.
+        self._prewarm: asyncio.Task | None = None
         # multi-run job id -> the per-account job it is currently waiting on.
         self._multi_children: dict[str, Job] = {}
 
@@ -1011,6 +1013,47 @@ class JobManager:
         return job
 
     # ---- bridge login (no noVNC: phone + code in Telegram) ----
+    async def prewarm_new_account(self, report: Report | None = None) -> dict:
+        """Get a browser + a loaded Eitaa page ready BEFORE the phone is typed.
+
+        Adding an account used to start the browser only after the number
+        arrived, so the owner waited through the whole 158-203s launch plus the
+        web-app download. This runs during the seconds the owner spends typing.
+
+        It also (re)builds the template profile, which is what makes every FUTURE
+        new account cheap: the app ends up cached on disk, ready to be copied.
+        """
+        if self._prewarm is not None and not self._prewarm.done():
+            return {"ok": True, "code": "already warming"}
+        self._prewarm = asyncio.create_task(self._prewarm_job(report))
+        return {"ok": True, "code": "started"}
+
+    async def _prewarm_job(self, report: Report | None = None) -> None:
+        from capture import template
+        name = template.TEMPLATE_NAME
+        t0 = time.time()
+        try:
+            if template.is_usable() and not template.is_stale():
+                print(f"[prewarm] template ready ({template.status()})", flush=True)
+                return
+            async with session_pool.lease(name, headed=config.HEADED_JOBS) as session:
+                driver = EitaaDriver(session)
+                await driver.open()
+                # Never log the template in: it is copied into other accounts.
+                logged = False
+                try:
+                    logged = await driver.is_logged_in()
+                except Exception:  # noqa: BLE001
+                    pass
+                if logged or template.looks_logged_in():
+                    print("[prewarm] template profile carries a session; refusing to "
+                          "use it as a template", flush=True)
+                    return
+            print(f"[prewarm] template warmed in {time.time() - t0:.0f}s "
+                  f"({template.status()})", flush=True)
+        except Exception as exc:  # noqa: BLE001 - prewarming is a bonus, never fatal
+            print(f"[prewarm] skipped: {type(exc).__name__}: {exc}", flush=True)
+
     async def start_bridge_login(self, account: str, phone: str, report: Report,
                                  live=None) -> bool:
         """Begin a no-noVNC login: send the code, then wait for the user's code.
@@ -1097,10 +1140,24 @@ class JobManager:
             ("finalize", "wait for the app to log in"),
             ("contacts", "read contacts"),
         ]) if live is not None else None
+        # Start from a pre-warmed copy when we have one: the app is already in the
+        # profile's disk cache, so this account does not download it over a link
+        # where every request costs 1-3s.
+        clone = {"ok": False, "code": "not attempted"}
+        try:
+            from capture import template
+            clone = template.clone_for(account)
+            print(f"[login] template clone for {account}: {clone}", flush=True)
+        except Exception as exc:  # noqa: BLE001
+            clone = {"ok": False, "code": f"{type(exc).__name__}: {exc}"}
         try:
             if stages is not None:
-                await stages.begin("browser", "Chromium takes 2-3 minutes on this "
-                                              "server. This card keeps ticking.")
+                await stages.begin(
+                    "browser",
+                    f"Starting from a pre-warmed profile ({clone.get('size_mb')} MB "
+                    f"copied in {clone.get('seconds')}s)." if clone.get("ok")
+                    else "Chromium takes 2-3 minutes on this server. This card keeps "
+                         "ticking.")
             async with session_pool.lease(account, headed=config.HEADED_JOBS) as session:
                 driver = EitaaDriver(session)
                 # NOTE: driver.open() navigates to Eitaa itself. This used to

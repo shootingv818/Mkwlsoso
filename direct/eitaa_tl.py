@@ -259,16 +259,47 @@ def _head_hex(rec) -> str:
     return v or ""
 
 
+def own_user_id(token1: str | None) -> int | None:
+    """The account's OWN user id, read from the routing token.
+
+    The envelope's first token ends with the account's user id, e.g.
+    `9179.c756a2d10f.e41c4e_123456`. That suffix is the only trustworthy source
+    of "who am I" in a capture: the request bodies are full of OTHER people's
+    peers (every sendMessage carries the recipient).
+    """
+    if not token1:
+        return None
+    tail = str(token1).rsplit("_", 1)
+    if len(tail) != 2 or not tail[1].isdigit():
+        return None
+    try:
+        return int(tail[1])
+    except ValueError:
+        return None
+
+
 def extract_context(capture) -> dict:
     """Pull the session-constant wire context out of a real capture:
     token1, token2 (envelope routing) and the 20-byte self peer.
 
     Returns {token1, token2, self_peer, user_id, access_hash}. Raises
     ValueError if no usable request is present.
+
+    IMPORTANT (bug fixed here): the self peer used to be "the first inputPeerUser
+    found in any request body". But those bodies are mostly `sendMessage` calls to
+    CONTACTS, so that peer was usually a random recipient. Symptom seen live: the
+    reported user_id changed on every capture (3241453, 21620421, 40690201,
+    27579494 for one and the same account). Anything built on it - the browser-free
+    file upload, the test send to Saved Messages - was addressing a stranger.
+
+    Now the account's own id comes from the routing token, and a peer is only
+    accepted as "self" when its user_id matches that id. If no matching peer is in
+    the capture, self_peer stays None (an honest "unknown" beats a wrong peer).
     """
     token1 = token2 = None
     self_peer = None
     peer_marker = tl.int_bytes(EITAA_INPUT_PEER_USER, signed=False)  # dde8a54c LE
+    bodies: list[bytes] = []
 
     for rec in _iter_records(capture):
         if rec.get("kind") not in ("fetch", "xhr"):
@@ -286,22 +317,38 @@ def extract_context(capture) -> dict:
             continue
         if token1 is None:
             token1, token2 = env["token1"], env["token2"]
-        body = env["body"]
-        if self_peer is None:
-            idx = body.find(peer_marker)
-            if idx != -1 and len(body) >= idx + 20:
-                self_peer = body[idx:idx + 20]
-        if token1 is not None and self_peer is not None:
-            break
+        bodies.append(env["body"])
 
     if token1 is None:
         raise ValueError("no Eitaa envelope found in capture")
+
+    expected_uid = own_user_id(token1)
+    access_hash = None
+    if expected_uid is not None:
+        # Scan EVERY peer in EVERY body and keep only the one that is really us.
+        for body in bodies:
+            start = 0
+            while True:
+                idx = body.find(peer_marker, start)
+                if idx == -1 or len(body) < idx + 20:
+                    break
+                cand = body[idx:idx + 20]
+                r = tl.Reader(cand)
+                r.int(signed=False)          # ctor
+                uid = r.long(signed=False)
+                ah = r.long(signed=False)
+                if uid == expected_uid:
+                    self_peer, access_hash = cand, ah
+                    break
+                start = idx + 4
+            if self_peer is not None:
+                break
+
     result = {"token1": token1, "token2": token2, "self_peer": self_peer}
-    if self_peer is not None:
-        r = tl.Reader(self_peer)
-        r.int(signed=False)  # ctor
-        result["user_id"] = r.long(signed=False)
-        result["access_hash"] = r.long(signed=False)
+    if expected_uid is not None:
+        result["user_id"] = expected_uid
+    if access_hash is not None:
+        result["access_hash"] = access_hash
     return result
 
 
