@@ -97,20 +97,27 @@ async def run(account: str, n_contacts: int, size_mb: float) -> int:
         if not await driver.is_logged_in():
             log("✗ not logged in"); return 1
 
-        # ---- UPLOAD ONCE, octet-stream, via the bot's real page upload fn ----
+        # ---- UPLOAD ONCE via the bot's REAL bridge_file_init, but with the
+        #      MIME the fix would produce: force .apk -> octet-stream by patching
+        #      mimetypes for THIS test process only (no project code changed).
+        #      This both bootstraps the page bridge and mirrors the exact fix. ----
         log("")
-        log("===== UPLOAD (octet-stream, same __MKWL_fileInit the bot uses) =====")
-        with open(apk_path, "rb") as f:
-            b64 = base64.b64encode(f.read()).decode("ascii")
-        locate_ms = int(min(420.0, 45.0 + 25.0 * size_mb) * 1000)
+        log("===== UPLOAD (real driver.bridge_file_init, .apk MIME forced to octet) =====")
+        import mimetypes as _mt
+        _orig_guess = _mt.guess_type
+
+        def _patched(p, *a, **k):
+            if str(p).lower().endswith(".apk"):
+                return ("application/octet-stream", None)
+            return _orig_guess(p, *a, **k)
+
+        _mt.guess_type = _patched
         try:
-            init = await driver.page.evaluate(
-                "(a) => window.__MKWL_fileInit(a.b, a.n, a.m, a.d)",
-                {"b": b64, "n": os.path.basename(apk_path),
-                 "m": "application/octet-stream", "d": locate_ms},
-            )
+            init = await driver.bridge_file_init(apk_path, CAPTION)
         except Exception as exc:  # noqa: BLE001
-            init = {"ok": False, "code": f"evaluate error: {exc}"}
+            init = {"ok": False, "code": f"bridge_file_init error: {exc}"}
+        finally:
+            _mt.guess_type = _orig_guess
         log(f"  upload: ok={init.get('ok')} doc_id={init.get('doc_id')} code={init.get('code')}")
         if not (isinstance(init, dict) and init.get("ok")):
             log("  ✗ upload failed -> aborting"); return 2
