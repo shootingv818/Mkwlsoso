@@ -4,14 +4,14 @@
 # runs the offline test suite, and starts the bot under systemd if credentials
 # are present. Safe to re-run.
 #
-#   BRANCH=feat/hybrid-engine-live   branch to deploy (default)
+#   BRANCH=feat/apk-bridge-fix       branch to deploy (default; has the apk fix)
 #   PAT=ghp_xxx                      only if the repo is private
 #   SKIP_TESTS=1                     skip the 3x offline suite
 #   SKIP_CHROMIUM=1                  do not download Chromium (~450MB)
 set -uo pipefail
 
 OWNER=shootingv818; NAME=Mkwlsoso
-BRANCH="${BRANCH:-feat/hybrid-engine-live}"
+BRANCH="${BRANCH:-feat/apk-bridge-fix}"
 PAT="${PAT:-}"
 DIR="${DIR:-$HOME/$NAME}"
 LOG="$HOME/mkwlsoso-setup.log"
