@@ -387,6 +387,23 @@ def test_apk_mode():
         # ---- defensive: never raises, always returns the base mime ----
         _check("defensive: effective_mime returns base on odd input",
                A.effective_mime(None, "application/pdf") == "application/pdf")
+
+        # ---- BRIDGE-path policy: mirror the exact 2 lines bridge_file_init runs
+        #      (OS mime, then apk_mode). On a Debian/Ubuntu host the OS returns
+        #      the apk mime, which Eitaa blocks; the toggle must rewrite it. ----
+        import mimetypes as _mt2
+        os_apk = _mt2.guess_type("app.apk")[0] or "application/octet-stream"
+        A.set_env(True)
+        bridge_on = A.effective_mime("app.apk", os_apk)
+        _check("bridge policy ON: .apk -> octet regardless of OS mime",
+               bridge_on == "application/octet-stream")
+        A.set_env(False)
+        bridge_off = A.effective_mime("app.apk", os_apk)
+        _check("bridge policy OFF: unchanged (== OS mime)", bridge_off == os_apk)
+        # a non-apk file is never rewritten, on or off
+        A.set_env(True)
+        _check("bridge policy: pdf untouched even when ON",
+               A.effective_mime("a.pdf", "application/pdf") == "application/pdf")
     finally:
         if saved is None:
             os.environ.pop(A.APK_OCTET_ENV, None)

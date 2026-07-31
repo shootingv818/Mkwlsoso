@@ -73,17 +73,29 @@ Our fix does the same thing.
 - Applied to the **browser-free (direct)** path already.
 - Full offline suite green 3× consecutively; isolation audit passed.
 
-## What is NOT done yet (remaining work)
+## DONE — the fix is now wired into the product
 
-1. **Wire APK mode into the bridge (browser) path** — the path the bot actually
-   uses for files. One line in `bridge_file_init` via `apk_mode.effective_mime`.
-   (This is the actual fix; the toggle already exists but currently only affects
-   the direct path.)
-2. Tests for the bridge path: apk ON→octet, OFF→unchanged, zip/pdf untouched,
-   fault-injection; run the full offline suite 3×.
-3. New branch + rollback tag before the change (per project convention).
-4. Optional: a small retry on `locate_failed` (the browser upload occasionally
-   needs a second try due to load-balancer node routing on this server).
+- **Wired APK mode into the bridge path** (`eitaa/driver.py` → `bridge_file_init`):
+  after the OS MIME is computed, `direct.apk_mode.effective_mime()` rewrites an
+  `.apk` to `application/octet-stream` when the toggle is ON (isolated +
+  defensive; logs `[apk-mode] file.apk: MIME x -> y` when it acts). Branch
+  `feat/apk-bridge-fix`, rollback tag `baseline-before-apkbridge`.
+- Tests added mirroring the exact bridge MIME computation (ON→octet, OFF→OS mime,
+  non-apk untouched). Full offline suite green 3× consecutively.
+- The `📦 APK send mode` toggle in Advanced Settings now affects the path the bot
+  actually uses for files (bridge), plus the direct path it already covered.
+
+### Live proof (final big test, 3 MB apk)
+
+`deploy/apk_final_test.py` uploaded once (octet) and delivered via the bot's real
+`bridge_file_send` to **11/11 recipients (Saved + 10 contacts), 0 failures**,
+upload 5.7s (0.53 MB/s), delivery **2.71 msg/s (~163/min sustained)**.
+
+## Optional / future
+
+- A small retry on `locate_failed` (the browser upload occasionally needs a
+  second try due to load-balancer node routing on this server). Not required for
+  apk delivery, which now works.
 
 ## Diagnostics added (read-only, deliver only to Saved/own contacts)
 

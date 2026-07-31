@@ -927,6 +927,21 @@ class EitaaDriver:
             b64 = _b64.b64encode(data).decode("ascii")
             filename = _os.path.basename(file_path)
             mime = _mt.guess_type(file_path)[0] or "application/octet-stream"
+            # APK send mode (opt-in, isolated). Eitaa blocks the real apk MIME
+            # (application/vnd.android.package-archive) on this bridge path too,
+            # so when the toggle is ON we upload an .apk as a generic binary and
+            # let the real ".apk" name ride in the filename attribute (the
+            # recipient still gets a valid apk). Defensive: ANY failure keeps the
+            # original MIME, so non-apk sends and the toggle-OFF path are
+            # byte-for-byte unchanged.
+            try:
+                from direct import apk_mode as _apk
+                _eff = _apk.effective_mime(filename, mime)
+                if _eff != mime:
+                    print(f"[apk-mode] {filename}: MIME {mime} -> {_eff}", flush=True)
+                mime = _eff
+            except Exception:  # noqa: BLE001
+                pass
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "code": f"read error: {exc}"}
         if locate_timeout is None:
