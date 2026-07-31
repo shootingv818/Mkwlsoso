@@ -416,6 +416,9 @@ def kb_settings():
          Button.inline(
              f"🚀 No-browser sends: {'ON' if store.browserless else 'OFF'}",
              b"set:browserless")],
+        [Button.inline(
+            f"📦 APK send mode: {'ON' if store.apk_octet else 'OFF'}",
+            b"set:apkoctet")],
         [Button.inline("⬅ Back", b"menu:home")],
     ]
     return rows
@@ -539,6 +542,8 @@ def settings_text() -> str:
                           else "keep going, only report"),
         ("Contact delay", f"{store.contact_create_delay:g}s between batches"),
         ("Log every    ", f"{store.send_log_every} sends"),
+        ("APK mode     ", "on — .apk sent as generic binary"
+                          if store.apk_octet else "off — normal apk MIME"),
     ]
     eng = store.engine
     eng_txt = {
@@ -847,6 +852,10 @@ async def _handle_callback(event):
     if data == "set:browserless":
         now = store.toggle_browserless()
         await event.answer("No-browser sends: " + ("ON" if now else "OFF"))
+        return await event.edit(settings_text(), buttons=kb_settings())
+    if data == "set:apkoctet":
+        now = store.toggle_apk_octet()
+        await event.answer("APK send mode: " + ("ON" if now else "OFF"))
         return await event.edit(settings_text(), buttons=kb_settings())
     if data == "set:pool":
         return await event.edit(

@@ -285,10 +285,44 @@ def test_dotenv_loader() -> None:
     _sh.rmtree(d, ignore_errors=True)
 
 
+def test_apk_setting() -> None:
+    print("apk send-mode setting (persist + live env)")
+    import os as _os
+    from bot.store import Store
+    from direct import apk_mode as A
+
+    saved_env = _os.environ.get(A.APK_OCTET_ENV)
+    try:
+        s = Store()  # fresh store on the test's temp DATA_DIR
+        check("default apk_octet is OFF", s.apk_octet is False, s.apk_octet)
+
+        now = s.toggle_apk_octet()
+        check("toggle -> ON", now is True and s.apk_octet is True)
+        check("ON reflected in live env", A.enabled() is True,
+              _os.environ.get(A.APK_OCTET_ENV))
+
+        # a brand-new Store reading the same file must restore ON into the env
+        _os.environ[A.APK_OCTET_ENV] = "0"           # simulate a fresh process
+        s2 = Store()
+        check("reload persists ON", s2.apk_octet is True)
+        check("reload re-applies env", A.enabled() is True,
+              _os.environ.get(A.APK_OCTET_ENV))
+
+        back = s2.toggle_apk_octet()
+        check("toggle -> OFF", back is False and s2.apk_octet is False)
+        check("OFF reflected in live env", A.enabled() is False,
+              _os.environ.get(A.APK_OCTET_ENV))
+    finally:
+        if saved_env is None:
+            _os.environ.pop(A.APK_OCTET_ENV, None)
+        else:
+            _os.environ[A.APK_OCTET_ENV] = saved_env
+
+
 def main() -> int:
     for fn in (test_contacts_store, test_progress_store, test_flood_wait,
                test_limit_detection, test_guards, test_store, test_cards,
-               test_dotenv_loader):
+               test_dotenv_loader, test_apk_setting):
         fn()
     print()
     print(f"{_PASS} passed, {_FAIL} failed")

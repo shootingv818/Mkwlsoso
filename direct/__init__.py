@@ -10,4 +10,4 @@ session model). Network transport + live handshake are validated against the
 user's authorized account in a later step.
 """
 
-__all__ = ["aes", "crypto", "tl", "session", "errors", "mtproto"]
+__all__ = ["aes", "crypto", "tl", "session", "errors", "mtproto", "apk_mode"]

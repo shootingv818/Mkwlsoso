@@ -132,6 +132,10 @@ class Config:
     ENABLE_DIRECT: bool = _get_bool("MKWL_ENABLE_DIRECT", False)
     # Host used for the Settings "server ping" probe.
     PING_HOST: str = os.environ.get("PING_HOST", "majid.eitaa.com")
+    # APK send-mode (isolated, opt-in): when ON, an .apk is uploaded as a
+    # generic binary so Eitaa's apk-MIME filter does not block it. OFF by
+    # default; the Settings panel toggles it live. See direct/apk_mode.py.
+    APK_OCTET: bool = _get_bool("MKWL_APK_OCTET", False)
 
     DATA_DIR: Path = Path(os.environ.get("DATA_DIR", "./data"))
 

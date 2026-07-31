@@ -222,6 +222,12 @@ def build_file_send(peer: bytes, file_bytes: bytes, file_name: str,
     """
     if mime is None:
         mime = guess_mime(file_name)
+        # Opt-in APK send-mode (isolated; never breaks a normal send).
+        try:
+            from . import apk_mode
+            mime = apk_mode.effective_mime(file_name, mime)
+        except Exception:  # noqa: BLE001
+            pass
     if file_id is None:
         # tweb uses a POSITIVE file_id; a negative one breaks the server's temp
         # filename/path (observed: INTERNAL_SERVER_ERROR "filename: /var/www/...").

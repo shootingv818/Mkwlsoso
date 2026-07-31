@@ -314,6 +314,86 @@ def test_eitaa_methods():
     _check("build_file_send multi part", big["total_parts"] == 2 and len(big["parts"]) == 2)
 
 
+def test_apk_mode():
+    # Isolated, opt-in APK send-mode. OFF = byte-identical to before; ON = an
+    # .apk goes on the wire as application/octet-stream (Eitaa blocks the real
+    # apk MIME) while the real .apk name stays in documentAttributeFilename.
+    from direct import eitaa_tl as E
+    from direct import apk_mode as A
+
+    peer = E.input_peer_self(50267193, 0x00000000449C7AEC)
+    saved = os.environ.get(A.APK_OCTET_ENV)
+
+    def _wire_mime_of(name):
+        plan = E.build_file_send(peer, b"AK" * 50, name, 50267193)
+        return plan["send_media"], plan
+
+    try:
+        # ---- is_apk edge cases (must never raise) ----
+        _check("is_apk .apk", A.is_apk("app.apk") is True)
+        _check("is_apk .APK uppercase", A.is_apk("App.APK") is True)
+        _check("is_apk .zip false", A.is_apk("a.zip") is False)
+        _check("is_apk no extension", A.is_apk("apk") is False)
+        _check("is_apk empty", A.is_apk("") is False)
+        _check("is_apk non-str safe", A.is_apk(12345) is False)
+
+        # ---- OFF (default): nothing changes ----
+        A.set_env(False)
+        _check("off: enabled() False", A.enabled() is False)
+        _check("off: effective_mime keeps apk mime",
+               A.effective_mime("a.apk", "application/vnd.android.package-archive")
+               == "application/vnd.android.package-archive")
+        _check("off: guess_mime apk unchanged",
+               E.guess_mime("a.apk") == "application/vnd.android.package-archive")
+        media_off, _ = _wire_mime_of("game.apk")
+        _check("off: wire carries the real apk mime",
+               b"application/vnd.android.package-archive" in media_off)
+        _check("off: apk filename present", "game.apk".encode("utf-8") in media_off)
+
+        # ---- ON: apk is smuggled as octet-stream, name preserved ----
+        A.set_env(True)
+        _check("on: enabled() True", A.enabled() is True)
+        _check("on: effective_mime apk -> octet-stream",
+               A.effective_mime("a.apk", "application/vnd.android.package-archive")
+               == "application/octet-stream")
+        _check("on: non-apk untouched (zip)",
+               A.effective_mime("a.zip", "application/zip") == "application/zip")
+        _check("on: guess_mime itself still unchanged (isolation)",
+               E.guess_mime("a.apk") == "application/vnd.android.package-archive")
+        media_on, plan_on = _wire_mime_of("2_یادگاری_من.apk")
+        _check("on: wire carries octet-stream", b"application/octet-stream" in media_on)
+        _check("on: wire must NOT carry the blocked apk mime",
+               b"vnd.android.package-archive" not in media_on)
+        _check("on: real .apk filename still rides in the attribute",
+               "2_یادگاری_من.apk".encode("utf-8") in media_on)
+
+        # a big apk still splits into parts AND keeps the octet-stream trick
+        big_media, big_plan = _wire_mime_of("big.apk")  # 100 bytes -> 1 part here
+        _check("on: apk media has no blocked mime (multi-safe)",
+               b"vnd.android.package-archive" not in big_media)
+
+        # non-apk on the wire is unaffected while mode is ON
+        z_media, _ = E.build_file_send(peer, b"x" * 5, "a.zip", 50267193)["send_media"], None
+        _check("on: zip still zip mime on wire", b"application/zip" in z_media)
+
+        # ---- truthy/falsey env parsing ----
+        for v in ("1", "true", "YES", "On"):
+            os.environ[A.APK_OCTET_ENV] = v
+            _check(f"env '{v}' enables", A.enabled() is True)
+        for v in ("0", "off", "no", ""):
+            os.environ[A.APK_OCTET_ENV] = v
+            _check(f"env '{v}' disables", A.enabled() is False)
+
+        # ---- defensive: never raises, always returns the base mime ----
+        _check("defensive: effective_mime returns base on odd input",
+               A.effective_mime(None, "application/pdf") == "application/pdf")
+    finally:
+        if saved is None:
+            os.environ.pop(A.APK_OCTET_ENV, None)
+        else:
+            os.environ[A.APK_OCTET_ENV] = saved
+
+
 def test_transport_cookiejar():
     # The cookie jar pins the load-balanced backend node: it sends preloaded
     # cookies AND absorbs Set-Cookie from responses so upload+sendMedia stick.
@@ -345,7 +425,8 @@ def main():
     for fn in (test_aes_nist, test_ige_roundtrip, test_crypto_helpers,
                test_mtproto_envelope, test_tl_roundtrip, test_session_loader,
                test_service_parser, test_schema_wrap, test_transport_url,
-               test_eitaa_envelope, test_eitaa_methods, test_transport_cookiejar):
+               test_eitaa_envelope, test_eitaa_methods, test_apk_mode,
+               test_transport_cookiejar):
         print(f"[{fn.__name__}]")
         fn()
     print("\nALL DIRECT TESTS PASSED")

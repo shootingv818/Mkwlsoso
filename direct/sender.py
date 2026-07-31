@@ -232,6 +232,14 @@ class DirectSender:
             return {"ok": False, "code": "self peer unknown in capture"}
         data = fp.read_bytes()
         mime = E.guess_mime(fp.name)
+        # Opt-in APK send-mode: upload an .apk as a generic binary so Eitaa does
+        # not block it (the real .apk name still rides in the filename
+        # attribute). Isolated + defensive: any failure keeps the original MIME.
+        try:
+            from . import apk_mode
+            mime = apk_mode.effective_mime(fp.name, mime)
+        except Exception:  # noqa: BLE001
+            pass
         plan = E.build_file_send(peer, data, fp.name, self.ctx["user_id"],
                                  caption=caption, mime=mime)
 

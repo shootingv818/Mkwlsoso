@@ -27,6 +27,8 @@ def _defaults() -> dict[str, Any]:
             "stop_on_limit": bool(config.STOP_ON_LIMIT),
             # "bridge" (browser/tweb) or "direct" (browser-free MTProto).
             "engine": str(config.ENGINE),
+            # Opt-in APK send-mode (see direct/apk_mode.py). OFF by default.
+            "apk_octet": bool(config.APK_OCTET),
         },
         # content to send: kind is "text" or "file".
         "content": {
@@ -65,6 +67,13 @@ class Store:
                     else:
                         merged[key] = val
                 self._data = merged
+        # Reflect the persisted apk setting into the live env so a restart keeps
+        # the owner's choice (outside the lock; never breaks load on failure).
+        try:
+            self._apply_apk_octet_env(
+                bool(self._data["settings"].get("apk_octet", config.APK_OCTET)))
+        except Exception:  # noqa: BLE001
+            pass
 
     def save(self) -> None:
         with _LOCK:
@@ -118,6 +127,28 @@ class Store:
     def toggle_browserless(self) -> bool:
         new = not self.browserless
         self.set_setting("browserless", new)
+        return new
+
+    @property
+    def apk_octet(self) -> bool:
+        """Whether an .apk is uploaded as a generic binary (Eitaa apk-MIME
+        workaround). OFF by default; the send path reads this via the live env
+        flag that ``_apply_apk_octet_env`` keeps in sync."""
+        return bool(self._data["settings"].get("apk_octet", config.APK_OCTET))
+
+    def _apply_apk_octet_env(self, value: bool) -> None:
+        """Mirror the persisted apk setting into the live environment so the
+        browser-free sender (direct/apk_mode.py) sees it. Never raises."""
+        try:
+            from direct import apk_mode
+            apk_mode.set_env(value)
+        except Exception:  # noqa: BLE001 - the toggle must never break the panel
+            pass
+
+    def toggle_apk_octet(self) -> bool:
+        new = not self.apk_octet
+        self.set_setting("apk_octet", new)
+        self._apply_apk_octet_env(new)
         return new
 
     @property
