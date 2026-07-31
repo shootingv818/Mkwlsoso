@@ -235,9 +235,60 @@ def test_cards() -> None:
     check("secrets are redacted in cards", "abc123" not in err, err)
 
 
+def test_dotenv_loader() -> None:
+    print("dotenv loader (inline comments)")
+    import tempfile as _tf
+    from config import _load_dotenv
+
+    body = "\n".join([
+        "# full line comment",
+        "MKWL_POOL_IDLE_TTL=240     # close a standby session after N idle seconds",
+        "TEXT_SEND_DELAY=8\t# tab before comment",
+        "PLAIN=hello",
+        "QUOTED=\"a # b\"            # keep the hash inside quotes",
+        "SINGLE='c # d'",
+        "EMPTY=",
+        "URL=https://web.eitaa.com/#frag",   # no space before # -> part of value
+        "SPACED=two words          # trailing note",
+        "",
+    ])
+    d = _tf.mkdtemp(prefix="mkwl_env_")
+    path = os.path.join(d, ".env")
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(body)
+
+    for k in ("MKWL_POOL_IDLE_TTL", "TEXT_SEND_DELAY", "PLAIN", "QUOTED",
+              "SINGLE", "EMPTY", "URL", "SPACED"):
+        os.environ.pop(k, None)
+    _load_dotenv(path)
+
+    check("strips inline comment -> float-safe",
+          os.environ["MKWL_POOL_IDLE_TTL"] == "240", os.environ.get("MKWL_POOL_IDLE_TTL"))
+    check("float() works on the value", float(os.environ["MKWL_POOL_IDLE_TTL"]) == 240.0)
+    check("tab-led comment stripped", os.environ["TEXT_SEND_DELAY"] == "8",
+          os.environ.get("TEXT_SEND_DELAY"))
+    check("plain value untouched", os.environ["PLAIN"] == "hello")
+    check("hash kept inside double quotes", os.environ["QUOTED"] == "a # b",
+          os.environ.get("QUOTED"))
+    check("hash kept inside single quotes", os.environ["SINGLE"] == "c # d",
+          os.environ.get("SINGLE"))
+    check("empty stays empty", os.environ["EMPTY"] == "")
+    check("hash without leading space is part of value",
+          os.environ["URL"] == "https://web.eitaa.com/#frag", os.environ.get("URL"))
+    check("value with spaces keeps words, drops note",
+          os.environ["SPACED"] == "two words", os.environ.get("SPACED"))
+    check("existing env var is not overwritten",
+          (os.environ.__setitem__("PLAIN", "keep") or _load_dotenv(path) or
+           os.environ["PLAIN"]) == "keep")
+
+    import shutil as _sh
+    _sh.rmtree(d, ignore_errors=True)
+
+
 def main() -> int:
     for fn in (test_contacts_store, test_progress_store, test_flood_wait,
-               test_limit_detection, test_guards, test_store, test_cards):
+               test_limit_detection, test_guards, test_store, test_cards,
+               test_dotenv_loader):
         fn()
     print()
     print(f"{_PASS} passed, {_FAIL} failed")

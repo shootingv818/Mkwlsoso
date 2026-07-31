@@ -14,6 +14,9 @@ def _load_dotenv(path: str = ".env") -> None:
     """Minimal .env loader so we don't add a dependency.
 
     Only parses simple KEY=VALUE lines. Existing environment variables win.
+    Inline comments after an unquoted value are stripped (dotenv-style: a ``#``
+    preceded by whitespace), so ``KEY=240   # note`` yields ``240`` and not
+    ``240   # note``. A ``#`` inside a quoted value is kept verbatim.
     """
     p = Path(path)
     if not p.is_file():
@@ -24,7 +27,19 @@ def _load_dotenv(path: str = ".env") -> None:
             continue
         key, _, value = line.partition("=")
         key = key.strip()
-        value = value.strip().strip('"').strip("'")
+        value = value.strip()
+        if value[:1] in ('"', "'"):
+            # quoted: take the quoted span, keep any '#' inside it
+            quote = value[0]
+            end = value.find(quote, 1)
+            value = value[1:end] if end != -1 else value[1:]
+        else:
+            # unquoted: an inline comment starts at the first whitespace-led '#'
+            for i in range(1, len(value)):
+                if value[i] == "#" and value[i - 1] in (" ", "\t"):
+                    value = value[:i]
+                    break
+            value = value.strip()
         if key and key not in os.environ:
             os.environ[key] = value
 
