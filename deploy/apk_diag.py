@@ -52,6 +52,64 @@ def log(msg: str) -> None:
         pass
 
 
+def raw_probe(endpoint: str, ctx, cookies: dict) -> None:
+    """Send ONE tiny saveFilePart via a raw HTTPS call and dump the exact
+    server reply (status, Set-Cookie, and the full body text). This reveals
+    WHY the media host answers 500 -- cookie affinity, auth, wrong DC, etc."""
+    import http.client
+    import ssl
+    from urllib.parse import urlparse
+
+    log("")
+    log("===== RAW PROBE (one saveFilePart, full server reply) =====")
+    try:
+        peer = E.input_peer_self(ctx["user_id"], 0)
+        plan = E.build_file_send(peer, b"MKWLDIAG" * 64, "probe.bin",
+                                 ctx["user_id"], caption="", mime="application/octet-stream")
+        body = wrap_eitaa(ctx["token1"], ctx["token2"], plan["parts"][0])
+        u = urlparse(endpoint)
+        host = u.hostname or ""
+        port = u.port or 443
+        path = u.path or "/"
+        conn = http.client.HTTPSConnection(host, port, timeout=30,
+                                           context=ssl.create_default_context())
+        headers = {"Content-Type": "application/octet-stream",
+                   "Content-Length": str(len(body)), "Connection": "close"}
+        if cookies:
+            headers["Cookie"] = "; ".join(f"{k}={v}" for k, v in cookies.items())
+        log(f"  POST {endpoint}  host={host}  bodylen={len(body)}")
+        conn.request("POST", path, body=body, headers=headers)
+        resp = conn.getresponse()
+        data = resp.read()
+        log(f"  <- HTTP {resp.status} {resp.reason}  ({len(data)} bytes)")
+        sc = resp.getheader("Set-Cookie")
+        log(f"  Set-Cookie: {sc if sc else '(none)'}")
+        server = resp.getheader("Server")
+        log(f"  Server hdr: {server}")
+        # body as text if printable, else hex
+        try:
+            txt = data.decode("utf-8")
+            printable = sum(c.isprintable() or c in "\n\r\t" for c in txt) > len(txt) * 0.7
+        except Exception:  # noqa: BLE001
+            txt, printable = "", False
+        if printable:
+            log("  BODY (text):")
+            for ln in txt.splitlines():
+                log(f"    | {ln}")
+        else:
+            log(f"  BODY (hex, first 200B): {data[:200].hex()}")
+            # eitaa often wraps errors; try to unwrap
+            try:
+                inner = unwrap_eitaa(data)["body"]
+                log(f"  unwrapped body (hex): {inner[:120].hex()}")
+                log(f"  unwrapped (latin1): {inner[:160].decode('latin-1', 'replace')}")
+            except Exception:  # noqa: BLE001
+                pass
+        conn.close()
+    except Exception as exc:  # noqa: BLE001
+        log(f"  probe exception: {type(exc).__name__}: {exc}")
+
+
 def make_dummy(path: str, size_bytes: int) -> None:
     """A zip-shaped blob (apk == zip) of an exact size, deterministic-ish."""
     with open(path, "wb") as fh:
@@ -146,6 +204,11 @@ def main() -> int:
         return 2
     cookies = _load_cookies(args.account)
     log(f"target={tgt}  user_id={ctx.get('user_id')}  cookies={len(cookies)}")
+
+    endpoint0 = E.extract_media_url(cap) or "https://fateme.eitaa.com/eitaa/"
+    log(f"media url source: {'capture' if E.extract_media_url(cap) else 'DEFAULT fallback'}"
+        f"  -> {endpoint0}")
+    raw_probe(endpoint0, ctx, cookies)
 
     tmp = tempfile.mkdtemp(prefix="apk_diag_")
     big = os.path.join(tmp, "diag_big.apk")
