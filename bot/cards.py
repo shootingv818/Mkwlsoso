@@ -115,6 +115,126 @@ def eta(done: int, total: int, elapsed: float) -> str:
     return fmt_duration((elapsed / done) * (total - done))
 
 
+# ---- diagnostics shared by the cards that close or interrupt a run ----
+#
+# These exist because the cards used to answer "how many went out" but not the
+# question you actually ask when a run ends unexpectedly: did the loop REACH THE
+# END of the list, or did it give up part way? Everything below is derived from
+# numbers the cards already receive, so no caller has to change.
+
+def _n(v: object) -> int:
+    try:
+        return int(v or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def coverage(sent: object, failed: object, total: object) -> tuple[int, int]:
+    """(attempted, never_tried) for a run. `skipped` is excluded on purpose:
+    skipped recipients were filtered out BEFORE the loop, so they are not part of
+    what the loop was supposed to walk."""
+    attempted = _n(sent) + _n(failed)
+    return attempted, max(0, _n(total) - attempted)
+
+
+def pace(attempted: object, elapsed: object) -> str | None:
+    """`1.9s each · 32/min` -- the number needed to judge whether a run was
+    slow or just long."""
+    a, el = _n(attempted), float(elapsed or 0)
+    if a <= 0 or el <= 0:
+        return None
+    return f"{el / a:.1f}s each · {a / el * 60:.0f}/min"
+
+
+def debug_line(**kv: object) -> str:
+    """One compact copy-pasteable line. When something goes wrong the whole state
+    of the run can be quoted in a bug report without screenshotting five cards."""
+    parts = [f"{k}={v}" for k, v in kv.items() if v is not None and v != ""]
+    return "🔍 " + " ".join(parts)
+
+
+# Server restriction strings, classified. The scope is the part that matters:
+# a per-recipient refusal means "skip this person", an account-wide one means
+# "this account is done for now" -- and they must not be treated the same.
+def limit_kind(reason: object) -> dict:
+    up = str(reason or "").upper()
+    m = re.search(r"FLOOD_WAIT_(\d+)", up)
+    if m:
+        secs = int(m.group(1))
+        return {"key": "flood_wait", "scope": "timed wait", "wait": secs,
+                "label": f"timed wait, {secs}s",
+                "note": (f"A timed wait: the server asked for {secs}s and it clears "
+                         f"on its own. This is NOT a permanent refusal and the "
+                         f"recipient is not added to the refused list.")}
+    if "ALL_PEER_FLOOD" in up:
+        return {"key": "all_peer_flood", "scope": "whole account", "wait": None,
+                "label": "account-wide",
+                "note": ("ALL_PEER_FLOOD is account-wide, not about one recipient: "
+                         "Eitaa has stopped this ACCOUNT from messaging people it "
+                         "is not in two-way contact with. Every recipient tried "
+                         "from here on will refuse for the same reason, so the "
+                         "refused list is being filled with people who did nothing "
+                         "wrong. It eases after quiet time and hits new accounts "
+                         "fastest.")}
+    if "PEER_FLOOD" in up:
+        return {"key": "peer_flood", "scope": "this recipient", "wait": None,
+                "label": "per-recipient",
+                "note": ("PEER_FLOOD is not a timed wait: Eitaa is refusing messages "
+                         "from this account to people it is not in two-way contact "
+                         "with. Waiting does not clear it — it usually needs a few "
+                         "quiet days, and it hits new accounts fastest.")}
+    if "SLOWMODE" in up:
+        return {"key": "slowmode", "scope": "this chat", "wait": None,
+                "label": "slow mode",
+                "note": ("Slow mode is set on that chat: it caps how often anyone "
+                         "may post there. It is not an account restriction.")}
+    if "SPAM" in up:
+        return {"key": "spam", "scope": "whole account", "wait": None,
+                "label": "spam warning",
+                "note": ("A spam warning is aimed at the ACCOUNT. Continuing to send "
+                         "while it stands is what turns it into a longer block.")}
+    if "TOO_MANY" in up:
+        return {"key": "too_many", "scope": "whole account", "wait": None,
+                "label": "too many requests",
+                "note": "Too many requests from this account. Slow the run down."}
+    if "FLOOD" in up:
+        return {"key": "flood", "scope": "whole account", "wait": None,
+                "label": "flood",
+                "note": "A flood limit with no stated wait; treat it as account-wide."}
+    return {"key": "unknown", "scope": "unknown", "wait": None, "label": "unclassified",
+            "note": ("This code is not one the panel recognises. It was treated as a "
+                     "limit because the text matched a limit pattern -- quote this "
+                     "card if it looks like a false positive.")}
+
+
+# code -> the first thing worth doing about it
+_CODE_HINTS = {
+    "not_logged_in": "Run 🔎 Check Session, then log in again from ➕ Add Account.",
+    "no_recipients": "Nothing was left to target: check Skipped / Refused above, "
+                     "then ➕ Build Contacts or 🧯 reset the refused list.",
+    "peer_id_invalid": "The saved peer is stale. Run 🔄 Update Contacts to re-resolve it.",
+    "ui_timeout": "The page did not answer in time -- almost always the server "
+                  "(CPU steal / swap), not Eitaa.",
+    "locate_failed": "The upload could not be found in the page again; the file "
+                     "state was rebuilt and lost.",
+    "timeouterror": "Something exceeded its time budget. Compare with ⏱ RUN TIMING.",
+    "modulenotfounderror": "Code is missing on this server -- the deploy is "
+                           "incomplete or on the wrong branch.",
+}
+
+
+def code_hint(code: object) -> str | None:
+    key = str(code or "").strip().lower()
+    if not key:
+        return None
+    if key in _CODE_HINTS:
+        return _CODE_HINTS[key]
+    for k, v in _CODE_HINTS.items():
+        if k in key:
+            return v
+    return None
+
+
 def _live(title: str, phone: str, pairs: Iterable[tuple[str, object]], ts: str | None = None) -> str:
     """Live-card shell: title, divider, 📱 phone, aligned rows, 🕒 time.
     This is the card that gets EDITED IN PLACE while a job runs."""
@@ -525,20 +645,48 @@ def send_started(account: str, kind: str, targets: int, delay: float) -> str:
 
 
 def send_progress(sent: int, failed: int, skipped: int, left: int, elapsed: float) -> str:
+    """Mid-run progress. Carries a bar, pace and ETA so a run that is merely slow
+    can be told apart from a run that has stalled -- the old card showed four
+    counters with no sense of movement."""
+    sent, failed, left = _n(sent), _n(failed), _n(left)
+    attempted = sent + failed
+    total = attempted + left
     return card(
         "📈 PROGRESS",
         [
-            ("Sent   ", sent),
-            ("Failed ", failed),
-            ("Skipped", skipped),
-            ("Left   ", left),
-            ("Elapsed", fmt_duration(elapsed)),
+            ("Progress", bar(attempted, total) if total else None),
+            ("Sent    ", f"{sent:,}"),
+            ("Failed  ", f"{failed:,}  ({_pct(failed, attempted)} of tried)"
+                         if failed else "0"),
+            ("Skipped ", f"{_n(skipped):,}" if skipped else None),
+            ("Left    ", f"{left:,}"),
+            ("Pace    ", pace(attempted, elapsed)),
+            ("Left ~  ", eta(attempted, total, elapsed) if left else None),
+            ("Elapsed ", fmt_duration(elapsed)),
         ],
     )
 
 
 def send_finished(account: str, kind: str, sent: int, failed: int, skipped: int,
-                  total: int, elapsed: float, stopped: bool = False) -> str:
+                  total: int, elapsed: float, stopped: bool = False,
+                  reason: str | None = None, engine: str | None = None,
+                  limits: int | None = None, via_bridge: int | None = None,
+                  via_fallback: int | None = None,
+                  job_id: str | None = None) -> str:
+    """The card that closes a run.
+
+    The old card said "Sent 199 of 1232" and left the only question that matters
+    unanswered: were the other 1033 TRIED AND REFUSED, or NEVER REACHED because
+    the loop gave up? Those are completely different bugs and they looked
+    identical. `Attempted` / `Never tried` / `Verdict` separate them, and the
+    debug line at the bottom carries the whole run state for a bug report.
+
+    Every extra argument is optional, so this stays a drop-in for existing calls.
+    """
+    sent, failed, skipped = _n(sent), _n(failed), _n(skipped)
+    total, elapsed = _n(total), float(elapsed or 0)
+    attempted, untouched = coverage(sent, failed, total)
+
     if stopped:
         title = "🛑 SEND STOPPED"
     elif failed and not sent:
@@ -547,20 +695,52 @@ def send_finished(account: str, kind: str, sent: int, failed: int, skipped: int,
         title = "⚠️ SEND FINISHED (with failures)"
     else:
         title = "✅ SEND FINISHED"
+
+    # The verdict is the line to read first: it says whether the list was walked.
+    if untouched and stopped:
+        verdict = (f"🛑 ended early — {untouched:,} of {total:,} were never tried")
+    elif untouched:
+        verdict = (f"⚠️ loop ended with {untouched:,} never tried "
+                   f"(it did not stop, so this is unexpected)")
+    elif total:
+        verdict = f"✅ walked the whole list — all {total:,} were tried"
+    else:
+        verdict = "◻️ there was nothing to walk"
+
     lines = [
         title,
         DIVIDER,
         f"📱 {account}",
-        bar(sent + failed, total),
+        bar(attempted, total),
+        verdict,
         *_rows([
-            ("Type   ", kind),
-            ("Sent   ", f"✅ {sent} of {total}"),
-            ("Failed ", f"✗ {failed}" if failed else None),
-            ("Skipped", skipped or None),
-            ("Time   ", fmt_duration(elapsed)),
+            ("Type     ", kind),
+            ("Engine   ", engine),
+            ("Delivered", f"✅ {sent:,} of {total:,}  ({_pct(sent, total)})"),
+            ("Failed   ", (f"✗ {failed:,}  ({_pct(failed, attempted)} of tried)")
+                          if failed else None),
+            ("Tried    ", f"{attempted:,} of {total:,}"),
+            ("Never tried", f"{untouched:,}  ← still waiting" if untouched else None),
+            ("Skipped  ", (f"{skipped:,} (already delivered in an earlier run)")
+                          if skipped else None),
+            ("Refused  ", f"{_n(limits):,} hit a server limit" if limits else None),
+            ("Path     ", (f"api {_n(via_bridge):,} · browser {_n(via_fallback):,}")
+                          if (via_bridge is not None or via_fallback is not None)
+                          else None),
+            ("Stopped by", sanitize(reason, 160) if reason else None),
+            ("Duration ", fmt_duration(elapsed)),
+            ("Pace     ", pace(attempted, elapsed)),
+            ("Left ~   ", (eta(attempted, total, elapsed)) if untouched else None),
         ]),
+        debug_line(job=job_id, sent=sent, failed=failed, skip=skipped, total=total,
+                   tried=attempted, untried=untouched, limits=limits,
+                   el=f"{elapsed:.0f}s", eng=engine, kind=kind,
+                   stop=1 if stopped else 0),
         f"🕒 {now_hms()}",
     ]
+    if untouched:
+        lines.append("Press Send again to resume: the delivered ones are skipped, "
+                     "so nobody gets it twice.")
     return "\n".join(lines)
 
 
@@ -622,7 +802,14 @@ def contacts_finished(account: str, added: int, not_on: int, invalid: int,
 def error_card(where: str, account: str | None = None, target: str | None = None,
                code: str | None = None, detail: str | None = None,
                trace_id: str | None = None, engine: str | None = None,
-               phase: str | None = None) -> str:
+               phase: str | None = None, sent: int | None = None,
+               total: int | None = None, attempt: str | None = None) -> str:
+    """An error, plus the first thing worth doing about it.
+
+    `Fix` is derived from the code so the card is actionable on its own instead of
+    being a code you then have to come and ask about. `Trace`/`Where`/`Phase`
+    together say exactly which part of which job produced it.
+    """
     return card(
         "⚠️ ERROR",
         [
@@ -632,10 +819,16 @@ def error_card(where: str, account: str | None = None, target: str | None = None
             ("Engine ", engine),
             ("Account", account),
             ("Target ", sanitize(target, 60) if target else None),
+            ("Attempt", attempt),
+            ("Progress", (f"{_n(sent):,} of {_n(total):,} at the time")
+                         if total is not None else None),
             ("Code   ", code),
             ("Detail ", sanitize(detail, 400) if detail else None),
+            ("Fix    ", code_hint(code)),
             ("Time   ", now_hms()),
         ],
+        footer=debug_line(trace=trace_id, where=where, phase=phase, code=code,
+                          eng=engine, acc=account),
     )
 
 
@@ -740,6 +933,25 @@ def timing_card(phone: str, engine: str, timing: dict, concurrency: int,
             return None
         return f"{v:.0f}s ({v / total * 100:.0f}%)"
 
+    # Name the biggest cost outright. Four percentages still needed a human to
+    # compare them; the verdict says which knob is the one worth touching.
+    buckets = {k: float(timing.get(k) or 0)
+               for k in ("transport", "fallback", "pacing", "other")}
+    top = max(buckets, key=lambda k: buckets[k]) if any(buckets.values()) else None
+    verdicts = {
+        "transport": "Eitaa itself was the slowest part — the settings are not the "
+                     "bottleneck.",
+        "fallback": "The browser slow path dominated: the in-page API was missing "
+                    "most sends. Worth investigating before raising the pace.",
+        "pacing": "Most of the run was your own Send Delay. Lowering it is the "
+                  "single fastest win here.",
+        "other": "Most of the time was neither Eitaa nor the settings — that points "
+                 "at the server itself (CPU steal, swap, disk).",
+    }
+    verdict = None
+    if top and buckets[top] / total >= 0.4:
+        verdict = f"➡️ {verdicts[top]}"
+
     return card(
         "⏱ RUN TIMING",
         [
@@ -750,11 +962,13 @@ def timing_card(phone: str, engine: str, timing: dict, concurrency: int,
             ("Slow path  ", share("fallback")),
             ("Pacing wait", share("pacing")),
             ("Everything else", share("other")),
+            ("Biggest cost", top),
             ("Per message", f"{timing.get('per_send')}s" if timing.get("per_send") else None),
             ("Rate       ", f"{timing.get('msg_per_s')} msg/s"),
             ("Refused    ", limits or None),
             ("Browser fallbacks", fallbacks or None),
         ],
+        body=verdict,
         footer="'Sending' is time Eitaa itself took. 'Pacing wait' is your Send Delay "
                "setting. A big 'Everything else' means the server (CPU steal, swap) "
                "rather than Eitaa or the settings.",
@@ -769,41 +983,77 @@ def restriction_card(account: str, reason: str, sent_before: int,
     is still posted so the restriction is never hidden, but the run continues and
     only Stop ends it.
     """
-    peer_flood = "PEER_FLOOD" in str(reason).upper()
-    footer = None
-    if peer_flood:
-        footer = ("PEER_FLOOD is not a timed wait: Eitaa is refusing messages from "
-                  "this account to people it is not in two-way contact with. Waiting "
-                  "does not clear it — it usually needs a few quiet days, and it hits "
-                  "new accounts fastest.")
+    kind = limit_kind(reason)
+    footer = kind["note"]
     if not paused:
         footer = ((footer + " ") if footer else "") + \
                  "Pause on limit is OFF, so the run continues. Use Stop to end it."
+
+    # What this restriction does to the refused list is the part that silently
+    # costs contacts: an account-wide code gets recorded against each recipient,
+    # so a growing refused list is expected and is NOT evidence those people
+    # rejected anything.
+    if kind["key"] == "flood_wait":
+        effect = "not recorded (timed waits are retried)"
+    elif kind["scope"] == "whole account":
+        effect = ("recipient added to the refused list — but the cause is the "
+                  "account, not them")
+    elif kind["key"] in ("peer_flood",):
+        effect = "recipient added to the refused list permanently"
+    else:
+        effect = None
+
+    if paused:
+        action = "job auto-paused"
+    else:
+        action = "continuing (pause on limit is off)"
+
     return card(
         "🚫 LIMIT DETECTED",
         [
             ("Account    ", account),
             ("Reason     ", sanitize(reason, 200)),
-            ("Sent before", sent_before),
-            ("Action     ", "job auto-paused" if paused
-                            else "continuing (pause on limit is off)"),
+            ("Kind       ", kind["label"]),
+            ("Applies to ", kind["scope"]),
+            ("Server wait", f"{kind['wait']}s" if kind.get("wait") else None),
+            ("Sent before", f"{_n(sent_before):,} in THIS run "
+                            f"(earlier runs are not counted here)"),
+            ("Refused list", effect),
+            ("Action     ", action),
+            ("Next       ", ("only Stop ends this run" if not paused
+                             else "press Send again to resume when it eases")),
             ("Time       ", now_hms()),
         ],
         footer=footer,
     )
 
 
-def paused_card(account: str, reason: str, sent_before: int) -> str:
-    """Job auto-paused by the safety brake (not necessarily a real limit)."""
+def paused_card(account: str, reason: str, sent_before: int,
+                total: int | None = None, brake: str | None = None) -> str:
+    """Job auto-paused by the safety brake (not necessarily a real limit).
+
+    Spelled out because this card and 🚫 LIMIT DETECTED look alike but mean
+    opposite things: this one is OUR OWN brake giving up, not Eitaa refusing.
+    Mistaking the two sends you hunting a limit that never happened.
+    """
+    left = None
+    if total is not None:
+        left = max(0, _n(total) - _n(sent_before))
     return card(
         "⏸ SEND PAUSED",
         [
             ("Account    ", account),
             ("Reason     ", sanitize(reason, 200)),
-            ("Sent before", sent_before),
-            ("Action     ", "auto-paused; see error cards above"),
+            ("Raised by  ", brake or "a local safety brake, not the Eitaa server"),
+            ("Sent before", f"{_n(sent_before):,} in THIS run"),
+            ("Not tried  ", f"{left:,}" if left else None),
+            ("Action     ", "auto-paused; the error cards above say what kept failing"),
+            ("Next       ", "fix the cause, then press Send again to resume"),
             ("Time       ", now_hms()),
         ],
+        footer="This is the panel's own brake: too many failures in a row, so it "
+               "stopped rather than hammering a broken session. Eitaa did not "
+               "necessarily limit anything — check the error cards for the real code.",
     )
 
 
@@ -892,27 +1142,49 @@ def multi_send_finished(accounts: list[dict], sent: int, failed: int, total: int
         title = f"⚠️ MULTI SEND FINISHED — {len(bad)} of {len(accounts)} had problems"
     else:
         title = "✅ MULTI SEND FINISHED"
+    attempted, untouched = coverage(sent, failed, total)
+    if untouched and stopped:
+        verdict = f"🛑 ended early — {untouched:,} of {total:,} were never tried"
+    elif untouched:
+        verdict = f"⚠️ {untouched:,} of {total:,} were never tried"
+    elif total:
+        verdict = f"✅ every one of {total:,} was tried"
+    else:
+        verdict = None
+
     lines = [
         title,
         DIVIDER,
-        bar(sent + failed, total),
-        *_rows([
-            ("Accounts", _account_tally(accounts)),
-            ("Type    ", kind),
-            ("Sent    ", f"✅ {sent} of {total}"),
-            ("Failed  ", f"✗ {failed}" if failed else None),
-            ("Time    ", fmt_duration(elapsed)),
-        ]),
+        bar(attempted, total),
     ]
+    if verdict:
+        lines.append(verdict)
+    lines.extend(_rows([
+        ("Accounts", _account_tally(accounts)),
+        ("Type    ", kind),
+        ("Engine  ", engine),
+        ("Delivered", f"✅ {sent:,} of {total:,}  ({_pct(sent, total)})"),
+        ("Failed  ", f"✗ {failed:,}  ({_pct(failed, attempted)} of tried)"
+                     if failed else None),
+        ("Tried   ", f"{attempted:,} of {total:,}"),
+        ("Never tried", f"{untouched:,}" if untouched else None),
+        ("Time    ", fmt_duration(elapsed)),
+        ("Pace    ", pace(attempted, elapsed)),
+    ]))
     if accounts:
         lines.append(DIVIDER)
         for i, a in enumerate(accounts, start=1):
             state = str(a.get("state", "done"))
             mark = _STATE_MARK.get(state, "•")
-            row = (f"{i}. {mark} {a.get('phone', '')} · "
-                   f"{a.get('sent', 0)}/{a.get('total', 0)}")
-            if a.get("failed"):
-                row += f" · ✗{a['failed']}"
+            a_sent, a_total = _n(a.get("sent")), _n(a.get("total"))
+            a_failed = _n(a.get("failed"))
+            row = f"{i}. {mark} {a.get('phone', '')} · {a_sent}/{a_total}"
+            if a_failed:
+                row += f" · ✗{a_failed}"
+            # Per account too: tried-but-refused and never-reached are different.
+            a_left = max(0, a_total - a_sent - a_failed)
+            if a_left:
+                row += f" · {a_left} untried"
             if state in ("no_targets", "failed", "limited", "stopped"):
                 row += f" · {_STATE_WORD.get(state, state)}"
             lines.append(row)
