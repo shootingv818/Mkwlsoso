@@ -176,6 +176,7 @@ def effective_engine(settings: dict) -> str:
 class Job:
     job_id: str
     kind: str          # "send" | "contacts" | "contacts_save" | "multi"
+                       #   | "dryrun" | "session_check"
     account: str
     stop: bool = False
     task: asyncio.Task | None = None
@@ -730,6 +731,40 @@ class JobManager:
         job.task = asyncio.create_task(
             self._save_contacts_job(job, report, account_phone or account))
         return job
+
+    async def run_session_check(self, account: str, report: Report,
+                                account_phone: str | None = None,
+                                live=None) -> Job:
+        """Verify the account's Eitaa session is still usable, without sending.
+
+        Every job below already starts with `driver.is_logged_in()` and aborts
+        with a not_logged_in card - but that was only discoverable by starting a
+        real run. This exposes the same gate on its own.
+
+        The check lives in the isolated `session_check/` package; it is imported
+        inside the job so a missing or broken package costs one error card and
+        leaves every other job untouched.
+        """
+        job = self._new_job("session_check", account)
+        job.task = asyncio.create_task(
+            self._session_check_job(job, report, account_phone or account, live))
+        return job
+
+    async def _session_check_job(self, job: Job, report: Report, phone: str,
+                                 live=None) -> None:
+        account = job.account
+        self._busy.add(account)
+        try:
+            from session_check.checker import check_session
+            job.summary = await check_session(
+                account, phone, report, live=live,
+                engine=effective_engine(self.settings_provider()))
+        except Exception as exc:  # noqa: BLE001
+            await report(cards.error_card("session_check", account,
+                                          code=type(exc).__name__, detail=str(exc),
+                                          phase="check", trace_id=job.job_id))
+        finally:
+            self._busy.discard(account)
 
     async def _build_transport(self, engine: str, driver, account: str,
                                report: Report, stages=None):
