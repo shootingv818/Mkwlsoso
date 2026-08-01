@@ -328,6 +328,9 @@ def kb_account_panel(acc: str):
         # when the account has gained new contacts since.
         [Button.inline("🔄 Update Contacts", b"pnl:save"),
          Button.inline("♻️ Refresh Panel", b"pnl:refresh")],
+        # Read-only: runs the same login gate every job starts with, so a dead
+        # session is found here instead of halfway through a campaign.
+        [Button.inline("🔎 Check Session", b"pnl:check")],
     ]
     if busy:
         # The label escalates: a second press force-stops.
@@ -723,6 +726,23 @@ async def _handle_callback(event):
         if not active:
             return await event.answer("No active account.", alert=True)
         return await _refresh_account(event, active)
+    if data == "pnl:check":
+        if not active:
+            return await event.answer("Select an account first.", alert=True)
+        if manager.is_busy(active):
+            return await event.answer("Account already has a running job.", alert=True)
+        await manager.run_session_check(active, report, store.account_phone(active),
+                                        live=LiveCard(config.report_to()))
+        await event.answer("Checking session…")
+        return await event.edit(
+            cards.card("🔎 SESSION CHECK",
+                       [("Phone ", store.account_phone(active)),
+                        ("Engine", store.engine)],
+                       footer="Opening this account's session and asking Eitaa whether "
+                              "it is still logged in. Nothing is sent to anybody and no "
+                              "contacts are collected. A live card follows with the "
+                              "result."),
+            buttons=kb_back())
     if data == "pnl:save":
         if not active:
             return await event.answer("Select an account first.", alert=True)
