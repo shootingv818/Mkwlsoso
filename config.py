@@ -136,6 +136,11 @@ class Config:
     # generic binary so Eitaa's apk-MIME filter does not block it. OFF by
     # default; the Settings panel toggles it live. See direct/apk_mode.py.
     APK_OCTET: bool = _get_bool("MKWL_APK_OCTET", False)
+    # Warm Path engine (isolated, opt-in): reuse the Eitaa page that is ALREADY
+    # booted in a standby session instead of re-navigating to web.eitaa.com for
+    # every job. OFF by default; the Settings panel toggles it live. Turning it
+    # off restores the previous behaviour exactly. See eitaa/warmpath.py.
+    WARMPATH: bool = _get_bool("MKWL_WARMPATH", False)
 
     DATA_DIR: Path = Path(os.environ.get("DATA_DIR", "./data"))
 

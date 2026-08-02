@@ -419,6 +419,9 @@ def kb_settings():
         [Button.inline(
             f"📦 APK send mode: {'ON' if store.apk_octet else 'OFF'}",
             b"set:apkoctet")],
+        [Button.inline(
+            f"🔥 Warm Path: {'ON' if store.warmpath else 'OFF'}",
+            b"set:warmpath")],
         [Button.inline("⬅ Back", b"menu:home")],
     ]
     return rows
@@ -544,6 +547,8 @@ def settings_text() -> str:
         ("Log every    ", f"{store.send_log_every} sends"),
         ("APK mode     ", "on — .apk sent as generic binary"
                           if store.apk_octet else "off — normal apk MIME"),
+        ("Warm Path    ", "on — reuse the booted page, skip redundant loads"
+                          if store.warmpath else "off — reload the web app per job"),
     ]
     eng = store.engine
     eng_txt = {
@@ -857,6 +862,10 @@ async def _handle_callback(event):
         now = store.toggle_apk_octet()
         await event.answer("APK send mode: " + ("ON" if now else "OFF"))
         return await event.edit(settings_text(), buttons=kb_settings())
+    if data == "set:warmpath":
+        now = store.toggle_warmpath()
+        await event.answer("Warm Path: " + ("ON" if now else "OFF"))
+        return await event.edit(settings_text(), buttons=kb_settings())
     if data == "set:pool":
         return await event.edit(
             cards.pool_card(session_pool.status()),
@@ -895,19 +904,30 @@ async def _refresh_account(event, acc: str):
 
     async def _run():
         from capture.browser import open_session
+        from eitaa import warmpath
         from eitaa.driver import EitaaDriver
         try:
-            async with open_session(acc) as session:
+            # Warm Path borrows a standby session so this button stops launching a
+            # second Chromium outside the pool's max_open ceiling. With the engine
+            # off it opens its own session exactly as before.
+            async with (session_pool.lease(acc, headed=config.HEADED_JOBS)
+                        if warmpath.use_pool() else open_session(acc)) as session:
                 driver = EitaaDriver(session)
                 await driver.open()
                 if not await driver.is_logged_in():
                     await report(cards.error_card("stats", acc, code="not_logged_in",
                                                   detail="account is not logged in"))
                     return
-                s = await driver.bridge_stats()
+                s = await driver.bridge_stats(with_pvs=warmpath.stats_with_pvs())
                 if s is None:
                     s = await driver.get_stats()
-                store.set_account_meta(acc, contacts=s.get("contacts"), pvs=s.get("pvs"))
+                # bridge_stats reports pvs=-1 when the 98-second getDialogs paging
+                # was skipped. Storing that would erase the last real count, so
+                # only a measured value is written.
+                pvs_measured = s.get("pvs")
+                if not (isinstance(pvs_measured, int) and pvs_measured >= 0):
+                    pvs_measured = None
+                store.set_account_meta(acc, contacts=s.get("contacts"), pvs=pvs_measured)
                 await report(cards.account_panel(
                     acc, store.account_phone(acc), s.get("contacts"), s.get("pvs"),
                     store.engine, False, peers=peer_count(acc)))

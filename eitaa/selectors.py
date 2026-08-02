@@ -88,6 +88,16 @@ CONTACTS_LABELS = [
     "Contacts",
 ]
 
+# Back/close control of an open left-column subview (Contacts, Settings, ...).
+# Its presence is the only reliable "a subview is covering the chat list" signal:
+# SEARCH_INPUT cannot be used for that, because the Contacts view has a search
+# box of its own and therefore matches the same selectors as the chat list.
+SUBVIEW_CLOSE = [
+    "#column-left .sidebar-close-button",
+    "#column-left .btn-icon.tgico-left",
+    ".sidebar-slider .sidebar-close-button",
+]
+
 # Scrollable container that holds the contacts list once the Contacts view is
 # open. The active tab is what we scope collection to.
 CONTACTS_CONTAINER = [

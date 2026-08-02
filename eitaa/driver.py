@@ -112,6 +112,13 @@ class EitaaDriver:
         return self.session.page
 
     async def open(self) -> None:
+        # Warm Path (opt-in, OFF by default): when the pooled page is already
+        # booted and usable, reuse it instead of re-downloading the whole web app.
+        # It returns False for anything it is not sure about, and the normal load
+        # below then runs exactly as it always has.
+        from eitaa import warmpath
+        if await warmpath.open_page(self):
+            return
         await self.session.goto()
         # Give the SPA time to boot and restore the session.
         await self.page.wait_for_timeout(4000)
@@ -735,11 +742,7 @@ class EitaaDriver:
                 return
             # Prefer the subview's back/close button, else press Escape.
             closed = False
-            for sel in [
-                "#column-left .sidebar-close-button",
-                "#column-left .btn-icon.tgico-left",
-                ".sidebar-slider .sidebar-close-button",
-            ]:
+            for sel in S.SUBVIEW_CLOSE:
                 loc = self.page.locator(sel).first
                 try:
                     if await loc.count() > 0 and await loc.is_visible():

@@ -29,6 +29,8 @@ def _defaults() -> dict[str, Any]:
             "engine": str(config.ENGINE),
             # Opt-in APK send-mode (see direct/apk_mode.py). OFF by default.
             "apk_octet": bool(config.APK_OCTET),
+            # Opt-in Warm Path engine (see eitaa/warmpath.py). OFF by default.
+            "warmpath": bool(config.WARMPATH),
         },
         # content to send: kind is "text" or "file".
         "content": {
@@ -149,6 +151,18 @@ class Store:
         new = not self.apk_octet
         self.set_setting("apk_octet", new)
         self._apply_apk_octet_env(new)
+        return new
+
+    @property
+    def warmpath(self) -> bool:
+        """Whether the Warm Path engine reuses an already-booted Eitaa page
+        instead of re-navigating for every job. OFF by default; turning it off
+        restores the previous page-load behaviour exactly. See eitaa/warmpath.py."""
+        return bool(self._data["settings"].get("warmpath", config.WARMPATH))
+
+    def toggle_warmpath(self) -> bool:
+        new = not self.warmpath
+        self.set_setting("warmpath", new)
         return new
 
     @property
