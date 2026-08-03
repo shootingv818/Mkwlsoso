@@ -167,6 +167,17 @@ bot = TelegramClient(
 )
 
 
+async def send_document(path: str, caption: str = "") -> object:
+    """Deliver a file to the owner's chat.
+
+    The panel only ever sent text before this; the photo export needs to hand
+    over the PDFs it builds. Errors propagate so the job can report them on its
+    own card instead of failing silently.
+    """
+    return await bot.send_file(config.report_to(), path, caption=caption,
+                              force_document=True)
+
+
 async def report(text: str) -> None:
     try:
         await bot.send_message(config.report_to(), text)
@@ -331,6 +342,10 @@ def kb_account_panel(acc: str):
         # Read-only: runs the same login gate every job starts with, so a dead
         # session is found here instead of halfway through a campaign.
         [Button.inline("🔎 Check Session", b"pnl:check")],
+        # Read-only: exports this account's photos to PDF, one photo per page.
+        [Button.inline(f"🖼 Export Photos: {store.photo_direction}",
+                       b"pnl:photos")],
+        [Button.inline("🔁 Photo Filter", b"pnl:photodir")],
     ]
     if busy:
         # The label escalates: a second press force-stops.
@@ -747,6 +762,29 @@ async def _handle_callback(event):
                               "it is still logged in. Nothing is sent to anybody and no "
                               "contacts are collected. A live card follows with the "
                               "result."),
+            buttons=kb_back())
+    if data == "pnl:photodir":
+        if not active:
+            return await event.answer("Select an account first.", alert=True)
+        now = store.cycle_photo_direction()
+        await event.answer("Photo filter: " + now)
+        return await event.edit(account_panel_text(active),
+                               buttons=kb_account_panel(active))
+    if data == "pnl:photos":
+        if not active:
+            return await event.answer("Select an account first.", alert=True)
+        if manager.is_busy(active):
+            return await event.answer("Account already has a running job.", alert=True)
+        from photo_export import cards as px_cards
+        direction = store.photo_direction
+        await manager.run_photo_export(
+            active, report, store.account_phone(active),
+            live=LiveCard(config.report_to()), direction=direction,
+            send_document=send_document)
+        await event.answer("Exporting photos…")
+        return await event.edit(
+            px_cards.started(account=active, phone=store.account_phone(active),
+                             direction=direction),
             buttons=kb_back())
     if data == "pnl:save":
         if not active:

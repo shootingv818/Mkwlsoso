@@ -176,7 +176,7 @@ def effective_engine(settings: dict) -> str:
 class Job:
     job_id: str
     kind: str          # "send" | "contacts" | "contacts_save" | "multi"
-                       #   | "dryrun" | "session_check"
+                       #   | "dryrun" | "session_check" | "photo_export"
     account: str
     stop: bool = False
     task: asyncio.Task | None = None
@@ -731,6 +731,91 @@ class JobManager:
         job.task = asyncio.create_task(
             self._save_contacts_job(job, report, account_phone or account))
         return job
+
+    async def run_photo_export(self, account: str, report: Report,
+                               account_phone: str | None = None,
+                               live=None, direction: str = "both",
+                               send_document=None) -> Job:
+        """Export this account's photos to PDF, one photo per page.
+
+        Read-only on Eitaa: it walks the private chats, searches each for photos,
+        downloads them and renders the pages. Nothing is sent to anybody there.
+
+        The work lives in the isolated `photo_export/` package and is imported
+        inside the job, so a missing or broken package costs one error card and
+        leaves every other job untouched.
+        """
+        job = self._new_job("photo_export", account)
+        job.task = asyncio.create_task(
+            self._photo_export_job(job, report, account_phone or account,
+                                   live, direction, send_document))
+        return job
+
+    async def _photo_export_job(self, job: Job, report: Report, phone: str,
+                                live=None, direction: str = "both",
+                                send_document=None) -> None:
+        account = job.account
+        self._busy.add(account)
+        try:
+            from photo_export import cards as px_cards
+            from photo_export import engine as px_engine
+
+            engine_name = effective_engine(self.settings_provider())
+            async with session_pool.lease(
+                    account, headed=config.HEADED_JOBS,
+                    init_script_path=_worker_capture_script(engine_name)) as session:
+                driver = EitaaDriver(session)
+                await driver.open()
+                if not await driver.is_logged_in():
+                    await report(cards.error_card(
+                        "photo_export", account, code="not_logged_in",
+                        detail="account is not logged in"))
+                    return
+
+                res = await px_engine.export(
+                    driver, account, phone, direction=direction,
+                    report=report, live=live, send_document=send_document,
+                    should_stop=lambda: job.stop)
+
+            if not res.get("ok"):
+                await report(cards.error_card(
+                    "photo_export", account, code=str(res.get("code")),
+                    detail=str(res.get("detail") or res.get("code")),
+                    trace_id=job.job_id))
+                return
+            if res.get("nothing_found") or not res.get("photos"):
+                await report(px_cards.nothing_found(
+                    account=account, phone=phone, direction=direction,
+                    chats_total=res.get("chats_total") or 0,
+                    elapsed=res.get("elapsed") or 0.0))
+                return
+
+            job.summary = {"photos": res.get("photos"),
+                           "files": len(res.get("files") or [])}
+            await report(px_cards.finished(
+                account=account, phone=phone, direction=direction,
+                photos=res.get("photos") or 0,
+                sent_by_me=res.get("sent_by_me") or 0,
+                received=res.get("received") or 0,
+                chats_with_photos=res.get("chats_with_photos") or 0,
+                chats_total=res.get("chats_total") or 0,
+                files=res.get("files") or [],
+                elapsed=res.get("elapsed") or 0.0,
+                skipped=res.get("skipped") or 0,
+                stopped=bool(res.get("stopped"))))
+        except Exception as exc:  # noqa: BLE001
+            await report(cards.error_card("photo_export", account,
+                                          code=type(exc).__name__,
+                                          detail=str(exc), phase="export",
+                                          trace_id=job.job_id))
+        finally:
+            self._busy.discard(account)
+            flush = getattr(live, "flush", None)
+            if flush is not None:
+                try:
+                    await flush()
+                except Exception:  # noqa: BLE001
+                    pass
 
     async def run_session_check(self, account: str, report: Report,
                                 account_phone: str | None = None,

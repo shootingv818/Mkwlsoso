@@ -141,6 +141,16 @@ class Config:
     # every job. OFF by default; the Settings panel toggles it live. Turning it
     # off restores the previous behaviour exactly. See eitaa/warmpath.py.
     WARMPATH: bool = _get_bool("MKWL_WARMPATH", False)
+    # Photo export (isolated, see photo_export/). Read-only on Eitaa: it walks
+    # the private chats, searches each for photos, and renders them to PDF with
+    # ONE PHOTO PER PAGE. Measured rates: ~55 ms per chat scanned at
+    # concurrency 8, ~30 ms per photo at concurrency 16, ~90-120 ms per PDF page.
+    PHOTO_DIRECTION: str = os.environ.get("MKWL_PHOTO_DIRECTION", "both")
+    PHOTO_EXPORT_MAX: int = int(os.environ.get("MKWL_PHOTO_MAX", "500") or 500)
+    PHOTO_EXPORT_PER_FILE: int = int(
+        os.environ.get("MKWL_PHOTO_PER_FILE", "150") or 150)
+    # Preferred pixel width; the nearest size Eitaa offers is used (296 or 1080).
+    PHOTO_EXPORT_WIDTH: int = int(os.environ.get("MKWL_PHOTO_WIDTH", "320") or 320)
 
     DATA_DIR: Path = Path(os.environ.get("DATA_DIR", "./data"))
 

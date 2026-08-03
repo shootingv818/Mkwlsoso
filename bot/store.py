@@ -31,6 +31,8 @@ def _defaults() -> dict[str, Any]:
             "apk_octet": bool(config.APK_OCTET),
             # Opt-in Warm Path engine (see eitaa/warmpath.py). OFF by default.
             "warmpath": bool(config.WARMPATH),
+            # Which photos the export collects: "both" | "sent" | "received".
+            "photo_direction": str(config.PHOTO_DIRECTION),
         },
         # content to send: kind is "text" or "file".
         "content": {
@@ -152,6 +154,23 @@ class Store:
         self.set_setting("apk_octet", new)
         self._apply_apk_octet_env(new)
         return new
+
+    _PHOTO_DIRECTIONS = ("both", "sent", "received")
+
+    @property
+    def photo_direction(self) -> str:
+        """Which photos the export collects: both, sent (by me) or received."""
+        v = str(self._data["settings"].get("photo_direction",
+                                           config.PHOTO_DIRECTION))
+        return v if v in self._PHOTO_DIRECTIONS else "both"
+
+    def cycle_photo_direction(self) -> str:
+        """Step to the next filter, so one button covers all three."""
+        cur = self.photo_direction
+        nxt = self._PHOTO_DIRECTIONS[
+            (self._PHOTO_DIRECTIONS.index(cur) + 1) % len(self._PHOTO_DIRECTIONS)]
+        self.set_setting("photo_direction", nxt)
+        return nxt
 
     @property
     def warmpath(self) -> bool:
