@@ -29,7 +29,11 @@ from typing import Awaitable, Callable
 from config import config
 
 FLOOR_CONC = 2
-MAX_FLOOD_ROUNDS = 6
+# A live run gave up after 305 of 500 with 110s of waiting, because six refusals
+# was the limit. A rate-limited account is exactly the case worth being patient
+# for, so the budget is time spent waiting rather than a refusal count.
+MAX_FLOOD_ROUNDS = 40
+MAX_TOTAL_WAIT = 420
 
 
 async def fetch(driver, indexes: list[int], *, target_width: int = 320,
@@ -137,7 +141,7 @@ async def fetch(driver, indexes: list[int], *, target_width: int = 320,
         if asked > max_wait:
             gave_up = True
             break
-        if rounds > MAX_FLOOD_ROUNDS:
+        if rounds > MAX_FLOOD_ROUNDS or waited >= MAX_TOTAL_WAIT:
             gave_up = True
             break
 

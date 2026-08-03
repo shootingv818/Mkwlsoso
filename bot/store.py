@@ -155,6 +155,44 @@ class Store:
         self._apply_apk_octet_env(new)
         return new
 
+    # ---- account order (newest last) ----------------------------------
+    def account_seq(self, name: str) -> int:
+        """This account's position in the list. Higher means added later."""
+        try:
+            return int(self._data.get("accounts_meta", {})
+                       .get(name, {}).get("seq") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def ensure_account_order(self, names: list[str]) -> None:
+        """Give every account a stable position, appending unknown ones LAST.
+
+        The list used to be sorted by phone number, so a newly added account
+        appeared wherever its digits happened to fall -- usually in the middle of
+        a page the owner was not looking at. Positions are assigned once and then
+        persist, so the order stops depending on the number itself.
+
+        `names` is used only to seed accounts that have no position yet; pass them
+        in the order you want that first backfill to take.
+        """
+        meta = self._data.setdefault("accounts_meta", {})
+        highest = 0
+        missing = []
+        for n in names:
+            seq = self.account_seq(n)
+            if seq:
+                highest = max(highest, seq)
+            else:
+                missing.append(n)
+        if not missing:
+            return
+        for n in missing:
+            highest += 1
+            cur = dict(meta.get(n, {}))
+            cur["seq"] = highest
+            meta[n] = cur
+        self.save()
+
     _PHOTO_DIRECTIONS = ("both", "sent", "received")
 
     @property

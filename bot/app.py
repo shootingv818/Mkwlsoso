@@ -37,10 +37,23 @@ PAGE_SIZE = 10
 
 
 def list_accounts() -> list[str]:
+    """Accounts in the order they were ADDED, newest last.
+
+    Sorting by profile-directory name meant sorting by phone number, so a new
+    account landed wherever its digits fell -- typically mid-list, on a page the
+    owner was not on. Positions are assigned once (existing accounts keep their
+    current alphabetical order) and persist, so anything added later goes to the
+    end and shows up on the last page.
+    """
     d = config.PROFILES_DIR
     if not d.is_dir():
         return []
-    return sorted(p.name for p in d.iterdir() if p.is_dir())
+    names = sorted(p.name for p in d.iterdir() if p.is_dir())
+    try:
+        store.ensure_account_order(names)
+        return sorted(names, key=lambda n: (store.account_seq(n), n))
+    except Exception:  # noqa: BLE001 - never lose the list over an ordering issue
+        return names
 
 
 def account_name_for_phone(phone: str) -> str:
@@ -70,6 +83,21 @@ def _page_slice(items: list, page: int) -> tuple[list, int, int]:
     page = max(0, min(page, pages - 1))
     start = page * PAGE_SIZE
     return items[start:start + PAGE_SIZE], page, pages
+
+
+def page_of(account: str | None, items: list[str] | None = None) -> int:
+    """Which page `account` sits on, 0 when it is not in the list."""
+    if not account:
+        return 0
+    seq = items if items is not None else list_accounts()
+    try:
+        return seq.index(account) // PAGE_SIZE
+    except ValueError:
+        return 0
+
+
+def page_of_active() -> int:
+    return page_of(store.active_account)
 
 
 def _pager_row(prefix: str, page: int, pages: int) -> list:
@@ -666,7 +694,11 @@ async def _handle_callback(event):
     if data == "noop":
         return await event.answer()
     if data == "menu:accounts":
-        return await event.edit(accounts_text(), buttons=kb_accounts(0))
+        # Land on the page holding the ACTIVE account. A freshly added account
+        # becomes active and now sorts last, so the owner opens the list already
+        # looking at it instead of hunting through pages.
+        return await event.edit(accounts_text(),
+                               buttons=kb_accounts(page_of_active()))
     if data.startswith("acc:page:"):
         page = int(data.rsplit(":", 1)[1] or 0)
         return await event.edit(accounts_text(), buttons=kb_accounts(page))

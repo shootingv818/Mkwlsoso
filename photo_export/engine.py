@@ -187,7 +187,7 @@ async def export(driver, account: str, phone: str, *, direction: str = "both",
     if got.get("gave_up"):
         state["note"] = (
             f"Eitaa kept rate-limiting: {len(items)} of {len(chosen)} photos "
-            f"were downloaded. Run it again to collect the rest.")
+            f"were downloaded. Raise MKWL_PHOTO_DELAY to go gentler.")
     elif got.get("waited"):
         state["note"] = (f"waited {got['waited']}s for Eitaa's rate limit; "
                          f"finished at concurrency {got.get('conc_final')}")

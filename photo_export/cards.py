@@ -189,9 +189,13 @@ def finished(*, account: str, phone: str, direction: str, photos: int,
     if stopped:
         footer = "Stopped early -- what had been collected was still exported."
     elif rate_limited and partial:
-        footer = ("Eitaa rate-limited this account, so only part of the list was "
-                  "downloaded. Press Export Photos again to continue -- or lower "
-                  "MKWL_PHOTO_MAX so each run asks for less.")
+        # Do NOT promise that pressing again continues where this stopped. There
+        # is no memory of what was already exported yet, so a second run picks the
+        # same newest photos. Say what actually helps instead.
+        footer = ("Eitaa rate-limited this account. Raise MKWL_PHOTO_DELAY to be "
+                  "gentler, or narrow the run with MKWL_PHOTO_MAX -- a second run "
+                  "right now would fetch the same newest photos again, not the "
+                  "missing ones.")
     elif partial:
         footer = ("Some photos could not be downloaded; the rest are in the "
                   "file(s) above, one photo per page.")
