@@ -26,7 +26,10 @@ MAX_PHOTOS = int(getattr(config, "PHOTO_EXPORT_MAX", 0) or 500)
 PER_FILE = int(getattr(config, "PHOTO_EXPORT_PER_FILE", 0) or 150)
 TARGET_WIDTH = int(getattr(config, "PHOTO_EXPORT_WIDTH", 0) or 320)
 SCAN_CONC = 8
-FETCH_CONC = 16
+# The probe measured 16 clean on a quiet account (63 photos in one chat), but an
+# account with 4,853 photos across 171 chats refused it right away -- the scan had
+# already spent the budget. Start at 8 and let the fetcher halve on each flood.
+FETCH_CONC = int(getattr(config, "PHOTO_EXPORT_CONC", 0) or 8)
 FETCH_BATCH = 24
 
 
@@ -136,26 +139,45 @@ async def export(driver, account: str, phone: str, *, direction: str = "both",
         state["downloaded"] = done
         await paint()
 
+    async def on_wait(seconds: int, new_conc: int) -> None:
+        state["status"] = "WAITING"
+        state["step"] = f"RATE LIMIT - PAUSE {seconds}s"
+        state["note"] = (f"Eitaa asked for {seconds}s; continuing at "
+                         f"concurrency {new_conc}")
+        await paint(True)
+
     got = await fetcher.fetch(
         driver, [int(m["i"]) for m in chosen], target_width=width,
         conc=FETCH_CONC, batch=FETCH_BATCH,
-        on_progress=on_fetch, should_stop=should_stop)
+        on_progress=on_fetch, on_wait=on_wait, should_stop=should_stop)
     if not got.get("ok"):
         return {"ok": False, "code": got.get("code", "fetch_failed"),
                 "chats_total": state["chats_total"]}
-    if got.get("floods"):
-        state["note"] = "Eitaa asked us to slow down during the download"
     stopped = stopped or bool(got.get("stopped"))
+    state.update(status="DOWNLOADING", step="FETCH PHOTOS")
 
-    images = got.get("images") or []
+    by_index = got.get("images") or {}
     items: list[dict] = []
-    for m, img in zip(chosen, images):
+    for m in chosen:
+        img = by_index.get(int(m["i"]))
         if not img:
             continue
         items.append({"bytes": img["bytes"], "chat": m.get("chat"),
                       "when": _when(m.get("date") or 0), "out": m.get("out")})
     skipped = len(chosen) - len(items)
     state["downloaded"] = len(items)
+
+    # Be honest about a download the server cut short.
+    partial = bool(got.get("gave_up")) or skipped > 0
+    if got.get("gave_up"):
+        state["note"] = (
+            f"Eitaa kept rate-limiting: {len(items)} of {len(chosen)} photos "
+            f"were downloaded. Run it again to collect the rest.")
+    elif got.get("waited"):
+        state["note"] = (f"waited {got['waited']}s for Eitaa's rate limit; "
+                         f"finished at concurrency {got.get('conc_final')}")
+    elif skipped:
+        state["note"] = f"{skipped} photo(s) could not be downloaded"
 
     if not items:
         return {"ok": False, "code": "no_photo_downloaded",
@@ -196,7 +218,10 @@ async def export(driver, account: str, phone: str, *, direction: str = "both",
             state["files_sent"] = len(delivered)
             await paint(True)
 
-    state.update(status="DONE", step="FINISHED")
+    state.update(status="PARTIAL" if partial else "DONE", step="FINISHED")
+    # The bars are what the owner reads first, so make them agree with reality:
+    # a run that only got 15 of 500 must not paint a full Download bar.
+    state["photos_target"] = max(state["photos_target"], len(items))
     await paint(True)
 
     sent_by_me = sum(1 for it in items if it.get("out"))
@@ -205,9 +230,14 @@ async def export(driver, account: str, phone: str, *, direction: str = "both",
         "received": len(items) - sent_by_me,
         "chats_total": state["chats_total"],
         "chats_with_photos": chats_with_photos,
+        "photos_available": len(meta),
+        "requested": len(chosen),
         "files": files, "delivered": len(delivered), "skipped": skipped,
         "elapsed": time.time() - started, "stopped": stopped,
+        "partial": partial, "rate_limited": bool(got.get("floods")),
+        "waited": got.get("waited") or 0,
         "render_ms": rendered.get("ms"),
         "ms_per_page": rendered.get("ms_per_page"),
         "out_dir": str(out_dir),
+        "note": state["note"],
     }

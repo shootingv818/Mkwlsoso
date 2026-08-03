@@ -1,36 +1,63 @@
-"""Download the selected photos out of the page, in batches.
+"""Download the selected photos out of the page, obeying the server.
 
-Measured on the live account: upload.getFile is fastest with NO dc options, and
-concurrency 16 sustained 48 downloads at ~30 ms each with zero FLOOD_WAIT. The
-batch size is what keeps memory sane -- base64 is 33% larger than the bytes, so
-handing 1,400 images across the bridge in one call would mean a ~20 MB string.
+The first version of this file abandoned the whole download on the first
+FLOOD_WAIT: on a busy account that meant 15 photos of 500 and a card that
+cheerfully said DONE. `bot/runner.py::_flood_wait` already says why that is
+wrong -- "a short server-declared pause is an instruction to obey, not a reason
+to abandon the remaining recipients" -- so this now does what the send loop does:
+
+  * a flood is a pause. Wait the seconds the server named (capped by
+    config.MAX_FLOOD_WAIT) and retry the SAME photos.
+  * every flood halves the concurrency, down to a floor of 2. A concurrency that
+    the account will not tolerate is not worth insisting on.
+  * only give up when the server keeps refusing after several rounds, or asks for
+    longer than MAX_FLOOD_WAIT, and then say so plainly instead of pretending the
+    export finished.
+
+Concurrency starts lower than the probe suggested. 16 ran clean on a quiet
+account with 63 photos in one chat; the account with 4,853 photos across 171
+chats refused it almost immediately, because the scan had already spent the
+budget.
 """
 
 from __future__ import annotations
 
+import asyncio
 import base64
 from typing import Awaitable, Callable
 
+from config import config
+
+FLOOR_CONC = 2
+MAX_FLOOD_ROUNDS = 6
+
 
 async def fetch(driver, indexes: list[int], *, target_width: int = 320,
-                conc: int = 16, batch: int = 24,
+                conc: int = 8, batch: int = 24,
                 on_progress: Callable[[int, int], Awaitable[None]] | None = None,
+                on_wait: Callable[[int, int], Awaitable[None]] | None = None,
                 should_stop: Callable[[], bool] | None = None) -> dict:
-    """Return {ok, images, failed, floods, stopped}.
+    """Download every index, waiting out rate limits.
 
-    `images` is aligned with `indexes`: each entry is either a dict with the raw
-    bytes or None when that photo could not be fetched.
+    Returns {ok, images, failed, floods, waited, stopped, gave_up, conc_final}
+    where `images` is a dict keyed by the original index so a caller can tell
+    exactly which photos arrived.
     """
-    out: list[dict | None] = []
-    failed = floods = 0
-    stopped = False
+    got: dict[int, dict] = {}
+    remaining = list(indexes)
     total = len(indexes)
+    failed = floods = waited = rounds = 0
+    stopped = gave_up = False
+    max_wait = int(getattr(config, "MAX_FLOOD_WAIT", 90) or 90)
 
-    for start in range(0, total, batch):
+    stalls = 0
+    while remaining:
         if should_stop is not None and should_stop():
             stopped = True
             break
-        chunk = indexes[start:start + batch]
+
+        before = len(remaining)
+        chunk = remaining[:batch]
         try:
             res = await driver.page.evaluate(
                 "(a) => window.__MKWL_px_fetch(a.idx, a.opts)",
@@ -38,29 +65,77 @@ async def fetch(driver, indexes: list[int], *, target_width: int = 320,
                  "opts": {"targetWidth": target_width, "conc": conc}})
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "code": f"{type(exc).__name__}: {exc}",
-                    "images": out, "failed": failed, "floods": floods}
+                    "images": got, "failed": failed, "floods": floods,
+                    "waited": waited, "conc_final": conc}
         if not res or not res.get("ok"):
             return {"ok": False, "code": (res or {}).get("code", "fetch failed"),
-                    "images": out, "failed": failed, "floods": floods}
+                    "images": got, "failed": failed, "floods": floods,
+                    "waited": waited, "conc_final": conc}
 
-        for item in (res.get("images") or []):
-            if not item or not item.get("b64"):
-                out.append(None)
+        flood_here = False
+        for row in (res.get("results") or []):
+            idx = int(row.get("i"))
+            if row.get("ok") and row.get("b64"):
+                try:
+                    got[idx] = {"bytes": base64.b64decode(row["b64"]),
+                                "w": row.get("w"), "h": row.get("h")}
+                except Exception:  # noqa: BLE001 - a bad image is skipped
+                    failed += 1
+                if idx in remaining:
+                    remaining.remove(idx)
                 continue
-            try:
-                raw = base64.b64decode(item["b64"])
-            except Exception:  # noqa: BLE001 - a bad image is skipped, not fatal
-                out.append(None)
-                failed += 1
+            if row.get("flood"):
+                flood_here = True          # leave it in `remaining` to retry
                 continue
-            out.append({"bytes": raw, "w": item.get("w"), "h": item.get("h")})
+            # A permanent failure for this photo; do not retry it forever.
+            failed += 1
+            if idx in remaining:
+                remaining.remove(idx)
 
-        failed += int(res.get("failed") or 0)
-        floods += int(res.get("floods") or 0)
         if on_progress is not None:
-            await on_progress(len(out), total)
-        if floods:
+            await on_progress(len(got), total)
+
+        if not flood_here:
+            rounds = 0
+            # A round that resolved nothing and was not rate-limited means the
+            # bridge is answering in a shape this code cannot use. Without this
+            # guard the loop would spin forever on the same indexes.
+            if len(remaining) == before:
+                stalls += 1
+                if stalls >= 3:
+                    return {"ok": False, "code": "fetch_stalled",
+                            "detail": "the bridge returned no usable result for "
+                                      "the same photos three times",
+                            "images": got, "failed": failed, "floods": floods,
+                            "waited": waited, "conc_final": conc,
+                            "missing": len(remaining)}
+            else:
+                stalls = 0
+            continue
+
+        # The server asked us to slow down.
+        floods += 1
+        rounds += 1
+        asked = int(res.get("wait") or 0)
+        if asked > max_wait:
+            gave_up = True
+            break
+        if rounds > MAX_FLOOD_ROUNDS:
+            gave_up = True
             break
 
-    return {"ok": True, "images": out, "failed": failed, "floods": floods,
-            "stopped": stopped}
+        pause = asked if asked > 0 else min(max_wait, 5 * rounds)
+        new_conc = max(FLOOR_CONC, conc // 2)
+        if on_wait is not None:
+            await on_wait(pause, new_conc)
+        conc = new_conc
+        try:
+            await asyncio.sleep(pause)
+        except asyncio.CancelledError:
+            stopped = True
+            break
+        waited += pause
+
+    return {"ok": True, "images": got, "failed": failed, "floods": floods,
+            "waited": waited, "stopped": stopped, "gave_up": gave_up,
+            "conc_final": conc, "missing": len(remaining)}

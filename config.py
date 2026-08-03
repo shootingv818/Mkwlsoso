@@ -151,6 +151,10 @@ class Config:
         os.environ.get("MKWL_PHOTO_PER_FILE", "150") or 150)
     # Preferred pixel width; the nearest size Eitaa offers is used (296 or 1080).
     PHOTO_EXPORT_WIDTH: int = int(os.environ.get("MKWL_PHOTO_WIDTH", "320") or 320)
+    # Download concurrency. 16 ran clean on a quiet account but a busy one
+    # rate-limited it immediately, so the default is 8 and the fetcher halves it
+    # on every FLOOD_WAIT down to a floor of 2.
+    PHOTO_EXPORT_CONC: int = int(os.environ.get("MKWL_PHOTO_CONC", "8") or 8)
 
     DATA_DIR: Path = Path(os.environ.get("DATA_DIR", "./data"))
 

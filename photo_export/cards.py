@@ -120,38 +120,71 @@ def progress(*, account: str, phone: str, direction: str, status: str,
 def finished(*, account: str, phone: str, direction: str, photos: int,
              sent_by_me: int, received: int, chats_with_photos: int,
              chats_total: int, files: list[dict], elapsed: float,
-             skipped: int = 0, stopped: bool = False) -> str:
+             skipped: int = 0, stopped: bool = False,
+             partial: bool = False, requested: int = 0,
+             photos_available: int = 0, rate_limited: bool = False,
+             waited: int = 0, note: str | None = None) -> str:
+    """The result card.
+
+    A run the server cut short must NOT say DONE with a full bar. The first
+    version did exactly that -- 15 photos of 500 under a green tick -- so the
+    status, the bar and the footer all follow what actually happened.
+    """
     total_kb = sum(int(f.get("kb") or 0) for f in files)
+    asked = requested or photos
+    if stopped:
+        status, title = "STOPPED", "| \U0001f6d1 - #photos"
+    elif partial:
+        status, title = "PARTIAL", "| \u26a0\ufe0f - #photos"
+    else:
+        status, title = "DONE", "| \u2705 - #photos"
+
     lines = [
         f"--| Phone - {phone}",
         f"\u2022 Mode : {direction}",
-        f"\u2022 Status : {'STOPPED' if stopped else 'DONE'}",
+        f"\u2022 Status : {status}",
         f"\u2022 Chats scanned : {chats_total:,}",
         f"\u2022 Chats with photos : {chats_with_photos:,}",
+    ]
+    if photos_available and photos_available != photos:
+        lines.append(f"\u2022 Photos in chats : {photos_available:,}")
+    if asked and asked != photos:
+        lines.append(f"\u2022 Photos requested : {asked:,}")
+    lines += [
         f"\u2022 Photos exported : {photos:,}",
         f"\u2022 Sent by me : {sent_by_me:,}",
         f"\u2022 Received : {received:,}",
     ]
     if skipped:
-        lines.append(f"\u2022 Skipped : {skipped:,}")
+        lines.append(f"\u2022 Not downloaded : {skipped:,}")
+    if waited:
+        lines.append(f"\u2022 Waited for limits : {waited}s")
     lines += [
         f"\u2022 Files : {len(files)}  ({total_kb:,} KB)",
         f"\u2022 Took : {cards.fmt_duration(elapsed)}",
         "",
-        "\u2022 Overall",
-        pct_bar(1, 1),
+        "\u2022 Exported",
+        # Against what was ASKED for, so a short run reads short.
+        count_bar(photos, asked or photos),
     ]
     for i, f in enumerate(files, start=1):
         lines.append(f"\u2022 {i}. {f.get('name')} - {f.get('pages')} page(s), "
                      f"{f.get('kb')} KB")
-    footer = ("Each photo is on its own page. The files were sent to this chat."
-              if not stopped else
-              "Stopped early -- what had been collected was still exported.")
-    return cards.card(
-        "| \u2705 - #photos" if not stopped else "| \U0001f6d1 - #photos",
-        body="\n".join(lines),
-        footer=footer,
-    )
+    if note:
+        lines += ["", f"\u2022 Note : {cards.sanitize(note, 200)}"]
+
+    if stopped:
+        footer = "Stopped early -- what had been collected was still exported."
+    elif rate_limited and partial:
+        footer = ("Eitaa rate-limited this account, so only part of the list was "
+                  "downloaded. Press Export Photos again to continue -- or lower "
+                  "MKWL_PHOTO_MAX so each run asks for less.")
+    elif partial:
+        footer = ("Some photos could not be downloaded; the rest are in the "
+                  "file(s) above, one photo per page.")
+    else:
+        footer = "Each photo is on its own page. The files were sent to this chat."
+    return cards.card(title, body="\n".join(lines), footer=footer)
 
 
 def nothing_found(*, account: str, phone: str, direction: str,

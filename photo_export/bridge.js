@@ -209,6 +209,11 @@
       return s[0];
     }
 
+    function floodSeconds(s) {
+      const m = S(s).match(/(?:FLOOD_WAIT_|WAIT_)(\d+)/i);
+      return m ? parseInt(m[1], 10) : null;
+    }
+
     async function grab(item) {
       const p = item.photo;
       const sz = pickSize(p);
@@ -227,7 +232,8 @@
             offset: off, limit: CHUNK });
         } catch (e) {
           const c = errStr(e);
-          return { ok: false, code: c, flood: isFlood(c) };
+          return { ok: false, code: c, flood: isFlood(c),
+                   wait: floodSeconds(c) };
         }
         const b = r && r.bytes;
         const u8 = b ? new Uint8Array(b) : new Uint8Array(0);
@@ -250,23 +256,45 @@
       return { ok: true, b64: btoa(s), bytes: total, w: sz.w, h: sz.h };
     }
 
-    const items = indexes.map(i => ST.photos[i]).filter(Boolean);
-    const out = [];
-    let floods = 0, failed = 0;
-    for (let i = 0; i < items.length; i += conc) {
-      const batch = items.slice(i, i + conc);
-      const rs = await Promise.all(batch.map(it =>
-        grab(it).catch(e => ({ ok: false, code: errStr(e) }))));
+    // Results stay ALIGNED WITH `indexes` and carry the index back, so Python
+    // can retry exactly the ones the server refused instead of throwing the
+    // whole remaining list away.
+    const results = [];
+    let floods = 0, failed = 0, maxWait = 0;
+    for (let i = 0; i < indexes.length; i += conc) {
+      const slice = indexes.slice(i, i + conc);
+      const rs = await Promise.all(slice.map(async (idx) => {
+        const it = ST.photos[idx];
+        if (!it) return { i: idx, ok: false, code: 'no such photo' };
+        try {
+          const r = await grab(it);
+          return Object.assign({ i: idx }, r);
+        } catch (e) {
+          const c = errStr(e);
+          return { i: idx, ok: false, code: c, flood: isFlood(c),
+                   wait: floodSeconds(c) };
+        }
+      }));
+      let hitFlood = false;
       for (const r of rs) {
-        if (r.ok) { out.push({ b64: r.b64, bytes: r.bytes, w: r.w, h: r.h }); }
-        else {
+        if (r.ok) {
+          results.push({ i: r.i, ok: true, b64: r.b64, bytes: r.bytes,
+                         w: r.w, h: r.h });
+        } else {
           failed++;
-          if (r.flood) floods++;
-          out.push(null);
+          results.push({ i: r.i, ok: false, code: r.code || 'failed',
+                         flood: !!r.flood, wait: r.wait || 0 });
+          if (r.flood) {
+            floods++; hitFlood = true;
+            if (r.wait && r.wait > maxWait) maxWait = r.wait;
+          }
         }
       }
-      if (floods) break;
+      // Stop THIS call on a flood so Python can wait and come back; the
+      // untouched indexes are simply absent from `results`.
+      if (hitFlood) break;
     }
-    return { ok: true, images: out, failed: failed, floods: floods };
+    return { ok: true, results: results, failed: failed, floods: floods,
+             wait: maxWait };
   };
 })();

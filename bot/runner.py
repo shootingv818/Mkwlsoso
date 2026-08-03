@@ -802,7 +802,13 @@ class JobManager:
                 files=res.get("files") or [],
                 elapsed=res.get("elapsed") or 0.0,
                 skipped=res.get("skipped") or 0,
-                stopped=bool(res.get("stopped"))))
+                stopped=bool(res.get("stopped")),
+                partial=bool(res.get("partial")),
+                requested=res.get("requested") or 0,
+                photos_available=res.get("photos_available") or 0,
+                rate_limited=bool(res.get("rate_limited")),
+                waited=res.get("waited") or 0,
+                note=res.get("note")))
         except Exception as exc:  # noqa: BLE001
             await report(cards.error_card("photo_export", account,
                                           code=type(exc).__name__,

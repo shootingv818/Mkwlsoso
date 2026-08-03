@@ -96,11 +96,18 @@ class FakePage:
     """
 
     def __init__(self, chats: list[dict], *, first_page: int = 25,
-                 page_size: int = 100, search_limit: int = 100) -> None:
+                 page_size: int = 100, search_limit: int = 100,
+                 flood_after: int | None = None, flood_rounds: int = 0,
+                 fail_indexes: set | None = None) -> None:
         self.chats = chats
         self.first_page = first_page
         self.page_size = page_size
         self.search_limit = search_limit
+        self.flood_after = flood_after
+        self.flood_rounds = flood_rounds
+        self.floods_served = 0
+        self.served = 0
+        self.fail_indexes = fail_indexes or set()
         self.bridge_injected = False
         self.dialog_pages: list[int] = []
         self.search_calls = 0
@@ -175,12 +182,39 @@ class FakePage:
                 "done": (frm + count) >= len(self._peers)}
 
     def _fetch(self, arg):
+        """Answer in the bridge's real shape: one aligned row per index.
+
+        `flood_after` makes the fake behave like a rate-limited account: the
+        first N downloads succeed, then FLOOD_WAIT until `flood_rounds` pauses
+        have been served, after which it recovers. That is what the live account
+        did, and the first version of the fetcher gave up on it.
+        """
         self.fetch_calls += 1
         idx = arg.get("idx") or []
         b64 = base64.b64encode(_JPEG_1PX).decode("ascii")
-        return {"ok": True, "failed": 0, "floods": 0,
-                "images": [{"b64": b64, "bytes": len(_JPEG_1PX),
-                            "w": 296, "h": 320} for _ in idx]}
+        rows = []
+        floods = 0
+        for i in idx:
+            limited = (self.flood_after is not None
+                       and self.served >= self.flood_after
+                       and self.floods_served < self.flood_rounds)
+            if limited:
+                floods += 1
+                self.floods_served += 1
+                rows.append({"i": i, "ok": False, "code": "FLOOD_WAIT_1",
+                             "flood": True, "wait": 1})
+                break                      # the bridge stops the call on a flood
+            if i in self.fail_indexes:
+                rows.append({"i": i, "ok": False, "code": "empty",
+                             "flood": False, "wait": 0})
+                continue
+            self.served += 1
+            rows.append({"i": i, "ok": True, "b64": b64,
+                         "bytes": len(_JPEG_1PX), "w": 296, "h": 320})
+        return {"ok": True, "results": rows,
+                "failed": sum(1 for r in rows if not r.get("ok")),
+                "floods": floods,
+                "wait": 1 if floods else 0}
 
 
 class FakeDriver:
@@ -355,13 +389,87 @@ def test_fetch() -> None:
     res = run(fetcher.fetch(drv, list(range(50)), batch=10,
                             on_progress=on_progress))
     check("fetch reports ok", res.get("ok") is True, str(res.get("code")))
-    imgs = [i for i in (res.get("images") or []) if i]
+    imgs = res.get("images") or {}
     check("every image came back", len(imgs) == 50, str(len(imgs)))
+    check("results are keyed by the original index",
+          set(imgs.keys()) == set(range(50)))
     check("bytes were decoded from base64",
-          all(isinstance(i["bytes"], bytes) and i["bytes"] for i in imgs))
+          all(isinstance(v["bytes"], bytes) and v["bytes"] for v in imgs.values()))
     check("it really batched", page.fetch_calls == 5,
           f"{page.fetch_calls} calls for 50 photos at batch=10")
     check("progress was reported", len(prog) == 5, str(prog))
+
+
+def test_fetch_flood_recovers() -> None:
+    print("\n6b) a rate limit is a pause, not the end")
+    chats = make_chats(1, {0: 40})
+    # 10 succeed, then three FLOOD_WAIT_1 answers, then it recovers.
+    page = FakePage(chats, flood_after=10, flood_rounds=3)
+    drv = FakeDriver(page)
+    run(scanner.ensure_bridge(drv))
+    run(scanner.list_chats(drv))
+    run(scanner.scan(drv, total_chats=1, slice_size=1))
+
+    waits: list[tuple[int, int]] = []
+
+    async def on_wait(seconds, new_conc):
+        waits.append((seconds, new_conc))
+
+    res = run(fetcher.fetch(drv, list(range(40)), batch=10, conc=8,
+                            on_wait=on_wait))
+    check("fetch still reports ok", res.get("ok") is True, str(res.get("code")))
+    check("it did NOT give up", res.get("gave_up") is False, str(res.get("gave_up")))
+    check("every photo arrived after the pauses",
+          len(res.get("images") or {}) == 40,
+          f"{len(res.get('images') or {})} of 40")
+    check("it waited at least once", len(waits) >= 1, str(waits))
+    check("it waited the seconds the server named",
+          all(w[0] == 1 for w in waits), str(waits))
+    check("concurrency was reduced", res.get("conc_final", 8) < 8,
+          f"ended at {res.get('conc_final')}")
+    check("the wait was accounted for", (res.get("waited") or 0) >= 1,
+          str(res.get("waited")))
+
+
+def test_fetch_gives_up_loudly() -> None:
+    print("\n6c) a server that never relents -> partial, never a fake DONE")
+    chats = make_chats(1, {0: 40})
+    page = FakePage(chats, flood_after=5, flood_rounds=10_000)
+    drv = FakeDriver(page)
+    run(scanner.ensure_bridge(drv))
+    run(scanner.list_chats(drv))
+    run(scanner.scan(drv, total_chats=1, slice_size=1))
+    res = run(fetcher.fetch(drv, list(range(40)), batch=10, conc=8))
+    check("it reports ok with a partial result", res.get("ok") is True)
+    check("gave_up is set", res.get("gave_up") is True, str(res.get("gave_up")))
+    got = len(res.get("images") or {})
+    check("what was fetched is kept", 0 < got < 40, f"{got} of 40")
+    check("the remainder is counted", (res.get("missing") or 0) > 0,
+          str(res.get("missing")))
+
+
+def test_fetch_stall_guard() -> None:
+    print("\n6d) a bridge answering nonsense must not spin forever")
+
+    class MutePage(FakePage):
+        def _fetch(self, arg):
+            self.fetch_calls += 1
+            return {"ok": True, "results": [], "failed": 0, "floods": 0,
+                    "wait": 0}
+
+    chats = make_chats(1, {0: 10})
+    page = MutePage(chats)
+    drv = FakeDriver(page)
+    run(scanner.ensure_bridge(drv))
+    run(scanner.list_chats(drv))
+    run(scanner.scan(drv, total_chats=1, slice_size=1))
+    res = run(fetcher.fetch(drv, list(range(10)), batch=5))
+    check("it bails out instead of looping", res.get("ok") is False,
+          str(res.get("ok")))
+    check("the reason is explicit", res.get("code") == "fetch_stalled",
+          str(res.get("code")))
+    check("it gave up quickly", page.fetch_calls <= 5,
+          f"{page.fetch_calls} calls")
 
 
 def test_fetch_stop() -> None:
@@ -381,7 +489,7 @@ def test_fetch_stop() -> None:
     res = run(fetcher.fetch(drv, list(range(100)), batch=10,
                             should_stop=should_stop))
     check("stop is honoured", res.get("stopped") is True, str(res.get("stopped")))
-    got = len([i for i in (res.get("images") or []) if i])
+    got = len(res.get("images") or {})
     check("only what was fetched is kept", 0 < got < 100, str(got))
 
 
@@ -443,6 +551,38 @@ def test_pdf() -> None:
 # --------------------------------------------------------------------------
 # 9. the whole engine end to end
 # --------------------------------------------------------------------------
+
+def test_partial_card() -> None:
+    print("\n7b) the result card must not fake a DONE")
+    short = px_cards.finished(
+        account="989213725238", phone="989213725238", direction="both",
+        photos=15, sent_by_me=7, received=8, chats_with_photos=171,
+        chats_total=429, files=[{"name": "a.pdf", "pages": 15, "kb": 191}],
+        elapsed=67.0, skipped=485, partial=True, requested=500,
+        photos_available=4853, rate_limited=True, waited=12,
+        note="Eitaa kept rate-limiting")
+    check("status says PARTIAL, not DONE", "\u2022 Status : PARTIAL" in short)
+    check("the title is not a green tick", "\u2705" not in short)
+    check("the bar is NOT full",
+          "[" + "\u2588" * 10 + "]" not in short.split("Exported")[1][:40],
+          short.split("Exported")[1][:40])
+    check("it shows what was asked for", "Photos requested : 500" in short)
+    check("it shows what exists", "Photos in chats : 4,853" in short)
+    check("it names the shortfall", "Not downloaded : 485" in short)
+    check("it reports the waiting", "Waited for limits : 12s" in short)
+    check("the footer tells the owner what to do",
+          "again" in short.lower())
+
+    full = px_cards.finished(
+        account="a", phone="9890", direction="both", photos=20, sent_by_me=10,
+        received=10, chats_with_photos=3, chats_total=30,
+        files=[{"name": "a.pdf", "pages": 20, "kb": 50}], elapsed=5.0,
+        skipped=0, partial=False, requested=20)
+    check("a complete run does say DONE", "\u2022 Status : DONE" in full)
+    check("a complete run gets the tick", "\u2705" in full)
+    check("a complete run fills the bar",
+          "[" + "\u2588" * 10 + "]" in full)
+
 
 def test_engine() -> None:
     print("\n9) the engine end to end")
@@ -539,7 +679,11 @@ def main() -> int:
         test_paging_beyond_one_page()
         test_select()
         test_fetch()
+        test_fetch_flood_recovers()
+        test_fetch_gives_up_loudly()
+        test_fetch_stall_guard()
         test_fetch_stop()
+        test_partial_card()
         test_pdf()
         test_engine()
         test_engine_nothing_found()
