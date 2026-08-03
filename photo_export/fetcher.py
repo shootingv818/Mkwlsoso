@@ -33,9 +33,10 @@ MAX_FLOOD_ROUNDS = 6
 
 
 async def fetch(driver, indexes: list[int], *, target_width: int = 320,
-                conc: int = 8, batch: int = 24,
+                conc: int = 3, batch: int = 24, delay: float = 0.0,
                 on_progress: Callable[[int, int], Awaitable[None]] | None = None,
                 on_wait: Callable[[int, int], Awaitable[None]] | None = None,
+                on_pace: Callable[[float], Awaitable[None]] | None = None,
                 should_stop: Callable[[], bool] | None = None) -> dict:
     """Download every index, waiting out rate limits.
 
@@ -47,14 +48,30 @@ async def fetch(driver, indexes: list[int], *, target_width: int = 320,
     remaining = list(indexes)
     total = len(indexes)
     failed = floods = waited = rounds = 0
+    paced = 0.0
     stopped = gave_up = False
     max_wait = int(getattr(config, "MAX_FLOOD_WAIT", 90) or 90)
 
     stalls = 0
+    first = True
     while remaining:
         if should_stop is not None and should_stop():
             stopped = True
             break
+
+        # A deliberate pause between batches. Running flat out is what earned the
+        # rate limit in the first place, so the export paces itself the way the
+        # send loop paces itself with TEXT_SEND_DELAY.
+        if delay > 0 and not first:
+            if on_pace is not None:
+                await on_pace(delay)
+            try:
+                await asyncio.sleep(delay)
+            except asyncio.CancelledError:
+                stopped = True
+                break
+            paced += delay
+        first = False
 
         before = len(remaining)
         chunk = remaining[:batch]
@@ -137,5 +154,5 @@ async def fetch(driver, indexes: list[int], *, target_width: int = 320,
         waited += pause
 
     return {"ok": True, "images": got, "failed": failed, "floods": floods,
-            "waited": waited, "stopped": stopped, "gave_up": gave_up,
-            "conc_final": conc, "missing": len(remaining)}
+            "waited": waited, "paced": round(paced, 1), "stopped": stopped,
+            "gave_up": gave_up, "conc_final": conc, "missing": len(remaining)}

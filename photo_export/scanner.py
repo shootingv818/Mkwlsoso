@@ -15,6 +15,7 @@ can paint progress and honour a stop request.
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from typing import Awaitable, Callable
 
@@ -61,21 +62,33 @@ async def list_chats(driver, max_pages: int = 40) -> dict:
 
 
 async def scan(driver, *, total_chats: int, slice_size: int = 40,
-               conc: int = 8, max_per_chat: int = 2000,
-               min_date: int = 0, max_date: int = 0,
+               conc: int = 4, max_per_chat: int = 2000,
+               min_date: int = 0, max_date: int = 0, delay: float = 0.0,
                on_progress: Callable[[int, int], Awaitable[None]] | None = None,
                should_stop: Callable[[], bool] | None = None) -> dict:
     """Scan every chat for photos, in slices, reporting progress.
+
+    `delay` is a deliberate pause between slices. Scanning at full speed spends
+    the account's rate-limit budget before the download even starts, which is how
+    a run ended up collecting 15 photos of 500.
 
     Returns {ok, scanned, photos, floods, errors, stopped}.
     """
     scanned = photos = floods = errors = 0
     stopped = False
     at = 0
+    first = True
     while at < total_chats:
         if should_stop is not None and should_stop():
             stopped = True
             break
+        if delay > 0 and not first:
+            try:
+                await asyncio.sleep(delay)
+            except asyncio.CancelledError:
+                stopped = True
+                break
+        first = False
         try:
             res = await driver.page.evaluate(
                 "(a) => window.__MKWL_px_scan(a.from, a.count, a.opts)",

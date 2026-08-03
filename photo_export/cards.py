@@ -66,7 +66,8 @@ def progress(*, account: str, phone: str, direction: str, status: str,
              photos_found: int = 0, photos_target: int = 0,
              downloaded: int = 0, pages_built: int = 0, pages_total: int = 0,
              files_sent: int = 0, files_total: int = 0,
-             elapsed: float = 0.0, note: str | None = None) -> str:
+             elapsed: float = 0.0, note: str | None = None,
+             pace: str | None = None) -> str:
     """The live card. Every stage keeps its own bar so nothing looks stuck."""
     dir_label = {"sent": "sent by me", "received": "received",
                  "both": "sent + received"}.get(direction, direction)
@@ -89,6 +90,18 @@ def progress(*, account: str, phone: str, direction: str, status: str,
         f"\u2022 Chats : {chats_scanned:,} / {chats_total:,}",
         f"\u2022 Photos : {photos_found:,}",
         f"\u2022 Elapsed : {cards.fmt_duration(elapsed)}",
+    ]
+    # A paced run can sit still for seconds at a time; an ETA is what tells the
+    # owner it is working rather than wedged.
+    if photos_target and downloaded:
+        lines.append(f"\u2022 Remaining : ~"
+                     f"{cards.eta(downloaded, photos_target, elapsed)}")
+    elif chats_total and chats_scanned:
+        lines.append(f"\u2022 Remaining : ~"
+                     f"{cards.eta(chats_scanned, chats_total, elapsed)}")
+    if pace:
+        lines.append(f"\u2022 Pace : {pace}")
+    lines += [
         "",
         "\u2022 Overall",
         pct_bar(int(overall * 1000), 1000),

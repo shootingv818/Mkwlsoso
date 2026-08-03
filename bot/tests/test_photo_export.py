@@ -34,6 +34,11 @@ _TMP = tempfile.mkdtemp(prefix="mkwl_photo_test_")
 os.environ["DATA_DIR"] = os.path.join(_TMP, "data")
 os.environ["PROFILES_DIR"] = os.path.join(_TMP, "profiles")
 os.environ["ARTIFACTS_DIR"] = os.path.join(_TMP, "artifacts")
+# The engine reads its pacing from config at import time and the real defaults
+# are seconds long on purpose. Zero them so the suite is fast AND deterministic;
+# pacing itself is tested directly, with explicit delays.
+os.environ["MKWL_PHOTO_DELAY"] = "0"
+os.environ["MKWL_PHOTO_SCAN_DELAY"] = "0"
 
 
 def _stub_playwright_module() -> None:
@@ -552,6 +557,63 @@ def test_pdf() -> None:
 # 9. the whole engine end to end
 # --------------------------------------------------------------------------
 
+def test_pacing() -> None:
+    print("\n7c) deliberate pacing between batches and slices")
+    import time as _time
+
+    # -- the scan pauses between slices -------------------------------
+    chats = make_chats(12, {})
+    page = FakePage(chats)
+    drv = FakeDriver(page)
+    run(scanner.ensure_bridge(drv))
+    run(scanner.list_chats(drv))
+    t0 = _time.time()
+    res = run(scanner.scan(drv, total_chats=12, slice_size=4, delay=0.05))
+    slow = _time.time() - t0
+    check("the scan still completes", res.get("scanned") == 12,
+          str(res.get("scanned")))
+    # 3 slices -> 2 pauses.
+    check("the scan actually paused between slices", slow >= 0.09,
+          f"{slow:.3f}s for 2 pauses of 0.05s")
+
+    t0 = _time.time()
+    run(scanner.scan(drv, total_chats=12, slice_size=4, delay=0))
+    fast = _time.time() - t0
+    check("delay=0 does not pause", fast < slow, f"{fast:.3f}s vs {slow:.3f}s")
+
+    # -- the download pauses between batches --------------------------
+    chats = make_chats(1, {0: 30})
+    page = FakePage(chats)
+    drv = FakeDriver(page)
+    run(scanner.ensure_bridge(drv))
+    run(scanner.list_chats(drv))
+    run(scanner.scan(drv, total_chats=1, slice_size=1))
+
+    paces: list[float] = []
+
+    async def on_pace(seconds):
+        paces.append(seconds)
+
+    t0 = _time.time()
+    res = run(fetcher.fetch(drv, list(range(30)), batch=10, conc=3,
+                            delay=0.05, on_pace=on_pace))
+    took = _time.time() - t0
+    check("every photo still arrives", len(res.get("images") or {}) == 30,
+          str(len(res.get("images") or {})))
+    # 3 batches -> 2 pauses.
+    check("it paused between batches", took >= 0.09,
+          f"{took:.3f}s for 2 pauses of 0.05s")
+    check("the card was told about the pause", len(paces) == 2, str(paces))
+    check("the pause is accounted for", (res.get("paced") or 0) > 0,
+          str(res.get("paced")))
+
+    t0 = _time.time()
+    run(fetcher.fetch(drv, list(range(30)), batch=10, conc=3, delay=0))
+    quick = _time.time() - t0
+    check("delay=0 downloads without pausing", quick < took,
+          f"{quick:.3f}s vs {took:.3f}s")
+
+
 def test_partial_card() -> None:
     print("\n7b) the result card must not fake a DONE")
     short = px_cards.finished(
@@ -683,6 +745,7 @@ def main() -> int:
         test_fetch_gives_up_loudly()
         test_fetch_stall_guard()
         test_fetch_stop()
+        test_pacing()
         test_partial_card()
         test_pdf()
         test_engine()

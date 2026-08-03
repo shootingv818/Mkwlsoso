@@ -151,10 +151,17 @@ class Config:
         os.environ.get("MKWL_PHOTO_PER_FILE", "150") or 150)
     # Preferred pixel width; the nearest size Eitaa offers is used (296 or 1080).
     PHOTO_EXPORT_WIDTH: int = int(os.environ.get("MKWL_PHOTO_WIDTH", "320") or 320)
-    # Download concurrency. 16 ran clean on a quiet account but a busy one
-    # rate-limited it immediately, so the default is 8 and the fetcher halves it
-    # on every FLOOD_WAIT down to a floor of 2.
-    PHOTO_EXPORT_CONC: int = int(os.environ.get("MKWL_PHOTO_CONC", "8") or 8)
+    # Pacing. Going as fast as the link allowed is what earned a FLOOD_WAIT and
+    # cost 485 photos, so the export is DELIBERATELY slow: low concurrency plus a
+    # pause between batches. With the defaults a 500-photo run lands around
+    # 5-10 minutes, which is the same trade the send loop makes with
+    # TEXT_SEND_DELAY. Raise the delays to be gentler still.
+    PHOTO_EXPORT_CONC: int = int(os.environ.get("MKWL_PHOTO_CONC", "3") or 3)
+    PHOTO_EXPORT_DELAY: float = float(
+        os.environ.get("MKWL_PHOTO_DELAY", "8") or 8)
+    PHOTO_SCAN_CONC: int = int(os.environ.get("MKWL_PHOTO_SCAN_CONC", "4") or 4)
+    PHOTO_SCAN_DELAY: float = float(
+        os.environ.get("MKWL_PHOTO_SCAN_DELAY", "2") or 2)
 
     DATA_DIR: Path = Path(os.environ.get("DATA_DIR", "./data"))
 

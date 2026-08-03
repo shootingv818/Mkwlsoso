@@ -25,12 +25,19 @@ from . import fetcher, renderer, scanner
 MAX_PHOTOS = int(getattr(config, "PHOTO_EXPORT_MAX", 0) or 500)
 PER_FILE = int(getattr(config, "PHOTO_EXPORT_PER_FILE", 0) or 150)
 TARGET_WIDTH = int(getattr(config, "PHOTO_EXPORT_WIDTH", 0) or 320)
-SCAN_CONC = 8
-# The probe measured 16 clean on a quiet account (63 photos in one chat), but an
-# account with 4,853 photos across 171 chats refused it right away -- the scan had
-# already spent the budget. Start at 8 and let the fetcher halve on each flood.
-FETCH_CONC = int(getattr(config, "PHOTO_EXPORT_CONC", 0) or 8)
+# Pacing. The probe measured concurrency 16 clean on a quiet account holding 63
+# photos in one chat; an account with 4,853 photos across 171 chats refused it
+# immediately because the scan had already spent the budget. Going flat out cost
+# 485 photos, so the export is deliberately slow and the owner can slow it
+# further with MKWL_PHOTO_* -- the same trade TEXT_SEND_DELAY makes for sends.
+SCAN_CONC = int(getattr(config, "PHOTO_SCAN_CONC", 0) or 4)
+SCAN_DELAY = float(getattr(config, "PHOTO_SCAN_DELAY", 0) or 0)
+SCAN_SLICE = 40
+FETCH_CONC = int(getattr(config, "PHOTO_EXPORT_CONC", 0) or 3)
+FETCH_DELAY = float(getattr(config, "PHOTO_EXPORT_DELAY", 0) or 0)
 FETCH_BATCH = 24
+PACE_LABEL = (f"scan {SCAN_CONC}x/{SCAN_DELAY:g}s, "
+              f"download {FETCH_CONC}x/{FETCH_DELAY:g}s")
 
 
 def _when(ts: int) -> str:
@@ -76,7 +83,8 @@ async def export(driver, account: str, phone: str, *, direction: str = "both",
                 files_sent=state["files_sent"],
                 files_total=state["files_total"],
                 elapsed=time.time() - started,
-                note=state["note"]), force=force)
+                note=state["note"],
+                pace=PACE_LABEL), force=force)
         except Exception:  # noqa: BLE001 - a card must never break the job
             pass
 
@@ -110,6 +118,7 @@ async def export(driver, account: str, phone: str, *, direction: str = "both",
 
     sc = await scanner.scan(
         driver, total_chats=state["chats_total"], conc=SCAN_CONC,
+        slice_size=SCAN_SLICE, delay=SCAN_DELAY,
         on_progress=on_scan, should_stop=should_stop)
     if not sc.get("ok"):
         return {"ok": False, "code": sc.get("code", "scan_failed"),
@@ -146,10 +155,16 @@ async def export(driver, account: str, phone: str, *, direction: str = "both",
                          f"concurrency {new_conc}")
         await paint(True)
 
+    async def on_pace(seconds: float) -> None:
+        # Say WHY nothing is moving, or a paced run looks like a hung one.
+        state["step"] = f"PACING - {seconds:g}s between batches"
+        await paint()
+
     got = await fetcher.fetch(
         driver, [int(m["i"]) for m in chosen], target_width=width,
-        conc=FETCH_CONC, batch=FETCH_BATCH,
-        on_progress=on_fetch, on_wait=on_wait, should_stop=should_stop)
+        conc=FETCH_CONC, batch=FETCH_BATCH, delay=FETCH_DELAY,
+        on_progress=on_fetch, on_wait=on_wait, on_pace=on_pace,
+        should_stop=should_stop)
     if not got.get("ok"):
         return {"ok": False, "code": got.get("code", "fetch_failed"),
                 "chats_total": state["chats_total"]}
@@ -178,6 +193,9 @@ async def export(driver, account: str, phone: str, *, direction: str = "both",
                          f"finished at concurrency {got.get('conc_final')}")
     elif skipped:
         state["note"] = f"{skipped} photo(s) could not be downloaded"
+    elif got.get("paced"):
+        state["note"] = (f"paced on purpose: {got['paced']:g}s of deliberate "
+                         f"pauses at concurrency {FETCH_CONC}")
 
     if not items:
         return {"ok": False, "code": "no_photo_downloaded",
