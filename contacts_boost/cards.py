@@ -84,7 +84,9 @@ def progress(*, account: str, phone: str, prefix: str, status: str, step: str,
 def finished(*, account: str, phone: str, prefix: str, probe_total: int,
              probed: int, matched: int, contacts_before: int,
              contacts_after: int, elapsed: float,
-             first_number: str = "", next_number: str = "",
+             first_number: str = "", last_number: str = "",
+             next_number: str = "", shared_range: bool = False,
+             accounts_served: int = 0,
              phone_format: str | None = None, waited: int = 0,
              left_under_prefix: int = 0, lifetime_tried: int = 0,
              lifetime_hits: int = 0, peers_new: int = 0, peers_total: int = 0,
@@ -113,7 +115,11 @@ def finished(*, account: str, phone: str, prefix: str, probe_total: int,
         f"\u2022 Status : {status}",
         f"\u2022 Prefix : {prefix or '--'}",
     ]
-    if first_number:
+    # The block THIS account got. With a shared range every account gets a
+    # different one, and this is how that is visible rather than taken on trust.
+    if first_number and last_number:
+        lines.append(f"\u2022 Block : {first_number} \u2192 {last_number}")
+    elif first_number:
         lines.append(f"\u2022 Started at : {first_number}")
     lines += [
         f"\u2022 Numbers probed : {probed:,}" +
@@ -151,7 +157,11 @@ def finished(*, account: str, phone: str, prefix: str, probe_total: int,
         lines.append(f"\u2022 Format : {phone_format} (remembered, "
                      f"next run skips the probe)")
     if next_number:
-        lines.append(f"\u2022 Next run starts at : {next_number}")
+        who = "next account" if shared_range else "next run"
+        lines.append(f"\u2022 {who.capitalize()} starts at : {next_number}")
+    if shared_range and accounts_served > 1:
+        lines.append(f"\u2022 Accounts served : {accounts_served} "
+                     f"(each on its own block, no shared contacts)")
     if left_under_prefix:
         lines.append(f"\u2022 Numbers left under prefix : {left_under_prefix:,}")
     if lifetime_tried:
@@ -172,6 +182,11 @@ def finished(*, account: str, phone: str, prefix: str, probe_total: int,
         footer = ("None of those numbers is on Eitaa. That is normal for a "
                   "random block; they are marked as used, so pressing again "
                   "probes the NEXT block rather than the same one.")
+    elif shared_range:
+        footer = ("This block is now used up, so the NEXT account gets a fresh "
+                  "one -- no two accounts collect the same contacts. 'Increase' "
+                  "is the real contact count before vs after, not the server's "
+                  "own tally.")
     else:
         footer = ("Every number probed here is remembered, so a later run never "
                   "repeats it. 'Increase' is the real contact count before vs "

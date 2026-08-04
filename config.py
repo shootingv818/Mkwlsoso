@@ -151,6 +151,11 @@ class Config:
     BOOST_PREFIX: str = os.environ.get("MKWL_BOOST_PREFIX", "")
     BOOST_PROBE: int = _get_int("MKWL_BOOST_PROBE", 400)
     BOOST_BATCH: int = _get_int("MKWL_BOOST_BATCH", 50)
+    # Accounts share ONE position per prefix, so each account reserves the NEXT
+    # unused block and no two accounts end up with the same contacts. 0 restores
+    # the per-account position, where every account starts at the beginning of
+    # the prefix and they all collect an identical contact list.
+    BOOST_SHARED_RANGE: bool = _get_bool("MKWL_BOOST_SHARED_RANGE", True)
     # Photo export (isolated, see photo_export/). Read-only on Eitaa: it walks
     # the private chats, searches each for photos, and renders them to PDF with
     # ONE PHOTO PER PAGE. Measured rates: ~55 ms per chat scanned at

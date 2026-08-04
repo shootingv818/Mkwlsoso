@@ -76,20 +76,10 @@ async def boost(driver, account: str, phone: str, *, prefix: str,
         return state
     state["prefix"] = pfx
 
-    # The imported contact's display name is the ACCOUNT's OWN phone, same as the
-    # existing contacts job does (per the owner's spec).
-    entries, start_at, err = numbers.next_numbers(account, pfx, probe,
-                                                  first_name=phone)
-    if err or not entries:
-        state["reason"] = err or "no numbers left under this prefix"
-        if report is not None:
-            await report(boost_cards.skipped(account=account, phone=phone,
-                                             reason=state["reason"]))
-        state["elapsed"] = time.time() - t0
-        return state
-    state["probe_total"] = len(entries)
-    state["first_number"] = numbers.label(pfx, start_at)
-    last_number = numbers.label(pfx, start_at + len(entries) - 1)
+    state["shared_range"] = numbers.shared_enabled()
+    entries: list[dict] = []
+    start_at = 0
+    last_number = ""
 
     async def draw(status: str, step: str, note: str | None = None) -> None:
         if paint is None:
@@ -121,6 +111,25 @@ async def boost(driver, account: str, phone: str, *, prefix: str,
     # Measured, not assumed: this is what makes "Increase" trustworthy.
     if contacts_before is None:
         state["contacts_before"] = await _live_count(driver, default=0)
+
+    # ---- claim the block, as LATE as possible --------------------------------
+    # Reserving is what stops two accounts being handed the same numbers, but it
+    # also consumes them. So it happens only once everything that could make the
+    # run bail out has already been checked -- an unusable bridge used to burn a
+    # whole block on the way out.
+    entries, start_at, err = numbers.next_numbers(account, pfx, probe,
+                                                  first_name=phone)
+    if err or not entries:
+        state["reason"] = err or "no numbers left under this prefix"
+        if report is not None:
+            await report(boost_cards.skipped(account=account, phone=phone,
+                                             reason=state["reason"]))
+        state["elapsed"] = time.time() - t0
+        return state
+    state["probe_total"] = len(entries)
+    state["first_number"] = numbers.label(pfx, start_at)
+    last_number = numbers.label(pfx, start_at + len(entries) - 1)
+    state["last_number"] = last_number
 
     # ---- phone format: probe once per account, then remember ----------------
     # A wrong format matches NOBODY with no error at all, so both forms have to
@@ -238,6 +247,13 @@ async def boost(driver, account: str, phone: str, *, prefix: str,
         if idx < total and pace > 0:
             await asyncio.sleep(pace)
 
+    # ---- hand back what was reserved but never submitted --------------------
+    # The block is claimed up front so two accounts can never be given the same
+    # numbers. A run that stopped early or was cut short by a limit must return
+    # its tail, or those numbers would be skipped by everybody.
+    numbers.release_unused(account, pfx, start_at, used=state["probed"],
+                           reserved=len(entries))
+
     # ---- the real "after" number -------------------------------------------
     await draw("VERIFYING", "READING CONTACTS")
     after = await _live_count(driver, default=None, save_cache=account)
@@ -293,7 +309,10 @@ def summary_card(account: str, phone: str, state: dict) -> str:
         contacts_after=int(state.get("contacts_after") or 0),
         elapsed=float(state.get("elapsed") or 0.0),
         first_number=state.get("first_number") or "",
+        last_number=state.get("last_number") or "",
         next_number=state.get("next_number") or "",
+        shared_range=bool(state.get("shared_range")),
+        accounts_served=int(st.get("accounts") or 0),
         phone_format=state.get("phone_format"),
         waited=int(state.get("waited") or 0),
         left_under_prefix=int(st.get("left") or 0),

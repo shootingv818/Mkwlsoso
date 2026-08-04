@@ -76,9 +76,19 @@ def run(coro):
 
 
 def fresh(account: str = "acct") -> str:
-    """A clean account name so each test starts with no memory."""
+    """A clean account name so each test starts with no memory.
+
+    The SHARED position is wiped too, otherwise one test's blocks would push the
+    next test's starting point and the assertions would drift.
+    """
     numbers.forget(account)
     contacts_store.forget(account)
+    try:
+        p = numbers.shared_path()
+        if p.is_file():
+            p.unlink()
+    except OSError:
+        pass
     return account
 
 
@@ -178,6 +188,112 @@ def test_prefix_validation():
           numbers.capacity("091646") == 100_000)
 
 
+def wipe_shared() -> None:
+    p = numbers.shared_path()
+    try:
+        if p.is_file():
+            p.unlink()
+    except OSError:
+        pass
+
+
+def test_each_account_gets_a_DIFFERENT_block():
+    print("\nevery account gets its OWN block -- no two collect the same people")
+    wipe_shared()
+    for a in ("acc1", "acc2", "acc3"):
+        numbers.forget(a)
+    got = {}
+    for a in ("acc1", "acc2", "acc3"):
+        entries, start, err = numbers.next_numbers(a, "0913151", 400)
+        check(f"{a} got a block", len(entries) == 400 and err is None, str(err))
+        got[a] = (start, {e["phone"] for e in entries})
+    check("account 1 starts at 0", got["acc1"][0] == 0, str(got["acc1"][0]))
+    check("account 2 starts at 400", got["acc2"][0] == 400, str(got["acc2"][0]))
+    check("account 3 starts at 800", got["acc3"][0] == 800, str(got["acc3"][0]))
+    a1, a2, a3 = (got[a][1] for a in ("acc1", "acc2", "acc3"))
+    check("1 and 2 share NO number", not (a1 & a2), str(len(a1 & a2)))
+    check("1 and 3 share NO number", not (a1 & a3), str(len(a1 & a3)))
+    check("2 and 3 share NO number", not (a2 & a3), str(len(a2 & a3)))
+    check("the shared position is at 1200", numbers.shared_cursor("0913151") == 1200,
+          str(numbers.shared_cursor("0913151")))
+    who = numbers.blocks("0913151")
+    check("who got what is recorded", len(who) == 3, str(who))
+    check("the ranges are contiguous",
+          [(b["from"], b["to"]) for b in who] == [(0, 400), (400, 800), (800, 1200)],
+          str([(b["from"], b["to"]) for b in who]))
+
+
+def test_two_boosts_at_once_cannot_get_the_same_block():
+    print("\nmulti-parallel: the block is claimed UP FRONT, not batch by batch")
+    wipe_shared()
+    numbers.forget("p1")
+    numbers.forget("p2")
+    # Both ask before either has submitted anything -- the race that would hand
+    # out the same numbers if the position only moved as batches completed.
+    e1, s1, _ = numbers.next_numbers("p1", "0913151", 400)
+    e2, s2, _ = numbers.next_numbers("p2", "0913151", 400)
+    check("the second one is pushed past the first", s2 == s1 + 400,
+          f"{s1} then {s2}")
+    check("and their numbers do not overlap",
+          not ({e["phone"] for e in e1} & {e["phone"] for e in e2}))
+
+
+def test_an_unused_tail_goes_back():
+    print("\na run that stops early hands its unused numbers back")
+    wipe_shared()
+    numbers.forget("tail1")
+    _, start, _ = numbers.next_numbers("tail1", "0913151", 400)
+    check("400 were claimed", numbers.shared_cursor("0913151") == 400)
+    numbers.release_unused("tail1", "0913151", start, used=100, reserved=400)
+    check("only the 100 used stay claimed",
+          numbers.shared_cursor("0913151") == 100,
+          str(numbers.shared_cursor("0913151")))
+    # ...but not if somebody reserved on top, or two accounts would collide.
+    _, s2, _ = numbers.next_numbers("tail2", "0913151", 50)
+    numbers.release_unused("tail1", "0913151", 0, used=10, reserved=100)
+    check("a tail under somebody else's block is NOT reclaimed",
+          numbers.shared_cursor("0913151") == 150,
+          str(numbers.shared_cursor("0913151")))
+
+
+def test_migration_from_the_old_per_account_position():
+    print("\nswitching to a shared range does not re-hand numbers an account had")
+    wipe_shared()
+    numbers.forget("old1")
+    numbers.forget("old2")
+    # Simulate the account that was already boosted before this change: it holds
+    # 0..400 under 0913151 in its own file, and the shared file does not exist.
+    numbers.advance("old1", "0913151", probed=0, hits=0)
+    data = numbers.load("old1")
+    data["prefixes"]["0913151"]["cursor"] = 400
+    numbers._write("old1", data)
+    wipe_shared()
+    check("the shared position adopts it", numbers.shared_cursor("0913151") == 400,
+          str(numbers.shared_cursor("0913151")))
+    entries, start, _ = numbers.next_numbers("old2", "0913151", 400)
+    check("the next account starts AFTER it", start == 400, str(start))
+    check("so it cannot get the first account's people",
+          "+989131510000" not in {e["phone"] for e in entries})
+
+
+def test_shared_can_be_turned_off():
+    print("\nMKWL_BOOST_SHARED_RANGE=0 restores the old per-account behaviour")
+    wipe_shared()
+    numbers.forget("off1")
+    numbers.forget("off2")
+    import config as config_mod
+    original = config_mod.config.BOOST_SHARED_RANGE
+    config_mod.config.BOOST_SHARED_RANGE = False
+    try:
+        _, s1, _ = numbers.next_numbers("off1", "0913151", 400)
+        _, s2, _ = numbers.next_numbers("off2", "0913151", 400)
+        check("both accounts start at 0", s1 == 0 and s2 == 0, f"{s1} / {s2}")
+        check("the shared file was not used",
+              not numbers.shared_path().is_file())
+    finally:
+        config_mod.config.BOOST_SHARED_RANGE = original
+
+
 def test_no_number_is_ever_probed_twice():
     print("\nthe SAME number is never probed twice for one account")
     acct = fresh("dup")
@@ -199,8 +315,10 @@ def test_no_number_is_ever_probed_twice():
 def test_cursor_survives_and_reports():
     print("\nthe cursor is on disk, so a restart continues instead of repeating")
     acct = fresh("persist")
+    numbers.next_numbers(acct, "091646", 400)      # claims 0..400
     numbers.advance(acct, "091646", probed=400, hits=87)
-    check("the position is remembered", numbers.cursor(acct, "091646") == 400)
+    check("the position is remembered", numbers.cursor(acct, "091646") == 400,
+          str(numbers.cursor(acct, "091646")))
     st = numbers.stats(acct, "091646")
     check("tried is counted", st["tried"] == 400)
     check("hits are counted", st["hits"] == 87)
@@ -216,7 +334,7 @@ def test_cursor_survives_and_reports():
 def test_exhausted_prefix_is_refused():
     print("\na prefix that has been fully probed says so instead of looping")
     acct = fresh("full")
-    numbers.advance(acct, "09164", probed=numbers.capacity("09164"))
+    numbers.reserve(acct, "09164", numbers.capacity("09164"))
     entries, _, err = numbers.next_numbers(acct, "09164", 10)
     check("no entries are handed back", entries == [])
     check("the reason is explained", err is not None and "probed" in err, str(err))
@@ -226,7 +344,7 @@ def test_partial_block_at_the_end():
     print("\nthe last block is short rather than running past the prefix")
     acct = fresh("tail")
     cap = numbers.capacity("09164")
-    numbers.advance(acct, "09164", probed=cap - 3)
+    numbers.reserve(acct, "09164", cap - 3)
     entries, _, err = numbers.next_numbers(acct, "09164", 400)
     check("only what is left is returned", len(entries) == 3, str(len(entries)))
     check("no error for a short tail", err is None)
@@ -264,9 +382,12 @@ def test_matched_but_already_a_contact_is_not_counted_as_growth():
     s1 = run(engine.boost(d, acct, "989999999999", prefix="091646", probe=10,
                           contacts_before=0))
     check("the first run gains 4", s1["increase"] == 4, str(s1["increase"]))
-    # Now re-probe the SAME numbers by rewinding only the cursor, which is what
-    # the old expand_range() did on every single run.
+    # Now re-probe the SAME numbers by rewinding the position, which is what the
+    # old expand_range() did on every single run. Both the account's record AND
+    # the shared position have to go: forget() deliberately leaves the shared one
+    # alone so a re-added account cannot be handed somebody else's block.
     numbers.forget(acct)
+    wipe_shared()
     before = len(d.contacts)
     s2 = run(engine.boost(d, acct, "989999999999", prefix="091646", probe=10,
                           contacts_before=before))
@@ -534,6 +655,11 @@ def main() -> int:
     print("=" * 68)
     try:
         test_prefix_validation()
+        test_each_account_gets_a_DIFFERENT_block()
+        test_two_boosts_at_once_cannot_get_the_same_block()
+        test_an_unused_tail_goes_back()
+        test_migration_from_the_old_per_account_position()
+        test_shared_can_be_turned_off()
         test_no_number_is_ever_probed_twice()
         test_cursor_survives_and_reports()
         test_exhausted_prefix_is_refused()

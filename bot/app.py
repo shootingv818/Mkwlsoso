@@ -643,10 +643,17 @@ def settings_text() -> str:
             active = store.active_account
             if active:
                 st = boost_numbers.stats(active, store.boost_prefix)
-                if st.get("tried"):
+                if st.get("tried_all"):
                     pairs.append(("Boost so far ",
-                                  f"{st['hits']:,} found in {st['tried']:,} probed"
-                                  f" — {st['left']:,} numbers left"))
+                                  f"{st['hits_all']:,} found in "
+                                  f"{st['tried_all']:,} probed"
+                                  f" — {st['left']:,} numbers left"
+                                  + (f", {st['accounts']} account(s)"
+                                     if st.get("accounts", 0) > 1 else "")))
+                pairs.append(("Boost range  ",
+                              "shared — each account gets its own block"
+                              if st.get("shared") else
+                              "per account — accounts collect the SAME contacts"))
         except Exception:  # noqa: BLE001 - a settings screen must always render
             pass
     eng = store.engine
@@ -869,8 +876,10 @@ async def _handle_callback(event):
         st = boost_numbers.stats(active, store.boost_prefix)
         if not st.get("left"):
             return await event.answer(
-                "Every number under this prefix has already been probed for "
-                "this account. Set a different prefix.", alert=True)
+                "Every number under this prefix has already been probed. "
+                "Set a different prefix in Settings.", alert=True)
+        start = st["cursor"]
+        end = min(st["capacity"], start + store.boost_probe) - 1
         await manager.run_boost(active, report, store.account_phone(active),
                                 live=LiveCard(config.report_to()))
         await event.answer("Boosting contacts…")
@@ -879,14 +888,17 @@ async def _handle_callback(event):
                        [("Phone ", store.account_phone(active)),
                         ("Prefix", store.boost_prefix),
                         ("Probing", f"{store.boost_probe:,} numbers"),
-                        ("Starts at",
-                         boost_numbers.label(store.boost_prefix, st["cursor"])),
+                        ("Block ", f"{boost_numbers.label(store.boost_prefix, start)}"
+                                   f" → {boost_numbers.label(store.boost_prefix, end)}"),
+                        ("Range ", "shared — each account gets its own block"
+                                   if st.get("shared") else
+                                   "per account — every account starts from the beginning"),
                         ("Left after this",
                          f"{max(0, st['left'] - store.boost_probe):,}")],
-                       footer="These numbers have never been probed for this account. "
-                              "Most random numbers are not on Eitaa, so the number "
-                              "added is whatever this block happens to yield — a live "
-                              "card follows with the real count before and after."),
+                       footer="This block has never been probed by ANY account, so these "
+                              "contacts are this account's alone. Most random numbers are "
+                              "not on Eitaa, so what gets added is whatever the block "
+                              "yields — a live card follows with the real count."),
             buttons=kb_back())
     if data == "pnl:photodir":
         if not active:
