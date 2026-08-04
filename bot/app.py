@@ -643,17 +643,18 @@ def settings_text() -> str:
             active = store.active_account
             if active:
                 st = boost_numbers.stats(active, store.boost_prefix)
-                if st.get("tried_all"):
+                if st.get("used"):
                     pairs.append(("Boost so far ",
-                                  f"{st['hits_all']:,} found in "
-                                  f"{st['tried_all']:,} probed"
-                                  f" — {st['left']:,} numbers left"
+                                  f"{st['hits_all']:,} found in {st['used']:,} "
+                                  f"used of {st['capacity']:,}"
+                                  f" — {st['left']:,} left"
                                   + (f", {st['accounts']} account(s)"
                                      if st.get("accounts", 0) > 1 else "")))
-                pairs.append(("Boost range  ",
-                              "shared — each account gets its own block"
-                              if st.get("shared") else
-                              "per account — accounts collect the SAME contacts"))
+                pairs.append(("Boost picks  ",
+                              ("at random across the prefix"
+                               if st.get("random") else "in order (sequential)")
+                              + (", shared memory" if st.get("shared")
+                                 else ", per-account memory")))
         except Exception:  # noqa: BLE001 - a settings screen must always render
             pass
     eng = store.engine
@@ -878,27 +879,26 @@ async def _handle_callback(event):
             return await event.answer(
                 "Every number under this prefix has already been probed. "
                 "Set a different prefix in Settings.", alert=True)
-        start = st["cursor"]
-        end = min(st["capacity"], start + store.boost_probe) - 1
         await manager.run_boost(active, report, store.account_phone(active),
                                 live=LiveCard(config.report_to()))
         await event.answer("Boosting contacts…")
         return await event.edit(
             cards.card("👥 CONTACT BOOST QUEUED",
-                       [("Phone ", store.account_phone(active)),
-                        ("Prefix", store.boost_prefix),
-                        ("Probing", f"{store.boost_probe:,} numbers"),
-                        ("Block ", f"{boost_numbers.label(store.boost_prefix, start)}"
-                                   f" → {boost_numbers.label(store.boost_prefix, end)}"),
-                        ("Range ", "shared — each account gets its own block"
-                                   if st.get("shared") else
-                                   "per account — every account starts from the beginning"),
-                        ("Left after this",
-                         f"{max(0, st['left'] - store.boost_probe):,}")],
-                       footer="This block has never been probed by ANY account, so these "
-                              "contacts are this account's alone. Most random numbers are "
-                              "not on Eitaa, so what gets added is whatever the block "
-                              "yields — a live card follows with the real count."),
+                       [("Phone  ", store.account_phone(active)),
+                        ("Prefix ", f"{store.boost_prefix}"
+                                    f"  ({st['capacity']:,} numbers)"),
+                        ("Probing", f"about {store.boost_probe:,} numbers"),
+                        ("Picking", "at random from across the prefix"
+                                    if st.get("random") else "in order"),
+                        ("Memory ", "shared — no two accounts get the same number"
+                                    if st.get("shared") else
+                                    "per account — accounts may overlap"),
+                        ("Used so far", f"{st['used']:,} of {st['capacity']:,}"
+                                        f"  ({st['left']:,} left)")],
+                       footer="These numbers have never been handed to ANY account, so "
+                              "these contacts are this account's alone. Most random "
+                              "numbers are not on Eitaa, so what gets added is whatever "
+                              "the draw yields — a live card follows with the real count."),
             buttons=kb_back())
     if data == "pnl:photodir":
         if not active:

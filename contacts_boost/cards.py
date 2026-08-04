@@ -29,11 +29,25 @@ def _hit_rate(hits: int, tried: int) -> str:
     return f"{hits * 100 / tried:.0f}%"
 
 
+def _pick_line(random_pick: bool, span) -> str | None:
+    """Where in the prefix the numbers came from.
+
+    With a random pick the numbers are scattered, so a "block" would be a lie;
+    the honest description is the span they were drawn from.
+    """
+    lo, hi = (span or ("", ""))
+    if not lo or not hi:
+        return None
+    if random_pick:
+        return f"\u2022 Picked : at random between {lo} and {hi}"
+    return f"\u2022 Block : {lo} \u2192 {hi}"
+
+
 def progress(*, account: str, phone: str, prefix: str, status: str, step: str,
              probe_total: int, probed: int, matched: int,
              contacts_before: int | None = None, contacts_now: int | None = None,
-             first_number: str = "", last_number: str = "",
              phone_format: str | None = None, waited: int = 0,
+             random_pick: bool = True, span=("", ""),
              elapsed: float = 0.0, note: str | None = None) -> str:
     """The live card while numbers are being probed."""
     lines = [
@@ -42,8 +56,9 @@ def progress(*, account: str, phone: str, prefix: str, status: str, step: str,
         f"\u2022 Step : {step}",
         f"\u2022 Prefix : {prefix or '--'}",
     ]
-    if first_number and last_number:
-        lines.append(f"\u2022 Range : {first_number} \u2192 {last_number}")
+    pick = _pick_line(random_pick, span)
+    if pick:
+        lines.append(pick)
     lines += [
         f"\u2022 Probing : {probe_total:,} numbers",
         f"\u2022 Matched : {matched:,}",
@@ -84,18 +99,19 @@ def progress(*, account: str, phone: str, prefix: str, status: str, step: str,
 def finished(*, account: str, phone: str, prefix: str, probe_total: int,
              probed: int, matched: int, contacts_before: int,
              contacts_after: int, elapsed: float,
-             first_number: str = "", last_number: str = "",
-             next_number: str = "", shared_range: bool = False,
-             accounts_served: int = 0,
+             span=("", ""), random_pick: bool = True,
+             shared_range: bool = True, accounts_served: int = 0,
              phone_format: str | None = None, waited: int = 0,
-             left_under_prefix: int = 0, lifetime_tried: int = 0,
-             lifetime_hits: int = 0, peers_new: int = 0, peers_total: int = 0,
-             stopped: bool = False,
-             rate_limited: bool = False, note: str | None = None) -> str:
+             returned: int = 0, capacity: int = 0,
+             used_under_prefix: int = 0, left_under_prefix: int = 0,
+             lifetime_tried: int = 0, lifetime_hits: int = 0,
+             peers_new: int = 0, peers_total: int = 0,
+             stopped: bool = False, rate_limited: bool = False,
+             note: str | None = None) -> str:
     """The result card. `Increase` is MEASURED, not the server's own count.
 
     `contacts.importContacts` reports a number in `imported` whenever it belongs
-    to a real user -- including when that user was already a contact -- so
+    to a real user -- including when that user is already a contact -- so
     `matched` answers "how many of these numbers exist" and only
     `contacts_after - contacts_before` answers "how many contacts did I gain".
     Both are shown, because the gap between them is the useful signal.
@@ -113,14 +129,12 @@ def finished(*, account: str, phone: str, prefix: str, probe_total: int,
     lines = [
         f"--| Phone - {phone}",
         f"\u2022 Status : {status}",
-        f"\u2022 Prefix : {prefix or '--'}",
+        f"\u2022 Prefix : {prefix or '--'}"
+        + (f"  ({capacity:,} numbers)" if capacity else ""),
     ]
-    # The block THIS account got. With a shared range every account gets a
-    # different one, and this is how that is visible rather than taken on trust.
-    if first_number and last_number:
-        lines.append(f"\u2022 Block : {first_number} \u2192 {last_number}")
-    elif first_number:
-        lines.append(f"\u2022 Started at : {first_number}")
+    pick = _pick_line(random_pick, span)
+    if pick:
+        lines.append(pick)
     lines += [
         f"\u2022 Numbers probed : {probed:,}" +
         (f" of {probe_total:,}" if probed != probe_total else ""),
@@ -141,6 +155,8 @@ def finished(*, account: str, phone: str, prefix: str, probe_total: int,
                      + (f"  ({peers_total:,} total)" if peers_total else ""))
     if waited:
         lines.append(f"\u2022 Waited for limits : {waited}s")
+    if returned:
+        lines.append(f"\u2022 Returned unused : {returned:,} numbers")
     lines += [
         f"\u2022 Took : {cards.fmt_duration(elapsed)}",
         "",
@@ -156,40 +172,37 @@ def finished(*, account: str, phone: str, prefix: str, probe_total: int,
         lines.append("")
         lines.append(f"\u2022 Format : {phone_format} (remembered, "
                      f"next run skips the probe)")
-    if next_number:
-        who = "next account" if shared_range else "next run"
-        lines.append(f"\u2022 {who.capitalize()} starts at : {next_number}")
+    if capacity:
+        lines.append(f"\u2022 Used under prefix : {used_under_prefix:,} of "
+                     f"{capacity:,}  ({left_under_prefix:,} left)")
     if shared_range and accounts_served > 1:
         lines.append(f"\u2022 Accounts served : {accounts_served} "
-                     f"(each on its own block, no shared contacts)")
-    if left_under_prefix:
-        lines.append(f"\u2022 Numbers left under prefix : {left_under_prefix:,}")
+                     f"(no two get the same number)")
     if lifetime_tried:
-        lines.append(f"\u2022 All runs : {lifetime_hits:,} found in "
+        lines.append(f"\u2022 This account : {lifetime_hits:,} found in "
                      f"{lifetime_tried:,} probed "
                      f"({_hit_rate(lifetime_hits, lifetime_tried)})")
     if note:
         lines += ["", f"\u2022 Note : {cards.sanitize(note, 200)}"]
 
     if stopped:
-        footer = ("Stopped early. The numbers already probed are remembered, so "
-                  "the next run continues from the next one.")
+        footer = ("Stopped early. Only the numbers actually submitted were used "
+                  "up; the rest went back for the next run.")
     elif rate_limited:
-        footer = ("Eitaa rate-limited this account, so the run ended early. Only "
-                  "the numbers actually submitted were consumed -- press Boost "
-                  "Contacts again later and it continues from where it stopped.")
+        footer = ("Eitaa rate-limited this account, so the run ended early. The "
+                  "numbers it never submitted went back, so pressing Boost "
+                  "Contacts again later loses nothing.")
     elif matched == 0:
-        footer = ("None of those numbers is on Eitaa. That is normal for a "
-                  "random block; they are marked as used, so pressing again "
-                  "probes the NEXT block rather than the same one.")
-    elif shared_range:
-        footer = ("This block is now used up, so the NEXT account gets a fresh "
-                  "one -- no two accounts collect the same contacts. 'Increase' "
-                  "is the real contact count before vs after, not the server's "
-                  "own tally.")
+        footer = ("None of those numbers is on Eitaa. They are marked as used, so "
+                  "pressing again picks a completely different set.")
+    elif random_pick:
+        footer = ("Numbers are picked at RANDOM from across the prefix and never "
+                  "handed out twice, so no two accounts share a contact and the "
+                  "list does not look machine-generated. 'Increase' is the real "
+                  "contact count before vs after, not the server's own tally.")
     else:
-        footer = ("Every number probed here is remembered, so a later run never "
-                  "repeats it. 'Increase' is the real contact count before vs "
+        footer = ("Sequential mode. Every number is remembered so it is never "
+                  "used twice. 'Increase' is the real contact count before vs "
                   "after, not the server's own tally.")
     return cards.card(title, body="\n".join(lines), footer=footer)
 

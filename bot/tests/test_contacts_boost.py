@@ -99,32 +99,54 @@ def fresh(account: str = "acct") -> str:
 class FakeDriver:
     """Answers the two bridge calls the engine uses.
 
-    `real_numbers` is the set of phone numbers that "exist" on Eitaa. Everything
-    else is silently unmatched, which is exactly how the server behaves.
+    Two ways to say which numbers "exist" on Eitaa:
+
+      * `real_numbers` -- an explicit set. Use it when the test cares about
+        SPECIFIC numbers.
+      * `match_every` -- every Nth number submitted across the whole run
+        matches. Use it for engine tests: numbers are now drawn at RANDOM, so a
+        test cannot know which ones will come out, and matching by position
+        keeps the expected count exact anyway.
+
+    Everything else is silently unmatched, with no error, which is exactly how
+    the server behaves when a number is not registered.
     """
 
     def __init__(self, real_numbers=(), *, good_format: str = "98",
+                 match_every: int | None = None,
                  flood_on_call: set | None = None, flood_wait: int = 5,
                  fail_on_call: set | None = None,
                  contacts_bridge: bool = True,
                  list_bridge: bool = True,
                  already_contacts: int = 0):
         self.real = {str(n).lstrip("+") for n in real_numbers}
+        self.match_every = match_every
         self.good_format = good_format
         self.flood_on_call = set(flood_on_call or ())
         self.flood_wait = flood_wait
         self.fail_on_call = set(fail_on_call or ())
         self.contacts_bridge = contacts_bridge
         self.list_bridge = list_bridge
-        # Contacts the account starts with (they count towards getContacts but
-        # are NOT in `real`, so they can never be matched again).
-        self.contacts: list[dict] = [
-            {"peer_id": f"pre{i}", "access_hash": f"h{i}", "title": f"Old {i}"}
-            for i in range(already_contacts)]
+        # Contacts the account starts with. Keyed by peer_id, like Eitaa: adding
+        # a number that is ALREADY a contact does not grow the list.
+        self.contact_map: dict = {
+            f"pre{i}": {"peer_id": f"pre{i}", "access_hash": f"h{i}",
+                        "title": f"Old {i}"}
+            for i in range(already_contacts)}
         self.calls = 0
+        self.seen = 0            # numbers submitted so far, across the run
         self.submitted: list[list[str]] = []
         self.formats_tried: list[str] = []
         self.list_calls = 0
+
+    @property
+    def contacts(self) -> list:
+        return list(self.contact_map.values())
+
+    def _exists(self, phone: str, position: int) -> bool:
+        if self.match_every:
+            return position % self.match_every == 0
+        return phone in self.real
 
     async def ensure_contacts_bridge(self) -> bool:
         return self.contacts_bridge
@@ -150,11 +172,17 @@ class FakeDriver:
                     "users_count": 0, "retry_count": 0, "added": []}
         added = []
         for phone in submitted:
-            if phone in self.real:
-                added.append({"user_id": phone, "access_hash": "ah" + phone,
-                              "phone": phone, "first": phone})
-                self.contacts.append({"peer_id": phone, "access_hash": "ah" + phone,
-                                      "title": phone})
+            position, self.seen = self.seen, self.seen + 1
+            if not self._exists(phone, position):
+                continue
+            added.append({"user_id": phone, "access_hash": "ah" + phone,
+                          "phone": phone, "first": phone})
+            # Eitaa answers "imported" even when the user is ALREADY a contact,
+            # so the row goes into `added` either way -- but the contact list
+            # does not grow twice. That gap is what the card has to be honest
+            # about.
+            self.contact_map.setdefault(phone, {
+                "peer_id": phone, "access_hash": "ah" + phone, "title": phone})
         return {"ok": True, "batch": len(entries), "imported_count": len(added),
                 "users_count": len(added), "retry_count": 0, "added": added}
 
@@ -197,87 +225,172 @@ def wipe_shared() -> None:
         pass
 
 
-def test_each_account_gets_a_DIFFERENT_block():
-    print("\nevery account gets its OWN block -- no two collect the same people")
+def test_numbers_are_scattered_not_sequential():
+    print("\nnumbers are picked at RANDOM, not walked in order")
+    print("  (a sequential import is an obvious machine fingerprint)")
+    acct = fresh("scatter")
+    entries, idx, err = numbers.next_numbers(acct, "0913151", 400)
+    check("400 numbers came back", len(idx) == 400 and err is None, str(err))
+    check("they are all different", len(set(idx)) == 400)
+    check("they are NOT consecutive", sorted(idx) != list(range(400)),
+          "lowest few: " + str(sorted(idx)[:5]))
+    gaps = {b - a for a, b in zip(sorted(idx), sorted(idx)[1:])}
+    check("the spacing varies (no arithmetic pattern)", len(gaps) > 5,
+          f"{len(gaps)} distinct gaps")
+    check("they cover the whole prefix, not one corner",
+          max(idx) - min(idx) > 8000, f"span {min(idx)}..{max(idx)}")
+    check("and the entries carry real +98 numbers",
+          all(e["phone"].startswith("+98913151") and len(e["phone"]) == 13
+              for e in entries), entries[0]["phone"])
+
+
+def test_a_number_is_never_handed_out_twice():
+    print("\nthe same number is never handed out twice, to anybody")
+    acct = fresh("once")
+    seen: set[int] = set()
+    for _ in range(10):
+        _, idx, err = numbers.next_numbers(acct, "0913151", 400)
+        check("a draw succeeded", len(idx) == 400 and err is None, str(err))
+        overlap = seen & set(idx)
+        if overlap:
+            check("no overlap with earlier draws", False, str(sorted(overlap)[:5]))
+            return
+        seen.update(idx)
+    check("4,000 drawn, zero repeats", len(seen) == 4000, str(len(seen)))
+    check("the used-set knows about all of them",
+          numbers.used_count(acct, "0913151") == 4000,
+          str(numbers.used_count(acct, "0913151")))
+
+
+def test_each_account_gets_DIFFERENT_numbers():
+    print("\nevery account gets its own numbers -- no shared contacts")
     wipe_shared()
     for a in ("acc1", "acc2", "acc3"):
         numbers.forget(a)
     got = {}
     for a in ("acc1", "acc2", "acc3"):
-        entries, start, err = numbers.next_numbers(a, "0913151", 400)
-        check(f"{a} got a block", len(entries) == 400 and err is None, str(err))
-        got[a] = (start, {e["phone"] for e in entries})
-    check("account 1 starts at 0", got["acc1"][0] == 0, str(got["acc1"][0]))
-    check("account 2 starts at 400", got["acc2"][0] == 400, str(got["acc2"][0]))
-    check("account 3 starts at 800", got["acc3"][0] == 800, str(got["acc3"][0]))
-    a1, a2, a3 = (got[a][1] for a in ("acc1", "acc2", "acc3"))
+        _, idx, err = numbers.next_numbers(a, "0913151", 400)
+        check(f"{a} drew 400", len(idx) == 400 and err is None, str(err))
+        got[a] = set(idx)
+    a1, a2, a3 = got["acc1"], got["acc2"], got["acc3"]
     check("1 and 2 share NO number", not (a1 & a2), str(len(a1 & a2)))
     check("1 and 3 share NO number", not (a1 & a3), str(len(a1 & a3)))
     check("2 and 3 share NO number", not (a2 & a3), str(len(a2 & a3)))
-    check("the shared position is at 1200", numbers.shared_cursor("0913151") == 1200,
-          str(numbers.shared_cursor("0913151")))
-    who = numbers.blocks("0913151")
-    check("who got what is recorded", len(who) == 3, str(who))
-    check("the ranges are contiguous",
-          [(b["from"], b["to"]) for b in who] == [(0, 400), (400, 800), (800, 1200)],
-          str([(b["from"], b["to"]) for b in who]))
+    check("1,200 numbers are used in total",
+          numbers.used_count("acc1", "0913151") == 1200,
+          str(numbers.used_count("acc1", "0913151")))
+    check("who drew how many is recorded", len(numbers.draws("0913151")) == 3)
 
 
-def test_two_boosts_at_once_cannot_get_the_same_block():
-    print("\nmulti-parallel: the block is claimed UP FRONT, not batch by batch")
+def test_two_boosts_at_once_cannot_get_the_same_number():
+    print("\nmulti-parallel: numbers are claimed at DRAW time")
     wipe_shared()
     numbers.forget("p1")
     numbers.forget("p2")
     # Both ask before either has submitted anything -- the race that would hand
-    # out the same numbers if the position only moved as batches completed.
-    e1, s1, _ = numbers.next_numbers("p1", "0913151", 400)
-    e2, s2, _ = numbers.next_numbers("p2", "0913151", 400)
-    check("the second one is pushed past the first", s2 == s1 + 400,
-          f"{s1} then {s2}")
-    check("and their numbers do not overlap",
-          not ({e["phone"] for e in e1} & {e["phone"] for e in e2}))
+    # out the same numbers if they were only marked as batches completed.
+    _, i1, _ = numbers.next_numbers("p1", "0913151", 400)
+    _, i2, _ = numbers.next_numbers("p2", "0913151", 400)
+    check("neither got any of the other's numbers", not (set(i1) & set(i2)),
+          str(len(set(i1) & set(i2))))
 
 
-def test_an_unused_tail_goes_back():
+def test_unused_numbers_go_back():
     print("\na run that stops early hands its unused numbers back")
     wipe_shared()
-    numbers.forget("tail1")
-    _, start, _ = numbers.next_numbers("tail1", "0913151", 400)
-    check("400 were claimed", numbers.shared_cursor("0913151") == 400)
-    numbers.release_unused("tail1", "0913151", start, used=100, reserved=400)
-    check("only the 100 used stay claimed",
-          numbers.shared_cursor("0913151") == 100,
-          str(numbers.shared_cursor("0913151")))
-    # ...but not if somebody reserved on top, or two accounts would collide.
-    _, s2, _ = numbers.next_numbers("tail2", "0913151", 50)
-    numbers.release_unused("tail1", "0913151", 0, used=10, reserved=100)
-    check("a tail under somebody else's block is NOT reclaimed",
-          numbers.shared_cursor("0913151") == 150,
-          str(numbers.shared_cursor("0913151")))
+    acct = "give-back"
+    numbers.forget(acct)
+    _, idx, _ = numbers.next_numbers(acct, "0913151", 400)
+    check("400 are marked used", numbers.used_count(acct, "0913151") == 400)
+    freed = numbers.undraw(acct, "0913151", idx[100:])
+    check("300 went back", freed == 300, str(freed))
+    check("only the 100 used remain",
+          numbers.used_count(acct, "0913151") == 100,
+          str(numbers.used_count(acct, "0913151")))
+    # ...and they can be drawn again, by anybody.
+    _, again, _ = numbers.next_numbers("someone-else", "0913151", 300)
+    check("the returned numbers are available again",
+          bool(set(again) & set(idx[100:])), "none came back round")
+    check("but never the 100 that WERE used",
+          not (set(again) & set(idx[:100])))
 
 
-def test_migration_from_the_old_per_account_position():
-    print("\nswitching to a shared range does not re-hand numbers an account had")
+def test_the_packed_used_set_stays_small():
+    print("\nthe memory is packed as ranges, so it does not bloat")
+    check("a solid run collapses to one entry",
+          numbers._pack(set(range(400))) == ["0-399"],
+          str(numbers._pack(set(range(400)))))
+    check("packing round-trips exactly",
+          numbers._unpack(numbers._pack({1, 2, 3, 9, 40, 41})) == {1, 2, 3, 9, 40, 41})
+    wipe_shared()
+    acct = "packed"
+    numbers.forget(acct)
+    numbers.next_numbers(acct, "0913151", 400)
+    raw = numbers.shared_path().read_text(encoding="utf-8")
+    check("the file stays well under 20 KB", len(raw) < 20_000, f"{len(raw)} bytes")
+    check("and it is still exact", numbers.used_count(acct, "0913151") == 400)
+
+
+def test_a_nearly_full_prefix_still_works():
+    print("\nwhen the prefix is nearly used up, the draw is exact, not a guess")
+    print("  (rejection sampling alone would spin at high density)")
+    wipe_shared()
+    acct = "dense"
+    numbers.forget(acct)
+    cap = numbers.capacity("091315123")        # 100 numbers
+    check("that prefix holds 100", cap == 100, str(cap))
+    got: set[int] = set()
+    err = None
+    for _ in range(20):
+        _, idx, err = numbers.next_numbers(acct, "091315123", 30)
+        if err:
+            break
+        got.update(idx)
+    check("all 100 were handed out, none twice", got == set(range(100)),
+          str(len(got)))
+    check("then it says the prefix is finished", err is not None, str(err))
+    check("and explains it clearly", "different prefix" in (err or ""), str(err))
+
+
+def test_sequential_mode_still_available():
+    print("\nMKWL_BOOST_ORDER=sequential restores the in-order walk")
+    wipe_shared()
+    numbers.forget("seq")
+    import config as config_mod
+    original = config_mod.config.BOOST_ORDER
+    config_mod.config.BOOST_ORDER = "sequential"
+    try:
+        _, idx, _ = numbers.next_numbers("seq", "0913151", 10)
+        check("it walks from the start", idx == list(range(10)), str(idx))
+        _, idx2, _ = numbers.next_numbers("seq", "0913151", 10)
+        check("and continues, never repeating", idx2 == list(range(10, 20)),
+              str(idx2))
+    finally:
+        config_mod.config.BOOST_ORDER = original
+
+
+def test_migration_from_the_old_sequential_records():
+    print("\nupgrading does not re-hand numbers an account already holds")
     wipe_shared()
     numbers.forget("old1")
     numbers.forget("old2")
-    # Simulate the account that was already boosted before this change: it holds
-    # 0..400 under 0913151 in its own file, and the shared file does not exist.
+    # The account boosted before this change: its file holds the old `cursor`.
     numbers.advance("old1", "0913151", probed=0, hits=0)
     data = numbers.load("old1")
     data["prefixes"]["0913151"]["cursor"] = 400
     numbers._write("old1", data)
     wipe_shared()
-    check("the shared position adopts it", numbers.shared_cursor("0913151") == 400,
-          str(numbers.shared_cursor("0913151")))
-    entries, start, _ = numbers.next_numbers("old2", "0913151", 400)
-    check("the next account starts AFTER it", start == 400, str(start))
-    check("so it cannot get the first account's people",
-          "+989131510000" not in {e["phone"] for e in entries})
+    check("the shared memory adopts those 400",
+          numbers.used_count("old2", "0913151") == 400,
+          str(numbers.used_count("old2", "0913151")))
+    _, idx, _ = numbers.next_numbers("old2", "0913151", 400)
+    check("the next account gets none of them",
+          not (set(idx) & set(range(400))),
+          str(sorted(set(idx) & set(range(400)))[:5]))
 
 
-def test_shared_can_be_turned_off():
-    print("\nMKWL_BOOST_SHARED_RANGE=0 restores the old per-account behaviour")
+def test_shared_memory_can_be_turned_off():
+    print("\nMKWL_BOOST_SHARED_RANGE=0 gives each account its own memory")
     wipe_shared()
     numbers.forget("off1")
     numbers.forget("off2")
@@ -285,119 +398,81 @@ def test_shared_can_be_turned_off():
     original = config_mod.config.BOOST_SHARED_RANGE
     config_mod.config.BOOST_SHARED_RANGE = False
     try:
-        _, s1, _ = numbers.next_numbers("off1", "0913151", 400)
-        _, s2, _ = numbers.next_numbers("off2", "0913151", 400)
-        check("both accounts start at 0", s1 == 0 and s2 == 0, f"{s1} / {s2}")
+        _, i1, _ = numbers.next_numbers("off1", "0913151", 400)
+        _, i2, _ = numbers.next_numbers("off2", "0913151", 400)
+        check("each account tracks its own", len(i1) == 400 and len(i2) == 400)
+        check("so they CAN overlap now (that is the trade-off)", True,
+              f"{len(set(i1) & set(i2))} shared")
         check("the shared file was not used",
               not numbers.shared_path().is_file())
     finally:
         config_mod.config.BOOST_SHARED_RANGE = original
 
 
-def test_no_number_is_ever_probed_twice():
-    print("\nthe SAME number is never probed twice for one account")
-    acct = fresh("dup")
-    first, start1, err = numbers.next_numbers(acct, "091646", 10)
-    check("the first block starts at index 0", start1 == 0 and err is None)
-    numbers.advance(acct, "091646", probed=len(first), hits=3)
-    second, start2, _ = numbers.next_numbers(acct, "091646", 10)
-    check("the second block starts after the first", start2 == 10, str(start2))
-    overlap = {e["phone"] for e in first} & {e["phone"] for e in second}
-    check("the two blocks share no number", not overlap, str(overlap))
-    # This is the exact bug in the existing job, shown side by side.
-    from bot.runner import expand_range
-    old_a, _ = expand_range("091646", 10)
-    old_b, _ = expand_range("091646", 10)
-    check("expand_range() DOES repeat itself (the bug being fixed)",
-          [e["phone"] for e in old_a] == [e["phone"] for e in old_b])
-
-
-def test_cursor_survives_and_reports():
-    print("\nthe cursor is on disk, so a restart continues instead of repeating")
-    acct = fresh("persist")
-    numbers.next_numbers(acct, "091646", 400)      # claims 0..400
-    numbers.advance(acct, "091646", probed=400, hits=87)
-    check("the position is remembered", numbers.cursor(acct, "091646") == 400,
-          str(numbers.cursor(acct, "091646")))
-    st = numbers.stats(acct, "091646")
-    check("tried is counted", st["tried"] == 400)
-    check("hits are counted", st["hits"] == 87)
-    check("what is left is reported", st["left"] == 100_000 - 400, f"{st['left']:,}")
-    check("the next number is nameable",
-          numbers.label("091646", 400) == "09164600400",
-          numbers.label("091646", 400))
-    check("the format is remembered once learned",
-          (numbers.remember_format(acct, "+98"),
-           numbers.phone_format(acct))[1] == "+98")
-
-
-def test_exhausted_prefix_is_refused():
-    print("\na prefix that has been fully probed says so instead of looping")
-    acct = fresh("full")
-    numbers.reserve(acct, "09164", numbers.capacity("09164"))
-    entries, _, err = numbers.next_numbers(acct, "09164", 10)
-    check("no entries are handed back", entries == [])
-    check("the reason is explained", err is not None and "probed" in err, str(err))
-
-
-def test_partial_block_at_the_end():
-    print("\nthe last block is short rather than running past the prefix")
-    acct = fresh("tail")
-    cap = numbers.capacity("09164")
-    numbers.reserve(acct, "09164", cap - 3)
-    entries, _, err = numbers.next_numbers(acct, "09164", 400)
-    check("only what is left is returned", len(entries) == 3, str(len(entries)))
-    check("no error for a short tail", err is None)
-
-
-# --------------------------------------------------------------------------
-# engine.py
-# --------------------------------------------------------------------------
-
 def test_boost_measures_the_increase():
     print("\nthe increase is MEASURED before/after, not taken from the server")
     acct = fresh("measure")
-    real = ["98916460000" + str(i) for i in range(5)]      # 5 numbers exist
-    d = FakeDriver(real, already_contacts=12)
+    # Every 20th number submitted exists -> exactly 5 of 100, whichever numbers
+    # the random draw happens to produce.
+    d = FakeDriver(match_every=20, already_contacts=12)
     state = run(engine.boost(d, acct, "989999999999", prefix="091646",
                              probe=100, contacts_before=12))
     check("it ran", state["ok"], str(state.get("reason")))
-    check("100 numbers were probed", state["probed"] == 100, str(state["probed"]))
-    check("5 matched", state["matched"] == 5, str(state["matched"]))
+    # The count is jittered on purpose, so the check is "it probed everything it
+    # asked for", not a hard-coded 100.
+    check("it probed the whole draw", state["probed"] == state["probe_total"],
+          f'{state["probed"]} of {state["probe_total"]}')
+    check("the draw is about 100", 90 <= state["probe_total"] <= 110,
+          str(state["probe_total"]))
+    # Every 20th of however many were drawn.
+    expect = -(-state["probe_total"] // 20)
+    check(f"{expect} matched", state["matched"] == expect, str(state["matched"]))
     check("before is 12", state["contacts_before"] == 12)
-    check("after is 17", state["contacts_after"] == 17, str(state["contacts_after"]))
-    check("the increase is +5", state["increase"] == 5)
+    check("after is before + matched", state["contacts_after"] == 12 + expect,
+          str(state["contacts_after"]))
+    check("the increase is what was matched", state["increase"] == expect,
+          str(state["increase"]))
     check("getContacts was consulted for the real count", d.list_calls >= 1)
     check("the fresh list was cached so the new contacts are sendable",
-          contacts_store.count(acct) == 17, str(contacts_store.count(acct)))
+          contacts_store.count(acct) == 12 + expect,
+          str(contacts_store.count(acct)))
 
 
 def test_matched_but_already_a_contact_is_not_counted_as_growth():
     print("\na number that was ALREADY a contact does not inflate the increase")
     print("  (this is the over-reporting in the existing job)")
     acct = fresh("already")
-    real = ["98916460000" + str(i) for i in range(4)]
-    d = FakeDriver(real, already_contacts=0)
-    # First run: these 4 become contacts.
-    s1 = run(engine.boost(d, acct, "989999999999", prefix="091646", probe=10,
-                          contacts_before=0))
-    check("the first run gains 4", s1["increase"] == 4, str(s1["increase"]))
-    # Now re-probe the SAME numbers by rewinding the position, which is what the
-    # old expand_range() did on every single run. Both the account's record AND
-    # the shared position have to go: forget() deliberately leaves the shared one
-    # alone so a re-added account cannot be handed somebody else's block.
-    numbers.forget(acct)
-    wipe_shared()
-    before = len(d.contacts)
-    s2 = run(engine.boost(d, acct, "989999999999", prefix="091646", probe=10,
-                          contacts_before=before))
-    check("the server still calls them imported", s2["matched"] == 4,
+    import config as config_mod
+    original = config_mod.config.BOOST_ORDER
+    original_jitter = engine.JITTER_PCT
+    # Sequential AND un-jittered, so the second run submits the IDENTICAL numbers
+    # once the memory is wiped -- which is exactly what the old expand_range()
+    # did on EVERY run.
+    config_mod.config.BOOST_ORDER = "sequential"
+    engine.JITTER_PCT = 0
+    try:
+        d = FakeDriver(match_every=3, already_contacts=0)
+        s1 = run(engine.boost(d, acct, "989999999999", prefix="091646", probe=10,
+                              contacts_before=0))
+        gained = s1["increase"]
+        check("the first run gains contacts", gained > 0, str(gained))
+        # Rewind the memory and run again over the identical numbers.
+        numbers.forget(acct)
+        wipe_shared()
+        d.seen = 0
+        before = len(d.contacts)
+        s2 = run(engine.boost(d, acct, "989999999999", prefix="091646", probe=10,
+                              contacts_before=before))
+    finally:
+        config_mod.config.BOOST_ORDER = original
+        engine.JITTER_PCT = original_jitter
+    check("the server still calls them imported", s2["matched"] == gained,
           str(s2["matched"]))
     check("but the measured increase is 0", s2["increase"] == 0,
           str(s2["increase"]))
     card = engine.summary_card(acct, "989999999999", s2)
     check("the card admits they were already contacts",
-          "Already had : 4" in card)
+          f"Already had : {gained}" in card, card)
     check("the card does not claim DONE with growth",
           "Increase : +0" in card)
 
@@ -407,7 +482,7 @@ def test_cursor_advances_per_batch_not_at_the_end():
     acct = fresh("perbatch")
     # Somebody in the first batch exists, so the phone format settles
     # immediately and every chunk is exactly one submission.
-    d = FakeDriver(["98916460000" + str(i) for i in range(3)], already_contacts=0)
+    d = FakeDriver(match_every=10, already_contacts=0)
 
     def should_stop() -> bool:
         # Stop the moment two batches have gone out, i.e. mid-run.
@@ -416,21 +491,19 @@ def test_cursor_advances_per_batch_not_at_the_end():
     state = run(engine.boost(d, acct, "989999999999", prefix="091646",
                              probe=400, contacts_before=0,
                              should_stop=should_stop))
-    cur = numbers.cursor(acct, "091646")
-    check("it stopped early", state["stopped"], str(state))
-    check("only the submitted numbers were consumed",
-          cur == len(d.submitted) * engine.BATCH, f"cursor={cur}")
-    check("that is less than the whole block", cur < 400, f"cursor={cur}")
-    # The next run must continue, not repeat.
-    nxt, start, _ = numbers.next_numbers(acct, "091646", 10)
-    check("the next run continues from there", start == cur, str(start))
+    used = numbers.used_count(acct, "091646")
+    check("it stopped early", state["stopped"], str(state.get("stopped")))
+    check("only the submitted numbers stayed used",
+          used == len(d.submitted) * engine.BATCH, f"used={used}")
+    check("the rest went back", used < state["probe_total"], f"used={used}")
+    check("the returned count is reported", state.get("returned", 0) > 0,
+          str(state.get("returned")))
 
 
 def test_flood_is_waited_out_and_the_run_resumes():
     print("\na FLOOD answer is waited out instead of killing the run")
     acct = fresh("flood")
-    real = ["98916460000" + str(i) for i in range(3)]
-    d = FakeDriver(real, flood_on_call={2}, flood_wait=1)
+    d = FakeDriver(match_every=10, flood_on_call={2}, flood_wait=1)
     slept: list[float] = []
     real_sleep = asyncio.sleep
 
@@ -448,8 +521,8 @@ def test_flood_is_waited_out_and_the_run_resumes():
     check("it slept the requested time", 1 in slept, str(slept))
     check("the wait is reported", state["waited"] == 1, str(state["waited"]))
     check("it is flagged as rate limited", state["rate_limited"])
-    check("all 150 numbers were still probed", state["probed"] == 150,
-          str(state["probed"]))
+    check("every number was still probed", state["probed"] == state["probe_total"],
+          f'{state["probed"]} of {state["probe_total"]}')
 
 
 def test_a_refused_batch_does_not_burn_its_numbers():
@@ -461,8 +534,8 @@ def test_a_refused_batch_does_not_burn_its_numbers():
                              probe=400, contacts_before=0))
     check("nothing was counted as probed", state["probed"] == 0,
           str(state["probed"]))
-    check("the cursor did not move", numbers.cursor(acct, "091646") == 0,
-          str(numbers.cursor(acct, "091646")))
+    check("no numbers stayed used", numbers.used_count(acct, "091646") == 0,
+          str(numbers.used_count(acct, "091646")))
     check("the reason is on the card", bool(state.get("note")), str(state.get("note")))
     card = engine.summary_card(acct, "989999999999", state)
     check("the card says PARTIAL, not DONE", "PARTIAL" in card)
@@ -471,8 +544,7 @@ def test_a_refused_batch_does_not_burn_its_numbers():
 def test_phone_format_is_probed_once_then_remembered():
     print("\nthe 98 / +98 format is probed once, then never again")
     acct = fresh("fmt")
-    real = ["+98916460000" + str(i) for i in range(3)]
-    d = FakeDriver([n.lstrip("+") for n in real], good_format="+98")
+    d = FakeDriver(match_every=10, good_format="+98")
     s1 = run(engine.boost(d, acct, "989999999999", prefix="091646", probe=50,
                           contacts_before=0))
     check("it found the working format", s1["phone_format"] == "+98",
@@ -484,9 +556,9 @@ def test_phone_format_is_probed_once_then_remembered():
     calls_before = len(d.formats_tried)
     run(engine.boost(d, acct, "989999999999", prefix="091646", probe=50,
                      contacts_before=len(d.contacts)))
+    after = d.formats_tried[calls_before:]
     check("the second run does not probe the format again",
-          d.formats_tried[calls_before:] == ["+98"],
-          str(d.formats_tried[calls_before:]))
+          after and all(f == "+98" for f in after), str(after))
 
 
 def test_an_empty_block_does_not_pin_the_wrong_format():
@@ -505,9 +577,7 @@ def test_an_empty_block_does_not_pin_the_wrong_format():
     check("it says what it did", "98 form only" in (state.get("note") or ""),
           str(state.get("note")))
     # A later run, once a real number turns up, still learns the right format.
-    d2 = FakeDriver(["98916460040" + str(i) for i in range(3)], good_format="+98")
-    d2.real = {"+98916460040" + str(i) for i in range(3)}
-    d2.real = {n.lstrip("+") for n in d2.real}
+    d2 = FakeDriver(match_every=10, good_format="+98")
     s2 = run(engine.boost(d2, acct, "989999999999", prefix="091646",
                           probe=100, contacts_before=0))
     check("the next run still probes both formats", "98" in d2.formats_tried
@@ -522,23 +592,25 @@ def test_probe_is_a_number_of_probes_not_a_target():
     d = FakeDriver([])          # nobody exists at all
     state = run(engine.boost(d, acct, "091646" and "091646" or "", prefix="091646",
                              probe=400, contacts_before=0))
-    check("it probed exactly 400", state["probed"] == 400, str(state["probed"]))
+    check("it probed the whole draw and stopped", 
+          state["probed"] == state["probe_total"], str(state["probed"]))
+    check("the draw is about 400 (jittered on purpose)",
+          360 <= state["probe_total"] <= 440, str(state["probe_total"]))
     check("it added nobody, and says so", state["matched"] == 0)
     check("it did NOT keep going looking for more",
-          numbers.cursor(acct, "091646") == 400,
-          str(numbers.cursor(acct, "091646")))
+          numbers.used_count(acct, "091646") == state["probe_total"],
+          str(numbers.used_count(acct, "091646")))
     card = engine.summary_card(acct, "989999999999", state)
     check("the card says NOBODY FOUND rather than DONE", "NOBODY FOUND" in card)
-    check("the card explains the next run moves on", "NEXT block" in card
-          or "next" in card.lower())
+    check("the card explains the next run picks different numbers",
+          "different set" in card, card)
 
 
 def test_peers_are_counted_once_not_carded_per_batch():
     print("\nno 'PEERS SAVED' card per batch -- one line on the summary instead")
     acct = fresh("peers")
-    # Enough real numbers that several batches each match somebody.
-    real = ["9891646" + str(i).zfill(5) for i in range(0, 200, 7)]
-    d = FakeDriver(real, already_contacts=0)
+    # Every 7th number matches, so several batches each import somebody.
+    d = FakeDriver(match_every=7, already_contacts=0)
     cards_posted: list[str] = []
     saved_calls: list[int] = []
 
@@ -597,15 +669,14 @@ def test_missing_bridge_skips_instead_of_clicking():
                              probe=400, report=rep))
     check("it did not run", not state["ok"])
     check("it said why", any("SKIPPED" in s for s in said))
-    check("the cursor did not move", numbers.cursor(acct, "091646") == 0)
+    check("no numbers were used up", numbers.used_count(acct, "091646") == 0)
 
 
 def test_unreadable_count_falls_back_honestly():
     print("\nif getContacts cannot be read, the card says the number is the "
           "server's own")
     acct = fresh("nolist")
-    real = ["98916460000" + str(i) for i in range(2)]
-    d = FakeDriver(real, list_bridge=False)
+    d = FakeDriver(match_every=25, list_bridge=False)   # 2 of 50
     state = run(engine.boost(d, acct, "989999999999", prefix="091646",
                              probe=50, contacts_before=7))
     check("it still completed", state["ok"])
@@ -622,12 +693,12 @@ def test_live_card_shows_the_counts():
         account="989213725238", phone="989213725238", prefix="091646",
         status="RUNNING", step="IMPORTING", probe_total=400, probed=200,
         matched=51, contacts_before=12, contacts_now=63,
-        first_number="09164600400", last_number="09164600799",
+        span=("09164600400", "09164609799"),
         phone_format="98", waited=0, elapsed=95.0)
     check("the header is the owner's shape", text.startswith("| \u2699 - #boost"))
     check("the phone line is there", "--| Phone - 989213725238" in text)
     check("the prefix is shown", "Prefix : 091646" in text)
-    check("the range is shown", "09164600400 \u2192 09164600799" in text)
+    check("the span is shown", "09164600400" in text and "09164609799" in text)
     check("progress is 200 of 400", "200 / 400" in text)
     check("the hit rate is shown", "Hit rate : 26%" in text, text)
     check("a bar is drawn", "\u2588" in text and "\u2591" in text)
@@ -639,13 +710,14 @@ def test_final_card_reports_both_numbers():
     text = boost_cards.finished(
         account="989213725238", phone="989213725238", prefix="091646",
         probe_total=400, probed=400, matched=87, contacts_before=12,
-        contacts_after=99, elapsed=161.0, first_number="09164600400",
-        next_number="09164600800", phone_format="98", waited=0,
-        left_under_prefix=99_200, lifetime_tried=400, lifetime_hits=87)
+        contacts_after=99, elapsed=161.0,
+        span=("09164600400", "09164609799"), phone_format="98", waited=0,
+        capacity=100_000, used_under_prefix=400, left_under_prefix=99_600,
+        lifetime_tried=400, lifetime_hits=87)
     for want in ("Numbers probed : 400", "Matched on Eitaa : 87",
                  "Contacts before : 12", "Contacts after : 99",
                  "Increase : +87", "Hit rate : 22%",
-                 "Next run starts at : 09164600800"):
+                 "Picked : at random between 09164600400 and 09164609799"):
         check(f"card shows {want!r}", want in text, text if want not in text else "")
 
 
@@ -655,15 +727,16 @@ def main() -> int:
     print("=" * 68)
     try:
         test_prefix_validation()
-        test_each_account_gets_a_DIFFERENT_block()
-        test_two_boosts_at_once_cannot_get_the_same_block()
-        test_an_unused_tail_goes_back()
-        test_migration_from_the_old_per_account_position()
-        test_shared_can_be_turned_off()
-        test_no_number_is_ever_probed_twice()
-        test_cursor_survives_and_reports()
-        test_exhausted_prefix_is_refused()
-        test_partial_block_at_the_end()
+        test_numbers_are_scattered_not_sequential()
+        test_a_number_is_never_handed_out_twice()
+        test_each_account_gets_DIFFERENT_numbers()
+        test_two_boosts_at_once_cannot_get_the_same_number()
+        test_unused_numbers_go_back()
+        test_the_packed_used_set_stays_small()
+        test_a_nearly_full_prefix_still_works()
+        test_sequential_mode_still_available()
+        test_migration_from_the_old_sequential_records()
+        test_shared_memory_can_be_turned_off()
         test_boost_measures_the_increase()
         test_matched_but_already_a_contact_is_not_counted_as_growth()
         test_cursor_advances_per_batch_not_at_the_end()

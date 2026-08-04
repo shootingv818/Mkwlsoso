@@ -24,6 +24,7 @@ Deliberate differences from bot.runner._contacts_job:
 from __future__ import annotations
 
 import asyncio
+import random
 import time
 
 from config import config
@@ -36,6 +37,23 @@ from . import numbers
 BATCH = int(getattr(config, "BOOST_BATCH", 50) or 50)
 #: Longest single FLOOD_WAIT worth sleeping through before giving up the run.
 MAX_WAIT = int(getattr(config, "MAX_FLOOD_WAIT", 90) or 90)
+#: Seconds between batches. The manual contacts job uses CONTACT_CREATE_DELAY,
+#: which defaults to 0.2s -- fine when a human is watching, but this runs
+#: unattended right after a login, on the account Eitaa is most suspicious of.
+#: 400 numbers at 2s per batch of 50 is under a minute either way.
+BOOST_DELAY = float(getattr(config, "BOOST_DELAY", 2.0) or 0)
+#: How much the probe count wobbles per run, in percent, so every run is not
+#: exactly the same size.
+JITTER_PCT = max(0, int(getattr(config, "BOOST_JITTER", 10) or 0))
+
+
+def _jitter(count: int) -> int:
+    """`count` give or take JITTER_PCT percent, never below 1."""
+    n = max(1, int(count or 0))
+    if JITTER_PCT <= 0:
+        return n
+    span = max(1, n * JITTER_PCT // 100)
+    return max(1, n + random.randint(-span, span))
 
 
 async def boost(driver, account: str, phone: str, *, prefix: str,
@@ -54,16 +72,16 @@ async def boost(driver, account: str, phone: str, *, prefix: str,
     """
     t0 = time.time()
     stop = should_stop or (lambda: False)
-    pace = float(config.CONTACT_CREATE_DELAY if delay is None else delay)
+    pace = float(BOOST_DELAY if delay is None else delay)
 
     state = {
         "ok": False, "reason": None, "prefix": "", "probe_total": int(probe or 0),
         "probed": 0, "matched": 0, "errors": 0, "waited": 0,
         "contacts_before": int(contacts_before or 0), "contacts_after": 0,
         "increase": 0, "peers_new": 0, "peers_total": 0,
-        "phone_format": None, "first_number": "",
-        "next_number": "", "stopped": False, "rate_limited": False,
-        "elapsed": 0.0, "note": None,
+        "phone_format": None, "asked": 0, "span": ("", ""),
+        "stopped": False, "rate_limited": False, "random": True,
+        "shared_range": True, "elapsed": 0.0, "note": None,
     }
 
     pfx, err = numbers.normalize_prefix(prefix)
@@ -77,11 +95,11 @@ async def boost(driver, account: str, phone: str, *, prefix: str,
     state["prefix"] = pfx
 
     state["shared_range"] = numbers.shared_enabled()
+    state["random"] = numbers.random_order()
     entries: list[dict] = []
-    start_at = 0
-    last_number = ""
+    indices: list[int] = []
 
-    async def draw(status: str, step: str, note: str | None = None) -> None:
+    async def show(status: str, step: str, note: str | None = None) -> None:
         if paint is None:
             return
         await paint(boost_cards.progress(
@@ -90,11 +108,11 @@ async def boost(driver, account: str, phone: str, *, prefix: str,
             matched=state["matched"],
             contacts_before=state["contacts_before"] or None,
             contacts_now=(state["contacts_before"] + state["matched"]) or None,
-            first_number=state["first_number"], last_number=last_number,
             phone_format=state["phone_format"], waited=state["waited"],
+            random_pick=state["random"], span=state["span"],
             elapsed=time.time() - t0, note=note))
 
-    await draw("STARTING", "PREPARING")
+    await show("STARTING", "PREPARING")
 
     if not await driver.ensure_contacts_bridge():
         # The per-number UI fallback exists in the manual contacts job, but it is
@@ -117,8 +135,13 @@ async def boost(driver, account: str, phone: str, *, prefix: str,
     # also consumes them. So it happens only once everything that could make the
     # run bail out has already been checked -- an unusable bridge used to burn a
     # whole block on the way out.
-    entries, start_at, err = numbers.next_numbers(account, pfx, probe,
-                                                  first_name=phone)
+    # The count is jittered so runs are not all EXACTLY the same size, which is
+    # itself a signature. The owner asked for "about 400", and that is what this
+    # is: 400 +/- JITTER percent.
+    asked = _jitter(probe)
+    state["asked"] = asked
+    entries, indices, err = numbers.next_numbers(account, pfx, asked,
+                                                 first_name=phone)
     if err or not entries:
         state["reason"] = err or "no numbers left under this prefix"
         if report is not None:
@@ -127,9 +150,8 @@ async def boost(driver, account: str, phone: str, *, prefix: str,
         state["elapsed"] = time.time() - t0
         return state
     state["probe_total"] = len(entries)
-    state["first_number"] = numbers.label(pfx, start_at)
-    last_number = numbers.label(pfx, start_at + len(entries) - 1)
-    state["last_number"] = last_number
+    state["span"] = (numbers.label(pfx, min(indices)),
+                     numbers.label(pfx, max(indices)))
 
     # ---- phone format: probe once per account, then remember ----------------
     # A wrong format matches NOBODY with no error at all, so both forms have to
@@ -145,7 +167,7 @@ async def boost(driver, account: str, phone: str, *, prefix: str,
     batch_size = max(1, BATCH)
     idx = 0
     total = len(entries)
-    await draw("RUNNING", "IMPORTING")
+    await show("RUNNING", "IMPORTING")
 
     while idx < total:
         if stop():
@@ -166,7 +188,7 @@ async def boost(driver, account: str, phone: str, *, prefix: str,
                 state["rate_limited"] = True
                 if wait and wait <= MAX_WAIT:
                     state["waited"] += wait
-                    await draw("WAITING", f"FLOOD - {wait}s",
+                    await show("WAITING", f"FLOOD - {wait}s",
                                note=f"Eitaa asked for {wait}s; the run continues "
                                     f"after that.")
                     await asyncio.sleep(wait)
@@ -243,19 +265,19 @@ async def boost(driver, account: str, phone: str, *, prefix: str,
         state["probed"] += len(chunk)
         idx += len(chunk)
 
-        await draw("RUNNING", "IMPORTING")
+        await show("RUNNING", "IMPORTING")
         if idx < total and pace > 0:
             await asyncio.sleep(pace)
 
-    # ---- hand back what was reserved but never submitted --------------------
-    # The block is claimed up front so two accounts can never be given the same
-    # numbers. A run that stopped early or was cut short by a limit must return
-    # its tail, or those numbers would be skipped by everybody.
-    numbers.release_unused(account, pfx, start_at, used=state["probed"],
-                           reserved=len(entries))
+    # ---- hand back what was claimed but never submitted ---------------------
+    # Numbers are claimed at draw time so two accounts can never be given the
+    # same one. A run that stopped early, or that a limit cut short, must return
+    # what it never used or those numbers would be lost to everybody.
+    if state["probed"] < len(indices):
+        state["returned"] = numbers.undraw(account, pfx, indices[state["probed"]:])
 
     # ---- the real "after" number -------------------------------------------
-    await draw("VERIFYING", "READING CONTACTS")
+    await show("VERIFYING", "READING CONTACTS")
     after = await _live_count(driver, default=None, save_cache=account)
     state["contacts_after"] = (after if after is not None
                                else state["contacts_before"] + state["matched"])
@@ -266,7 +288,6 @@ async def boost(driver, account: str, phone: str, *, prefix: str,
     state["increase"] = max(0, state["contacts_after"] - state["contacts_before"])
     state["ok"] = True
     state["elapsed"] = time.time() - t0
-    state["next_number"] = numbers.label(pfx, numbers.cursor(account, pfx))
     numbers.advance(account, pfx, probed=0, hits=0, finished_run=True)
     return state
 
@@ -308,14 +329,16 @@ def summary_card(account: str, phone: str, state: dict) -> str:
         contacts_before=int(state.get("contacts_before") or 0),
         contacts_after=int(state.get("contacts_after") or 0),
         elapsed=float(state.get("elapsed") or 0.0),
-        first_number=state.get("first_number") or "",
-        last_number=state.get("last_number") or "",
-        next_number=state.get("next_number") or "",
+        span=state.get("span") or ("", ""),
+        random_pick=bool(state.get("random")),
         shared_range=bool(state.get("shared_range")),
         accounts_served=int(st.get("accounts") or 0),
         phone_format=state.get("phone_format"),
         waited=int(state.get("waited") or 0),
+        returned=int(state.get("returned") or 0),
+        used_under_prefix=int(st.get("used") or 0),
         left_under_prefix=int(st.get("left") or 0),
+        capacity=int(st.get("capacity") or 0),
         lifetime_tried=int(st.get("tried") or 0),
         lifetime_hits=int(st.get("hits") or 0),
         peers_new=int(state.get("peers_new") or 0),

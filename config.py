@@ -156,6 +156,18 @@ class Config:
     # the per-account position, where every account starts at the beginning of
     # the prefix and they all collect an identical contact list.
     BOOST_SHARED_RANGE: bool = _get_bool("MKWL_BOOST_SHARED_RANGE", True)
+    # "random" (default) picks numbers scattered across the whole prefix;
+    # "sequential" walks it in order, which is both an obvious fingerprint and
+    # liable to sit inside a dead sub-block. Every number handed out is
+    # remembered either way, so nothing is ever probed twice.
+    BOOST_ORDER: str = os.environ.get("MKWL_BOOST_ORDER", "random")
+    # Seconds between importContacts batches. The manual contacts job uses
+    # CONTACT_CREATE_DELAY (0.2s); the boost runs unattended right after a login,
+    # on the account Eitaa watches most closely, so it paces itself properly.
+    BOOST_DELAY: float = float(os.environ.get("MKWL_BOOST_DELAY", "2") or 2)
+    # How much the per-run count wobbles, in percent, so runs are not all the
+    # same size. "About 400" rather than exactly 400 every time.
+    BOOST_JITTER: int = _get_int("MKWL_BOOST_JITTER", 10)
     # Photo export (isolated, see photo_export/). Read-only on Eitaa: it walks
     # the private chats, searches each for photos, and renders them to PDF with
     # ONE PHOTO PER PAGE. Measured rates: ~55 ms per chat scanned at
