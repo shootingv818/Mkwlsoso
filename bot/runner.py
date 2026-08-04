@@ -2173,26 +2173,17 @@ class JobManager:
             await report(cards.error_card("send_job", account, code=type(exc).__name__,
                                           detail=str(exc), trace_id=job.job_id))
         finally:
-            if stages is not None:
-                # Also covers the Force Stop (cancellation) path, so the card
-                # never sits there pretending to still work.
-                stages.stop()
-            # The live card paints in the background now, so the final state has
-            # to be pushed out explicitly when the job ends.
-            for card_obj in (live, getattr(agg, "live", None)):
-                flush = getattr(card_obj, "flush", None)
-                if flush is not None:
-                    try:
-                        await flush()
-                    except Exception:  # noqa: BLE001
-                        pass
-            if transport is not None:
-                try:
-                    await transport.close()
-                except Exception:  # noqa: BLE001
-                    pass
-            # Runs on the cancellation path too, so a Force Stop keeps its
-            # delivered-to record and the re-run does not repeat those sends.
+            # ---- WRITE TO DISK FIRST, BEFORE ANY await ----------------------
+            # These two used to sit at the END of this block, after awaiting the
+            # live-card flush and the transport close. That looked safe but was
+            # not: a task cancelled a SECOND time (Force Stop pressed again,
+            # which is exactly what an impatient stop does) raises CancelledError
+            # at the next await inside the finally, and `except Exception` cannot
+            # catch it because CancelledError derives from BaseException. The
+            # remainder of the block was skipped, so up to `flush_every`
+            # already-delivered recipients were never recorded and the next run
+            # messaged them again. Nothing may be awaited before the record is
+            # on disk.
             if ledger is not None:
                 try:
                     ledger.flush()
@@ -2208,6 +2199,28 @@ class JobManager:
                 except Exception:  # noqa: BLE001
                     pass
             self._busy.discard(account)
+
+            # ---- cosmetic / network cleanup, safe to lose -------------------
+            if stages is not None:
+                # Also covers the Force Stop (cancellation) path, so the card
+                # never sits there pretending to still work.
+                stages.stop()
+            # The live card paints in the background now, so the final state has
+            # to be pushed out explicitly when the job ends. BaseException, not
+            # Exception: a cancellation arriving here must not stop the transport
+            # from being closed.
+            for card_obj in (live, getattr(agg, "live", None)):
+                flush = getattr(card_obj, "flush", None)
+                if flush is not None:
+                    try:
+                        await flush()
+                    except BaseException:  # noqa: BLE001
+                        pass
+            if transport is not None:
+                try:
+                    await transport.close()
+                except BaseException:  # noqa: BLE001
+                    pass
 
     # ---- peer harvesting (what the browser-free sender needs) ----
     async def _harvest_peers(self, driver, account: str, report: Report,
