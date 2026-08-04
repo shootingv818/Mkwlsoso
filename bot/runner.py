@@ -808,7 +808,8 @@ class JobManager:
                 photos_available=res.get("photos_available") or 0,
                 rate_limited=bool(res.get("rate_limited")),
                 waited=res.get("waited") or 0,
-                note=res.get("note")))
+                note=res.get("note"),
+                top_chats=res.get("top_chats") or []))
         except Exception as exc:  # noqa: BLE001
             await report(cards.error_card("photo_export", account,
                                           code=type(exc).__name__,

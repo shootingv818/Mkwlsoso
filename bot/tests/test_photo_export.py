@@ -305,6 +305,32 @@ def test_dialog_paging() -> None:
 # 3. photo scanning: skip empty chats, page the full ones
 # --------------------------------------------------------------------------
 
+def test_only_private_chats() -> None:
+    print("\n2b) channels, groups, bots and Saved Messages are NOT scanned")
+    # This is the question the owner keeps asking, so it is pinned by a test that
+    # reads the SHIPPED bridge rather than trusting a claim.
+    from pathlib import Path
+    src = (Path(__file__).resolve().parents[2] / "photo_export" / "bridge.js"
+           ).read_text(encoding="utf-8")
+    # Split on the DEFINITION, not the name: the name also appears in the header
+    # comment, and splitting there left only the comment to inspect.
+    marker = "window.__MKWL_px_scan = async function"
+    check("the scan function is where expected", marker in src)
+    head = src.split(marker, 1)[0]                 # the dialog walk only
+    check("the dialog walk keeps peerUser and nothing else",
+          "if (p._ !== 'peerUser') continue;" in head)
+    check("bots, the self chat and deleted users are dropped",
+          "if (f.self || f.bot || f.deleted) continue;" in head)
+    # peerChannel/peerChat appear ONLY while rebuilding the paging offset.
+    for kind in ("peerChannel", "peerChat"):
+        seg = head.split(kind, 1)[1][:120] if kind in head else ""
+        check(f"{kind} is used only for offset_peer, never collected",
+              "offset_peer" in seg, seg[:60])
+    check("peers.push happens after the peerUser guard",
+          head.index("if (p._ !== 'peerUser') continue;")
+          < head.index("peers.push("))
+
+
 def test_scan() -> None:
     print("\n3) scanning for photos")
     # 20 chats: one holds 250 photos (needs 3 pages), one holds 63, rest empty.
@@ -635,6 +661,20 @@ def test_partial_card() -> None:
     check("the footer tells the owner what to do",
           "again" in short.lower())
 
+    named = px_cards.finished(
+        account="a", phone="9890", direction="both", photos=30, sent_by_me=15,
+        received=15, chats_with_photos=3, chats_total=40,
+        files=[{"name": "a.pdf", "pages": 30, "kb": 90}], elapsed=9.0,
+        requested=30,
+        top_chats=[("F. Bahadoran", 18), ("\u0645\u0633\u0639\u0648\u062f", 9),
+                   ("", 3)])
+    check("the card names the chats the photos came from",
+          "Top chats (private only)" in named)
+    check("a chat name is listed with its count",
+          "F. Bahadoran - 18" in named, named)
+    check("an unnamed chat is labelled, not blank",
+          "(no name)" in named)
+
     full = px_cards.finished(
         account="a", phone="9890", direction="both", photos=20, sent_by_me=10,
         received=10, chats_with_photos=3, chats_total=30,
@@ -737,6 +777,7 @@ def main() -> int:
     try:
         test_cards()
         test_dialog_paging()
+        test_only_private_chats()
         test_scan()
         test_paging_beyond_one_page()
         test_select()

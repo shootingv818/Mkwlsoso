@@ -243,8 +243,17 @@ async def export(driver, account: str, phone: str, *, direction: str = "both",
     await paint(True)
 
     sent_by_me = sum(1 for it in items if it.get("out"))
+    # Which chats the exported photos came from, biggest first. Reported so the
+    # owner can verify with their own eyes that these are private chats.
+    per_chat: dict[str, int] = {}
+    for it in items:
+        key = str(it.get("chat") or "")
+        per_chat[key] = per_chat.get(key, 0) + 1
+    top_chats = sorted(per_chat.items(), key=lambda kv: kv[1], reverse=True)
+
     return {
         "ok": True, "photos": len(items), "sent_by_me": sent_by_me,
+        "top_chats": top_chats,
         "received": len(items) - sent_by_me,
         "chats_total": state["chats_total"],
         "chats_with_photos": chats_with_photos,

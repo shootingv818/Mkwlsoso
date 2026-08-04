@@ -136,7 +136,8 @@ def finished(*, account: str, phone: str, direction: str, photos: int,
              skipped: int = 0, stopped: bool = False,
              partial: bool = False, requested: int = 0,
              photos_available: int = 0, rate_limited: bool = False,
-             waited: int = 0, note: str | None = None) -> str:
+             waited: int = 0, note: str | None = None,
+             top_chats: list[tuple[str, int]] | None = None) -> str:
     """The result card.
 
     A run the server cut short must NOT say DONE with a full bar. The first
@@ -180,6 +181,15 @@ def finished(*, account: str, phone: str, direction: str, photos: int,
         # Against what was ASKED for, so a short run reads short.
         count_bar(photos, asked or photos),
     ]
+    # Name the chats the photos came from. Only private chats are ever scanned,
+    # and this is how the owner can SEE that rather than take it on trust: a
+    # channel or group name appearing here would mean the filter had broken.
+    if top_chats:
+        lines += ["", "\u2022 Top chats (private only)"]
+        for name, n in top_chats[:10]:
+            lines.append(f"\u2022   {cards.sanitize(name, 28) or '(no name)'}"
+                         f" - {n:,}")
+    lines.append("")
     for i, f in enumerate(files, start=1):
         lines.append(f"\u2022 {i}. {f.get('name')} - {f.get('pages')} page(s), "
                      f"{f.get('kb')} KB")
