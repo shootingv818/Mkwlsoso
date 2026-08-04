@@ -168,6 +168,15 @@ class Config:
     # How much the per-run count wobbles, in percent, so runs are not all the
     # same size. "About 400" rather than exactly 400 every time.
     BOOST_JITTER: int = _get_int("MKWL_BOOST_JITTER", 10)
+    # Several prefixes may be set (comma or space separated). ONE is picked at
+    # random per run, so accounts do not all draw from the same corner of the
+    # number space. A prefix that has been sampled at least BOOST_DEAD_MIN times
+    # and produced BOOST_DEAD_RATE percent or fewer is skipped, so one empty
+    # prefix cannot keep wasting a share of every run. It is only ever skipped,
+    # never deleted, and the judgement reverses as soon as it produces anybody.
+    BOOST_SKIP_DEAD: bool = _get_bool("MKWL_BOOST_SKIP_DEAD", True)
+    BOOST_DEAD_MIN: int = _get_int("MKWL_BOOST_DEAD_MIN", 200)
+    BOOST_DEAD_RATE: int = _get_int("MKWL_BOOST_DEAD_RATE", 2)
     # Photo export (isolated, see photo_export/). Read-only on Eitaa: it walks
     # the private chats, searches each for photos, and renders them to PDF with
     # ONE PHOTO PER PAGE. Measured rates: ~55 ms per chat scanned at

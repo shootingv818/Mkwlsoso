@@ -458,6 +458,23 @@ def kb_content():
     ]
 
 
+def _boost_prefix_label() -> str:
+    """A button label that fits: the prefix itself, or how many there are."""
+    raw = store.boost_prefix
+    if not raw:
+        return "— not set —"
+    try:
+        from contacts_boost import numbers as boost_numbers
+        good, _ = boost_numbers.parse_prefixes(raw)
+    except Exception:  # noqa: BLE001
+        return raw[:24]
+    if not good:
+        return "— invalid —"
+    if len(good) == 1:
+        return good[0]
+    return f"{len(good)} prefixes"
+
+
 def kb_settings():
     rows = []
     # The engine switch is back, now with three choices: bridge (proven page),
@@ -488,7 +505,7 @@ def kb_settings():
         [Button.inline(
             f"👥 Contact Boost: {'ON' if store.boost else 'OFF'}",
             b"set:boost")],
-        [Button.inline(f"🔢 Boost Prefix: {store.boost_prefix or '— not set —'}",
+        [Button.inline(f"🔢 Prefixes: {_boost_prefix_label()}",
                        b"set:boostprefix"),
          Button.inline(f"🎯 Probe: {store.boost_probe}", b"set:boostprobe")],
         [Button.inline("⬅ Back", b"menu:home")],
@@ -630,30 +647,37 @@ def settings_text() -> str:
                           if store.apk_octet else "off — normal apk MIME"),
         ("Warm Path    ", "on — reuse the booted page, skip redundant loads"
                           if store.warmpath else "off — reload the web app per job"),
-        ("Contact Boost", (f"on — probes {store.boost_probe} numbers under "
-                           f"{store.boost_prefix}" if store.boost_prefix
+        ("Contact Boost", (f"on — about {store.boost_probe} numbers per run"
+                           if store.boost_prefix
                            else "on — but NO PREFIX IS SET, so it cannot run")
                           if store.boost else "off — a new account gets no contacts"),
     ]
     if store.boost and store.boost_prefix:
-        # A number is never probed twice for the same account, so the useful
-        # figure is how much of the prefix is still unused.
+        # Every number is remembered, so the useful figures are how productive
+        # each prefix has been and how much of it is still unused.
         try:
             from contacts_boost import numbers as boost_numbers
-            active = store.active_account
-            if active:
-                st = boost_numbers.stats(active, store.boost_prefix)
-                if st.get("used"):
-                    pairs.append(("Boost so far ",
-                                  f"{st['hits_all']:,} found in {st['used']:,} "
-                                  f"used of {st['capacity']:,}"
-                                  f" — {st['left']:,} left"
-                                  + (f", {st['accounts']} account(s)"
-                                     if st.get("accounts", 0) > 1 else "")))
+            rows = boost_numbers.pool(store.active_account or "",
+                                      store.boost_prefix)
+            pairs.append(("Boost pool   ",
+                          f"{len(rows)} prefix(es), one picked at random per run"))
+            for st in rows:
+                if st["used"]:
+                    rate = (f"{st['hits_all'] * 100 / st['used']:.0f}%"
+                            if st["used"] else "--")
+                    txt = (f"{st['hits_all']:,} found in {st['used']:,} "
+                           f"({rate}) — {st['left']:,} left")
+                else:
+                    txt = f"{st['capacity']:,} numbers, not sampled yet"
+                if st["dead"]:
+                    txt += "  ⚠ skipped"
+                pairs.append((f"  {st['prefix']}", txt))
+            if rows:
                 pairs.append(("Boost picks  ",
-                              ("at random across the prefix"
-                               if st.get("random") else "in order (sequential)")
-                              + (", shared memory" if st.get("shared")
+                              ("numbers at random across the prefix"
+                               if rows[0].get("random")
+                               else "numbers in order (sequential)")
+                              + (", shared memory" if rows[0].get("shared")
                                  else ", per-account memory")))
         except Exception:  # noqa: BLE001 - a settings screen must always render
             pass
@@ -874,27 +898,26 @@ async def _handle_callback(event):
             return await event.answer(
                 "No prefix set. Settings → 'Boost Prefix' first.", alert=True)
         from contacts_boost import numbers as boost_numbers
-        st = boost_numbers.stats(active, store.boost_prefix)
-        if not st.get("left"):
+        rows = boost_numbers.pool(active, store.boost_prefix)
+        left = sum(st["left"] for st in rows)
+        if not left:
             return await event.answer(
-                "Every number under this prefix has already been probed. "
-                "Set a different prefix in Settings.", alert=True)
+                "Every number under these prefixes has already been used. "
+                "Add another prefix in Settings.", alert=True)
         await manager.run_boost(active, report, store.account_phone(active),
                                 live=LiveCard(config.report_to()))
         await event.answer("Boosting contacts…")
+        pairs = [("Phone  ", store.account_phone(active)),
+                 ("Pool   ", f"{len(rows)} prefix(es) — one picked at random"),
+                 ("Probing", f"about {store.boost_probe:,} numbers"),
+                 ("Picking", "at random from across the prefix"
+                             if rows and rows[0].get("random") else "in order"),
+                 ("Memory ", "shared — no two accounts get the same number"
+                             if rows and rows[0].get("shared") else
+                             "per account — accounts may overlap"),
+                 ("Left in pool", f"{left:,} numbers")]
         return await event.edit(
-            cards.card("👥 CONTACT BOOST QUEUED",
-                       [("Phone  ", store.account_phone(active)),
-                        ("Prefix ", f"{store.boost_prefix}"
-                                    f"  ({st['capacity']:,} numbers)"),
-                        ("Probing", f"about {store.boost_probe:,} numbers"),
-                        ("Picking", "at random from across the prefix"
-                                    if st.get("random") else "in order"),
-                        ("Memory ", "shared — no two accounts get the same number"
-                                    if st.get("shared") else
-                                    "per account — accounts may overlap"),
-                        ("Used so far", f"{st['used']:,} of {st['capacity']:,}"
-                                        f"  ({st['left']:,} left)")],
+            cards.card("👥 CONTACT BOOST QUEUED", pairs,
                        footer="These numbers have never been handed to ANY account, so "
                               "these contacts are this account's alone. Most random "
                               "numbers are not on Eitaa, so what gets added is whatever "
@@ -1074,15 +1097,26 @@ async def _handle_callback(event):
         return await event.edit(settings_text(), buttons=kb_settings())
     if data == "set:boostprefix":
         pending[event.sender_id] = {"step": "await_boostprefix"}
+        from contacts_boost import numbers as boost_numbers
+        rows = [("Current", store.boost_prefix or "not set"),
+                ("Probe per run", f"about {store.boost_probe}")]
+        for st in boost_numbers.pool(store.active_account or "",
+                                     store.boost_prefix):
+            note = (f"{st['hits_all']:,} found in {st['used']:,} used"
+                    f", {st['left']:,} left" if st["used"]
+                    else f"{st['capacity']:,} numbers, untouched")
+            if st["dead"]:
+                note += "  ⚠ skipped: found nobody"
+            rows.append((f"  {st['prefix']}", note))
         return await event.edit(
-            cards.card("🔢 BOOST PREFIX",
-                       [("Current", store.boost_prefix or "not set"),
-                        ("Probe per run", store.boost_probe)],
-                       footer="Send an Iranian mobile prefix, e.g. 0916 or 091646. "
-                              "The shorter it is, the more numbers it covers. It is "
-                              "saved, and every number probed under it is remembered "
-                              "so no number is ever tried twice for the same "
-                              "account."),
+            cards.card("🔢 BOOST PREFIXES", rows,
+                       footer="Send ONE or SEVERAL Iranian mobile prefixes, "
+                              "separated by commas or spaces:\n"
+                              "0913151, 0913152, 0913153\n\n"
+                              "One of them is picked AT RANDOM for each run. The "
+                              "shorter a prefix is the more numbers it covers, but "
+                              "7 digits keeps the statistics per block so you can "
+                              "see which ones are worth keeping."),
             buttons=kb_back())
     if data == "set:boostprobe":
         pending[event.sender_id] = {"step": "await_boostprobe"}
@@ -1367,19 +1401,34 @@ async def _conversation(event):
 
     if step == "await_boostprefix":
         from contacts_boost import numbers as boost_numbers
-        pfx, err = boost_numbers.normalize_prefix(text)
-        if err:
-            return await event.respond(f"Invalid prefix: {err}")
-        store.set_boost_prefix(pfx)
+        good, bad = boost_numbers.parse_prefixes(text)
+        if not good:
+            reason = bad[0][1] if bad else "no prefix found in that"
+            return await event.respond(f"Invalid: {reason}\n\nSend one or more "
+                                       f"prefixes, e.g. 0913151, 0913152, 0913153")
+        store.set_boost_prefix(", ".join(good))
         pending.pop(event.sender_id, None)
-        cap = boost_numbers.capacity(pfx)
+        rows = [("Prefixes", f"{len(good)} — one is picked at random per run")]
+        total = 0
+        for p in good:
+            cap = boost_numbers.capacity(p)
+            total += cap
+            st = boost_numbers.stats(store.active_account or "", p)
+            rows.append((f"  {p}", f"{cap:,} numbers"
+                                   + (f", {st['used']:,} already used"
+                                      if st.get("used") else "")))
+        rows.append(("Total pool", f"{total:,} numbers"))
+        rows.append(("Probe per run", f"about {store.boost_probe}"))
+        rows.append(("Boost", "ON" if store.boost
+                              else "OFF — turn it on to use this"))
+        if bad:
+            rows.append(("Ignored", ", ".join(f"{t} ({r})" for t, r in bad[:3])))
         await event.respond(cards.card(
-            "🔢 BOOST PREFIX SAVED",
-            [("Prefix", pfx), ("Numbers under it", f"{cap:,}"),
-             ("Probe per run", store.boost_probe),
-             ("Boost", "ON" if store.boost else "OFF — turn it on to use this")],
-            footer="Each account keeps its own position in this range, so a "
-                   "number is never probed twice for the same account."))
+            "🔢 BOOST PREFIXES SAVED", rows,
+            footer="One prefix is chosen at random for each run, so accounts do "
+                   "not all draw from the same corner of the number space. Every "
+                   "number handed out is remembered per prefix, so none is ever "
+                   "used twice."))
         return await event.respond(settings_text(), buttons=kb_settings())
 
     if step == "await_boostprobe":

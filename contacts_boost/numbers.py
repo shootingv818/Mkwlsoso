@@ -79,6 +79,25 @@ def shared_path() -> Path:
     return config.DATA_DIR / "boost_range.json"
 
 
+def parse_prefixes(raw: str) -> tuple[list[str], list[tuple[str, str]]]:
+    """Split a setting like "0913151, 0913152 0913153" into prefixes.
+
+    Returns (good, bad) where bad is [(text, reason)]. Duplicates are dropped and
+    the original order is kept, so the Settings screen can echo it back.
+    """
+    good: list[str] = []
+    bad: list[tuple[str, str]] = []
+    for chunk in re.split(r"[,\s;/|]+", str(raw or "")):
+        if not chunk.strip():
+            continue
+        p, err = normalize_prefix(chunk)
+        if err:
+            bad.append((chunk.strip(), err))
+        elif p not in good:
+            good.append(p)
+    return good, bad
+
+
 def normalize_prefix(raw: str) -> tuple[str, str | None]:
     """Return (prefix, error). The prefix is the national form, e.g. "0913151"."""
     p = re.sub(r"\D", "", str(raw or ""))
@@ -217,15 +236,20 @@ def remember_format(account: str, fmt: str) -> None:
 
 # ------------------------------------------------------------ the used-set row
 
-def _legacy_used(prefix: str) -> set[int]:
-    """Convert the OLD sequential `cursor` records into used indices.
+def _legacy_stats(prefix: str) -> tuple[set[int], int]:
+    """Fold the OLD per-account records into the shared memory.
 
     Earlier versions handed out numbers 0..cursor in order and stored only the
-    position. Those numbers really were used, so they are folded into the set --
+    position. Those numbers really were used, so they become used indices --
     otherwise the first random draw after an upgrade could hand an account
     numbers another account already holds.
+
+    The HITS are adopted too. Without that, a prefix carried over from before the
+    shared file existed would read "400 used, 0 found" and the dead-prefix check
+    below would wrongly retire a perfectly good prefix.
     """
     used: set[int] = set()
+    hits = 0
     try:
         for path in config.DATA_DIR.glob("boost_*.json"):
             if path.name == "boost_range.json":
@@ -238,9 +262,10 @@ def _legacy_used(prefix: str) -> set[int]:
             cur = int(row.get("cursor") or 0)
             if cur > 0:
                 used.update(range(0, min(cur, 5_000_000)))
+                hits += int(row.get("hits") or 0)
     except Exception:  # noqa: BLE001
         pass
-    return used
+    return used, hits
 
 
 def _row(data: dict, prefix: str, *, shared: bool) -> dict:
@@ -249,10 +274,12 @@ def _row(data: dict, prefix: str, *, shared: bool) -> dict:
     if row is None:
         row = {"used": [], "tried": 0, "hits": 0, "runs": 0, "draws": []}
         if shared:
-            legacy = _legacy_used(prefix)
+            legacy, legacy_hits = _legacy_stats(prefix)
             if legacy:
                 row["used"] = _pack(legacy)
                 row["tried"] = len(legacy)
+                row["hits"] = legacy_hits
+                row["runs"] = 1
                 row["migrated_from_sequential"] = len(legacy)
         prefixes[prefix] = row
     row.setdefault("used", [])
@@ -455,6 +482,77 @@ def stats(account: str, prefix: str) -> dict:
             "shared": shared,
             "accounts": accounts,
             "random": random_order()}
+
+
+def pool(account: str, raw: str) -> list[dict]:
+    """Per-prefix state for every prefix in the setting, in the order given."""
+    prefixes, _ = parse_prefixes(raw)
+    out = []
+    for p in prefixes:
+        st = stats(account, p)
+        st["prefix"] = p
+        st["dead"] = _is_dead(st)
+        out.append(st)
+    return out
+
+
+def _is_dead(st: dict) -> bool:
+    """A prefix that has been sampled enough and returned (almost) nobody.
+
+    Without this, one empty prefix in the pool would keep being chosen and would
+    waste a share of every run forever. It is only ever a SKIP, never a delete:
+    the numbers stay available and the judgement reverses itself the moment the
+    prefix produces anybody.
+    """
+    if not bool(getattr(config, "BOOST_SKIP_DEAD", True)):
+        return False
+    used = int(st.get("used") or 0)
+    floor = int(getattr(config, "BOOST_DEAD_MIN", 200) or 200)
+    if used < max(1, floor):
+        return False
+    rate = int(getattr(config, "BOOST_DEAD_RATE", 2) or 0)
+    hits = int(st.get("hits_all") or 0)
+    return (hits * 100) <= (used * rate)
+
+
+def choose_prefix(account: str, raw: str) -> tuple[str, str | None, dict]:
+    """Pick ONE prefix at RANDOM from the pool, for this run.
+
+    Random rather than "use one up, then move on": the whole point of several
+    prefixes is that the accounts do not all draw from the same corner of the
+    number space. Exhausted prefixes are dropped, and prefixes that have proven
+    empty are skipped (see _is_dead) unless there is nothing else left.
+
+    Returns (prefix, error, info) -- `info` is what the card reports.
+    """
+    prefixes, bad = parse_prefixes(raw)
+    info = {"pool": len(prefixes), "bad": bad, "full": [], "dead": [],
+            "candidates": []}
+    if not prefixes:
+        reason = ("no usable prefix is set"
+                  + (f" ({bad[0][1]})" if bad else ""))
+        return "", reason, info
+
+    alive, dead = [], []
+    for p in prefixes:
+        st = stats(account, p)
+        if st.get("left", 0) <= 0:
+            info["full"].append(p)
+            continue
+        if _is_dead(st):
+            info["dead"].append(p)
+            dead.append(p)
+            continue
+        alive.append(p)
+
+    # Everything is either used up or looks empty: rather than refuse, fall back
+    # to the "empty" ones -- a 0% sample is evidence, not proof.
+    candidates = alive or dead
+    if not candidates:
+        return "", (f"every number under {', '.join(prefixes)} has been used; "
+                    f"add another prefix in Settings"), info
+    info["candidates"] = candidates
+    return random.choice(candidates), None, info
 
 
 def draws(prefix: str, limit: int = 10) -> list[dict]:

@@ -81,14 +81,8 @@ def fresh(account: str = "acct") -> str:
     The SHARED position is wiped too, otherwise one test's blocks would push the
     next test's starting point and the assertions would drift.
     """
-    numbers.forget(account)
     contacts_store.forget(account)
-    try:
-        p = numbers.shared_path()
-        if p.is_file():
-            p.unlink()
-    except OSError:
-        pass
+    wipe_all()
     return account
 
 
@@ -217,12 +211,193 @@ def test_prefix_validation():
 
 
 def wipe_shared() -> None:
+    """Remove only the SHARED memory (per-account files survive)."""
     p = numbers.shared_path()
     try:
         if p.is_file():
             p.unlink()
     except OSError:
         pass
+
+
+def wipe_all() -> None:
+    """A real clean slate.
+
+    The migration scan reads EVERY boost_*.json in DATA_DIR to fold old
+    sequential positions in, so a leftover file from one test would seed the
+    next one's memory. Production never wipes the shared file, so this is a test
+    concern only.
+    """
+    from config import config as _cfg
+    for path in _cfg.DATA_DIR.glob("boost_*.json"):
+        try:
+            path.unlink()
+        except OSError:
+            pass
+
+
+def test_several_prefixes_can_be_set():
+    print("\nseveral prefixes can be given at once, however they are typed")
+    good, bad = numbers.parse_prefixes("0913151, 0913152 0913153")
+    check("all three parsed", good == ["0913151", "0913152", "0913153"], str(good))
+    check("nothing rejected", not bad, str(bad))
+    good, bad = numbers.parse_prefixes("0913151\n0913151\n09131 52")
+    check("duplicates dropped", good.count("0913151") == 1, str(good))
+    good, bad = numbers.parse_prefixes("0913151, 021445, hello")
+    check("the good one survives", "0913151" in good, str(good))
+    check("the bad ones are reported with a reason", len(bad) == 2, str(bad))
+    check("and the reason is readable", "09" in bad[0][1], str(bad[0]))
+
+
+def test_one_prefix_is_picked_at_random_per_run():
+    print("\nONE prefix is picked at RANDOM each run, not used up in turn")
+    wipe_shared()
+    acct = fresh("pick")
+    raw = "0913151, 0913152, 0913153"
+    seen = {}
+    for _ in range(60):
+        p, err, info = numbers.choose_prefix(acct, raw)
+        check_once = err is None and p
+        if not check_once:
+            check("a prefix was chosen", False, str(err))
+            return
+        seen[p] = seen.get(p, 0) + 1
+        check_once = None
+    check("all three get chosen over 60 runs", len(seen) == 3, str(seen))
+    check("none of them dominates", all(5 <= n <= 40 for n in seen.values()),
+          str(seen))
+    check("the pool size is reported", info["pool"] == 3, str(info))
+
+
+def test_numbers_stay_unique_across_prefixes():
+    print("\nnumbers never repeat, whichever prefix they came from")
+    wipe_shared()
+    acct = fresh("across")
+    raw = "0913151, 0913152, 0913153"
+    seen: set[str] = set()
+    for _ in range(15):
+        p, err, _ = numbers.choose_prefix(acct, raw)
+        if err:
+            break
+        entries, idx, err = numbers.next_numbers(acct, p, 200)
+        if err:
+            continue
+        phones = {e["phone"] for e in entries}
+        overlap = seen & phones
+        if overlap:
+            check("no number was handed out twice", False, str(sorted(overlap)[:5]))
+            return
+        seen.update(phones)
+    check("3,000 numbers, all distinct", len(seen) == 3000, str(len(seen)))
+    check("and they span more than one prefix",
+          len({p[:10] for p in seen}) > 1, str(len({p[:10] for p in seen})))
+
+
+def test_an_exhausted_prefix_drops_out_of_the_pool():
+    print("\na prefix with nothing left stops being offered")
+    wipe_all()
+    acct = "drained"
+    raw = "091315123, 0913152"          # the first holds only 100 numbers
+    numbers.draw(acct, "091315123", 100)
+    check("the small one is full",
+          numbers.stats(acct, "091315123")["left"] == 0)
+    for _ in range(20):
+        p, err, info = numbers.choose_prefix(acct, raw)
+        check("something was still chosen", err is None and p, str(err))
+        if p != "0913152":
+            check("the full prefix was not offered", False, p)
+            return
+    check("only the one with numbers left is offered", True)
+    check("and the card can say which was skipped",
+          info["full"] == ["091315123"], str(info["full"]))
+
+
+def test_a_prefix_that_finds_nobody_is_retired():
+    print("\na prefix that has been sampled and found NOBODY stops wasting runs")
+    wipe_shared()
+    acct = fresh("empty-block")
+    raw = "0913151, 0913152"
+    # 0913152 sampled 400 times, nobody found. 0913151 sampled 400, 284 found.
+    numbers.draw(acct, "0913152", 400)
+    numbers.advance(acct, "0913152", probed=400, hits=0)
+    numbers.draw(acct, "0913151", 400)
+    numbers.advance(acct, "0913151", probed=400, hits=284)
+    for _ in range(20):
+        p, err, info = numbers.choose_prefix(acct, raw)
+        if p != "0913151":
+            check("the empty prefix was skipped", False, p)
+            return
+    check("only the productive prefix is offered", True)
+    check("the skip is reported so it is visible",
+          info["dead"] == ["0913152"], str(info["dead"]))
+    # ...and one hit is enough to bring it back. A 0% sample is evidence, not proof.
+    numbers.advance(acct, "0913152", probed=0, hits=20)
+    _, _, info2 = numbers.choose_prefix(acct, raw)
+    check("one hit brings it back", not info2["dead"], str(info2["dead"]))
+
+
+def test_retiring_never_leaves_nothing_to_do():
+    print("\nif EVERY prefix looks empty it still runs, rather than refusing")
+    print("  (a 0% sample is evidence, not proof)")
+    wipe_shared()
+    acct = fresh("all-empty")
+    raw = "0913151, 0913152"
+    for p in ("0913151", "0913152"):
+        numbers.draw(acct, p, 400)
+        numbers.advance(acct, p, probed=400, hits=0)
+    p, err, info = numbers.choose_prefix(acct, raw)
+    check("it still chose one", err is None and p in ("0913151", "0913152"),
+          f"{p!r} err={err}")
+    check("and both were flagged", len(info["dead"]) == 2, str(info["dead"]))
+
+
+def test_the_migrated_prefix_is_not_mistaken_for_empty():
+    print("\nthe prefix boosted BEFORE the shared memory existed keeps its hits")
+    print("  (otherwise it would read '400 used, 0 found' and be retired)")
+    wipe_all()
+    # Exactly the shape the live account was left in: its own file holds the old
+    # cursor AND the hits, and the shared file does not exist yet.
+    numbers.advance("legacy", "0913151", probed=400, hits=284)
+    data = numbers.load("legacy")
+    data["prefixes"]["0913151"]["cursor"] = 400
+    numbers._write("legacy", data)
+    wipe_shared()
+    st = numbers.stats("legacy", "0913151")
+    check("the 400 numbers carried over", st["used"] == 400, str(st["used"]))
+    check("and so did the 284 hits", st["hits_all"] == 284, str(st["hits_all"]))
+    check("so it is NOT retired", not st["dead"] if "dead" in st else True)
+    _, _, info = numbers.choose_prefix("legacy", "0913151")
+    check("it stays in the pool", not info["dead"], str(info["dead"]))
+
+
+def test_no_prefix_at_all_is_explained():
+    print("\nan empty or unusable prefix setting says what to do")
+    p, err, info = numbers.choose_prefix("nobody", "")
+    check("nothing was chosen", not p)
+    check("and it says why", err is not None and "prefix" in err, str(err))
+    p, err, info = numbers.choose_prefix("nobody", "021445, 12")
+    check("garbage is refused too", not p and err, str(err))
+    check("with the reason from the first bad one", info["bad"], str(info["bad"]))
+
+
+def test_the_pool_view_reports_each_prefix():
+    print("\nthe Settings pool view reports every prefix separately")
+    wipe_shared()
+    acct = fresh("poolview")
+    raw = "0913151, 0913152, 0913153"
+    numbers.draw(acct, "0913151", 400)
+    numbers.advance(acct, "0913151", probed=400, hits=284)
+    rows = numbers.pool(acct, raw)
+    check("one row per prefix", len(rows) == 3, str(len(rows)))
+    check("the order given is kept",
+          [r["prefix"] for r in rows] == ["0913151", "0913152", "0913153"],
+          str([r["prefix"] for r in rows]))
+    first = rows[0]
+    check("the sampled one shows its hits", first["hits_all"] == 284,
+          str(first["hits_all"]))
+    check("and what is left", first["left"] == 9600, str(first["left"]))
+    check("the untouched ones show full capacity",
+          rows[1]["left"] == 10000 and rows[1]["used"] == 0, str(rows[1]))
 
 
 def test_numbers_are_scattered_not_sequential():
@@ -264,9 +439,7 @@ def test_a_number_is_never_handed_out_twice():
 
 def test_each_account_gets_DIFFERENT_numbers():
     print("\nevery account gets its own numbers -- no shared contacts")
-    wipe_shared()
-    for a in ("acc1", "acc2", "acc3"):
-        numbers.forget(a)
+    wipe_all()
     got = {}
     for a in ("acc1", "acc2", "acc3"):
         _, idx, err = numbers.next_numbers(a, "0913151", 400)
@@ -284,9 +457,7 @@ def test_each_account_gets_DIFFERENT_numbers():
 
 def test_two_boosts_at_once_cannot_get_the_same_number():
     print("\nmulti-parallel: numbers are claimed at DRAW time")
-    wipe_shared()
-    numbers.forget("p1")
-    numbers.forget("p2")
+    wipe_all()
     # Both ask before either has submitted anything -- the race that would hand
     # out the same numbers if they were only marked as batches completed.
     _, i1, _ = numbers.next_numbers("p1", "0913151", 400)
@@ -297,9 +468,8 @@ def test_two_boosts_at_once_cannot_get_the_same_number():
 
 def test_unused_numbers_go_back():
     print("\na run that stops early hands its unused numbers back")
-    wipe_shared()
+    wipe_all()
     acct = "give-back"
-    numbers.forget(acct)
     _, idx, _ = numbers.next_numbers(acct, "0913151", 400)
     check("400 are marked used", numbers.used_count(acct, "0913151") == 400)
     freed = numbers.undraw(acct, "0913151", idx[100:])
@@ -322,9 +492,8 @@ def test_the_packed_used_set_stays_small():
           str(numbers._pack(set(range(400)))))
     check("packing round-trips exactly",
           numbers._unpack(numbers._pack({1, 2, 3, 9, 40, 41})) == {1, 2, 3, 9, 40, 41})
-    wipe_shared()
+    wipe_all()
     acct = "packed"
-    numbers.forget(acct)
     numbers.next_numbers(acct, "0913151", 400)
     raw = numbers.shared_path().read_text(encoding="utf-8")
     check("the file stays well under 20 KB", len(raw) < 20_000, f"{len(raw)} bytes")
@@ -334,9 +503,8 @@ def test_the_packed_used_set_stays_small():
 def test_a_nearly_full_prefix_still_works():
     print("\nwhen the prefix is nearly used up, the draw is exact, not a guess")
     print("  (rejection sampling alone would spin at high density)")
-    wipe_shared()
+    wipe_all()
     acct = "dense"
-    numbers.forget(acct)
     cap = numbers.capacity("091315123")        # 100 numbers
     check("that prefix holds 100", cap == 100, str(cap))
     got: set[int] = set()
@@ -354,8 +522,7 @@ def test_a_nearly_full_prefix_still_works():
 
 def test_sequential_mode_still_available():
     print("\nMKWL_BOOST_ORDER=sequential restores the in-order walk")
-    wipe_shared()
-    numbers.forget("seq")
+    wipe_all()
     import config as config_mod
     original = config_mod.config.BOOST_ORDER
     config_mod.config.BOOST_ORDER = "sequential"
@@ -371,9 +538,7 @@ def test_sequential_mode_still_available():
 
 def test_migration_from_the_old_sequential_records():
     print("\nupgrading does not re-hand numbers an account already holds")
-    wipe_shared()
-    numbers.forget("old1")
-    numbers.forget("old2")
+    wipe_all()
     # The account boosted before this change: its file holds the old `cursor`.
     numbers.advance("old1", "0913151", probed=0, hits=0)
     data = numbers.load("old1")
@@ -391,9 +556,7 @@ def test_migration_from_the_old_sequential_records():
 
 def test_shared_memory_can_be_turned_off():
     print("\nMKWL_BOOST_SHARED_RANGE=0 gives each account its own memory")
-    wipe_shared()
-    numbers.forget("off1")
-    numbers.forget("off2")
+    wipe_all()
     import config as config_mod
     original = config_mod.config.BOOST_SHARED_RANGE
     config_mod.config.BOOST_SHARED_RANGE = False
@@ -727,6 +890,15 @@ def main() -> int:
     print("=" * 68)
     try:
         test_prefix_validation()
+        test_several_prefixes_can_be_set()
+        test_one_prefix_is_picked_at_random_per_run()
+        test_numbers_stay_unique_across_prefixes()
+        test_an_exhausted_prefix_drops_out_of_the_pool()
+        test_a_prefix_that_finds_nobody_is_retired()
+        test_retiring_never_leaves_nothing_to_do()
+        test_the_migrated_prefix_is_not_mistaken_for_empty()
+        test_no_prefix_at_all_is_explained()
+        test_the_pool_view_reports_each_prefix()
         test_numbers_are_scattered_not_sequential()
         test_a_number_is_never_handed_out_twice()
         test_each_account_gets_DIFFERENT_numbers()

@@ -102,7 +102,7 @@ def finished(*, account: str, phone: str, prefix: str, probe_total: int,
              span=("", ""), random_pick: bool = True,
              shared_range: bool = True, accounts_served: int = 0,
              phone_format: str | None = None, waited: int = 0,
-             returned: int = 0, capacity: int = 0,
+             pool: int = 0, pool_skipped=(), returned: int = 0, capacity: int = 0,
              used_under_prefix: int = 0, left_under_prefix: int = 0,
              lifetime_tried: int = 0, lifetime_hits: int = 0,
              peers_new: int = 0, peers_total: int = 0,
@@ -130,8 +130,12 @@ def finished(*, account: str, phone: str, prefix: str, probe_total: int,
         f"--| Phone - {phone}",
         f"\u2022 Status : {status}",
         f"\u2022 Prefix : {prefix or '--'}"
-        + (f"  ({capacity:,} numbers)" if capacity else ""),
+        + (f"  ({capacity:,} numbers)" if capacity else "")
+        + (f"  \u2014 picked at random from {pool}" if pool > 1 else ""),
     ]
+    if pool_skipped:
+        lines.append(f"\u2022 Skipped : {', '.join(pool_skipped)} "
+                     f"(sampled, found nobody)")
     pick = _pick_line(random_pick, span)
     if pick:
         lines.append(pick)

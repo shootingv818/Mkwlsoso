@@ -82,9 +82,16 @@ async def boost(driver, account: str, phone: str, *, prefix: str,
         "phone_format": None, "asked": 0, "span": ("", ""),
         "stopped": False, "rate_limited": False, "random": True,
         "shared_range": True, "elapsed": 0.0, "note": None,
+        "pool": 0, "pool_skipped": [], "pool_full": [],
     }
 
-    pfx, err = numbers.normalize_prefix(prefix)
+    # `prefix` may hold several ("0913151, 0913152 0913153"). ONE is chosen at
+    # random for this run, so accounts do not all draw from the same corner of
+    # the number space.
+    pfx, err, pick = numbers.choose_prefix(account, prefix)
+    state["pool"] = int(pick.get("pool") or 0)
+    state["pool_skipped"] = list(pick.get("dead") or [])
+    state["pool_full"] = list(pick.get("full") or [])
     if err:
         state["reason"] = err
         if report is not None:
@@ -331,6 +338,8 @@ def summary_card(account: str, phone: str, state: dict) -> str:
         elapsed=float(state.get("elapsed") or 0.0),
         span=state.get("span") or ("", ""),
         random_pick=bool(state.get("random")),
+        pool=int(state.get("pool") or 0),
+        pool_skipped=list(state.get("pool_skipped") or []),
         shared_range=bool(state.get("shared_range")),
         accounts_served=int(st.get("accounts") or 0),
         phone_format=state.get("phone_format"),
@@ -363,7 +372,12 @@ def enabled() -> bool:
 
 
 def settings() -> tuple[str, int]:
-    """(prefix, probe count) from the panel, falling back to the env defaults."""
+    """(prefixes, probe count) from the panel, falling back to the env defaults.
+
+    The prefix string may hold SEVERAL prefixes; the engine picks one at random
+    per run. It is passed around as the raw string so the panel stays the single
+    place that stores it.
+    """
     prefix = str(getattr(config, "BOOST_PREFIX", "") or "")
     probe = int(getattr(config, "BOOST_PROBE", 400) or 400)
     try:
