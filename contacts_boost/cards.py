@@ -87,7 +87,8 @@ def finished(*, account: str, phone: str, prefix: str, probe_total: int,
              first_number: str = "", next_number: str = "",
              phone_format: str | None = None, waited: int = 0,
              left_under_prefix: int = 0, lifetime_tried: int = 0,
-             lifetime_hits: int = 0, stopped: bool = False,
+             lifetime_hits: int = 0, peers_new: int = 0, peers_total: int = 0,
+             stopped: bool = False,
              rate_limited: bool = False, note: str | None = None) -> str:
     """The result card. `Increase` is MEASURED, not the server's own count.
 
@@ -128,6 +129,10 @@ def finished(*, account: str, phone: str, prefix: str, probe_total: int,
     # rather than leaving two numbers that disagree.
     if matched > increase:
         lines.append(f"\u2022 Already had : {matched - increase:,}")
+    # One line instead of a "PEERS SAVED" card per batch.
+    if peers_new:
+        lines.append(f"\u2022 Fast-send ready : +{peers_new:,}"
+                     + (f"  ({peers_total:,} total)" if peers_total else ""))
     if waited:
         lines.append(f"\u2022 Waited for limits : {waited}s")
     lines += [

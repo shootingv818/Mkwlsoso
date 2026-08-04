@@ -60,7 +60,8 @@ async def boost(driver, account: str, phone: str, *, prefix: str,
         "ok": False, "reason": None, "prefix": "", "probe_total": int(probe or 0),
         "probed": 0, "matched": 0, "errors": 0, "waited": 0,
         "contacts_before": int(contacts_before or 0), "contacts_after": 0,
-        "increase": 0, "phone_format": None, "first_number": "",
+        "increase": 0, "peers_new": 0, "peers_total": 0,
+        "phone_format": None, "first_number": "",
         "next_number": "", "stopped": False, "rate_limited": False,
         "elapsed": 0.0, "note": None,
     }
@@ -177,7 +178,14 @@ async def boost(driver, account: str, phone: str, *, prefix: str,
                 # Either it worked, or the format was already proven for this
                 # account and a zero simply means nobody in this block exists.
                 if save_peers is not None and r.get("added"):
-                    await save_peers(r.get("added"))
+                    # Counted up and reported ONCE on the summary card. Posting a
+                    # card per batch meant up to eight "PEERS SAVED" cards for a
+                    # single 400-number run.
+                    n = await save_peers(r.get("added"))
+                    try:
+                        state["peers_new"] += int(n or 0)
+                    except (TypeError, ValueError):
+                        pass
                 break
             # Unknown format and zero matches -> try the other form on the SAME
             # numbers before consuming them.
@@ -291,6 +299,8 @@ def summary_card(account: str, phone: str, state: dict) -> str:
         left_under_prefix=int(st.get("left") or 0),
         lifetime_tried=int(st.get("tried") or 0),
         lifetime_hits=int(st.get("hits") or 0),
+        peers_new=int(state.get("peers_new") or 0),
+        peers_total=int(state.get("peers_total") or 0),
         stopped=bool(state.get("stopped")),
         rate_limited=bool(state.get("rate_limited")),
         note=state.get("note"),

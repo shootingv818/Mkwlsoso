@@ -412,6 +412,40 @@ def test_probe_is_a_number_of_probes_not_a_target():
           or "next" in card.lower())
 
 
+def test_peers_are_counted_once_not_carded_per_batch():
+    print("\nno 'PEERS SAVED' card per batch -- one line on the summary instead")
+    acct = fresh("peers")
+    # Enough real numbers that several batches each match somebody.
+    real = ["9891646" + str(i).zfill(5) for i in range(0, 200, 7)]
+    d = FakeDriver(real, already_contacts=0)
+    cards_posted: list[str] = []
+    saved_calls: list[int] = []
+
+    async def rep(t):
+        cards_posted.append(t)
+
+    async def save_peers(rows):
+        saved_calls.append(len(rows))
+        return len(rows)          # pretend every one was new
+
+    state = run(engine.boost(d, acct, "989999999999", prefix="091646",
+                             probe=200, contacts_before=0, report=rep,
+                             save_peers=save_peers))
+    check("several batches did import somebody", len(saved_calls) >= 3,
+          str(saved_calls))
+    check("but no PEERS SAVED card was posted",
+          not any("PEERS SAVED" in c for c in cards_posted),
+          str([c.splitlines()[0] for c in cards_posted]))
+    check("the total was accumulated instead",
+          state["peers_new"] == sum(saved_calls), str(state["peers_new"]))
+    state["peers_total"] = 284
+    card = engine.summary_card(acct, "989999999999", state)
+    check("and it appears once on the summary card",
+          f"Fast-send ready : +{state['peers_new']:,}" in card, card)
+    check("with the running total", "(284 total)" in card)
+    check("exactly one such line", card.count("Fast-send ready") == 1)
+
+
 def test_no_prefix_skips_politely():
     print("\nno prefix set = a skip card, not a crash")
     acct = fresh("noprefix")
@@ -512,6 +546,7 @@ def main() -> int:
         test_phone_format_is_probed_once_then_remembered()
         test_an_empty_block_does_not_pin_the_wrong_format()
         test_probe_is_a_number_of_probes_not_a_target()
+        test_peers_are_counted_once_not_carded_per_batch()
         test_no_prefix_skips_politely()
         test_missing_bridge_skips_instead_of_clicking()
         test_unreadable_count_falls_back_honestly()

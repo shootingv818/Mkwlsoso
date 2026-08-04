@@ -1012,8 +1012,9 @@ class JobManager:
                     return
                 await card.set(head_text + "\n\n" + text)
 
-            async def save_peers(rows) -> None:
-                await self._save_imported_peers(account, report, rows)
+            async def save_peers(rows) -> int:
+                return await self._save_imported_peers(account, report, rows,
+                                                       quiet=True)
 
             state = await boost_engine.boost(
                 driver, account, phone, prefix=prefix, probe=probe,
@@ -1021,6 +1022,7 @@ class JobManager:
                 contacts_before=contacts_before, save_peers=save_peers)
             if not state.get("ok") and state.get("reason"):
                 return          # the engine already reported why it skipped
+            self._add_peer_total(account, state)
             final = boost_engine.summary_card(account, phone, state)
             if card is not None:
                 await card.set(head_text + "\n\n" + final, force=True)
@@ -1031,6 +1033,19 @@ class JobManager:
             await report(cards.error_card(
                 "contacts_boost", account, code=type(exc).__name__,
                 detail=str(exc), phase="after_login", trace_id="login"))
+
+    @staticmethod
+    def _add_peer_total(account: str, state: dict) -> None:
+        """Put the peer-store total on the boost state, for its one summary line.
+
+        Read here rather than inside contacts_boost/ so the isolated package
+        keeps no dependency on direct/.
+        """
+        try:
+            from direct import peers as peer_store
+            state["peers_total"] = peer_store.count(account)
+        except Exception:  # noqa: BLE001 - direct/ is optional
+            pass
 
     async def run_boost(self, account: str, report: Report,
                         account_phone: str | None = None, live=None) -> Job:
@@ -1073,8 +1088,9 @@ class JobManager:
                     if live is not None:
                         await live.set(text)
 
-                async def save_peers(rows) -> None:
-                    await self._save_imported_peers(account, report, rows)
+                async def save_peers(rows) -> int:
+                    return await self._save_imported_peers(account, report, rows,
+                                                           quiet=True)
 
                 state = await boost_engine.boost(
                     driver, account, phone, prefix=prefix, probe=probe,
@@ -1084,6 +1100,7 @@ class JobManager:
                            "matched": state.get("matched"),
                            "increase": state.get("increase")}
             if state.get("ok"):
+                self._add_peer_total(account, state)
                 final = boost_engine.summary_card(account, phone, state)
                 if live is not None:
                     await live.set(final, force=True)
@@ -2401,7 +2418,7 @@ class JobManager:
             return 0
 
     async def _save_imported_peers(self, account: str, report: Report,
-                                   added: list | None) -> int:
+                                   added: list | None, quiet: bool = False) -> int:
         """Persist the user_id + access_hash of freshly imported contacts.
 
         `contacts.importContacts` answers with the matched users AND their
@@ -2417,7 +2434,10 @@ class JobManager:
                       "access_hash": a.get("access_hash"),
                       "label": a.get("phone")} for a in rows]
             new = peer_store.save_users(account, users)
-            if new:
+            # `quiet` is for callers that import in many batches (the contact
+            # boost does 8 batches for a 400-number run): one card per batch is
+            # noise, so they report the total on their own card instead.
+            if new and not quiet:
                 await report(cards.peers_saved(account, new, peer_store.count(account),
                                                source="importContacts"))
             return new
