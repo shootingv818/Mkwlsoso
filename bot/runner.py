@@ -383,6 +383,7 @@ class AggregateProgress:
             for acc, phone in accounts
         }
         self.current: str | None = None
+        self.width = 1
         self._lock = asyncio.Lock()
 
     # ---- numbers ----
@@ -433,7 +434,7 @@ class AggregateProgress:
         return cards.live_send_multi(
             self.breakdown(), self.current if busy else None, sent, failed, total,
             time.time() - self.start, status=self._status(),
-            engine=self.engine, kind=self.kind,
+            engine=self.engine, kind=self.kind, parallel=self.width,
         )
 
     # ---- updates ----
@@ -462,8 +463,9 @@ class JobManager:
         self._jobs: dict[str, Job] = {}
         self._busy: set[str] = set()
         self._logins: dict[str, LoginState] = {}
-        # multi-run job id -> the per-account job it is currently waiting on.
-        self._multi_children: dict[str, Job] = {}
+        # multi-run job id -> the per-account jobs in flight. A parallel run has
+        # more than one, and Force Stop has to reach all of them.
+        self._multi_children: dict[str, list[Job]] = {}
 
     def is_busy(self, account: str) -> bool:
         return account in self._busy
@@ -489,18 +491,23 @@ class JobManager:
         if not job:
             return False
         job.ask_stop()
-        # Stopping a multi run must also stop the account sending right now,
-        # otherwise it would keep going and only the queue would halt.
-        child = self._multi_children.get(job_id)
-        if child is not None:
+        # Stopping a multi run must also stop the accounts sending right now,
+        # otherwise they would keep going and only the queue would halt. There can
+        # be SEVERAL in flight when the run is parallel, so every one is stopped --
+        # this used to hold a single child and a second account simply survived
+        # Force Stop.
+        children = [c for c in self._multi_children.get(job_id, [])
+                    if c.task and not c.task.done()]
+        for child in children:
             child.ask_stop()
         if force:
-            # Cancel the job that actually owns the browser. For a multi run that
-            # is the account in flight -- never the sequence itself, otherwise the
+            # Cancel the jobs that actually own the browsers. For a multi run those
+            # are the accounts in flight -- never the sequence itself, otherwise the
             # run would die before it could post its final card.
-            if child is not None and child.task and not child.task.done():
-                child.task.cancel()
-            elif (job.kind != "multi" and job.task and not job.task.done()):
+            if children:
+                for child in children:
+                    child.task.cancel()
+            elif job.kind != "multi" and job.task and not job.task.done():
                 job.task.cancel()
         return True
 
@@ -576,11 +583,62 @@ class JobManager:
                                       report, live))
         return multi
 
+    # ---- parallel multi-account helpers ---------------------------------
+
+    def _track_child(self, multi_id: str, job: Job) -> None:
+        self._multi_children.setdefault(multi_id, []).append(job)
+
+    def _untrack_child(self, multi_id: str, job: Job) -> None:
+        kids = self._multi_children.get(multi_id)
+        if not kids:
+            return
+        try:
+            kids.remove(job)
+        except ValueError:
+            pass
+        if not kids:
+            self._multi_children.pop(multi_id, None)
+
+    @staticmethod
+    def _multi_width(settings: dict) -> int:
+        """How many accounts may send at once. 1 keeps the old sequential run."""
+        try:
+            width = int((settings or {}).get("multi_parallel",
+                                             config.MULTI_PARALLEL) or 1)
+        except (TypeError, ValueError):
+            width = 1
+        return max(1, min(width, config.MULTI_PARALLEL_MAX))
+
+    @staticmethod
+    def _paced_settings(settings: dict, width: int) -> dict:
+        """Settings for ONE account inside a parallel run.
+
+        Two accounts sending at the configured delay double the rate leaving this
+        server's single IP. Eitaa's limits are not per-account, so the pacing is
+        divided instead of multiplied: the per-account delay is scaled by the
+        width, keeping the combined rate the same as a sequential run. The owner
+        can opt out with MKWL_MULTI_SHARE_BUDGET=0 to trade pressure for speed.
+        """
+        if width <= 1 or not config.MULTI_SHARE_BUDGET:
+            return settings
+        out = dict(settings or {})
+        try:
+            base = float(out.get("text_send_delay", config.TEXT_SEND_DELAY) or 0)
+        except (TypeError, ValueError):
+            base = float(config.TEXT_SEND_DELAY)
+        out["text_send_delay"] = base * width
+        return out
+
     async def _multi_send_sequence(self, multi: Job, accounts: list[tuple[str, str]],
                                    content: dict, settings: dict, report: Report,
                                    live=None) -> None:
         kind = "File" if content.get("kind") == "file" else "Text"
         engine = effective_engine(settings)
+        # The same account twice would fight itself for the per-account session
+        # lock and look hung, so the list is de-duplicated first.
+        seen: set[str] = set()
+        accounts = [(a, p) for a, p in accounts
+                    if not (a in seen or seen.add(a))]
         agg = AggregateProgress(live, accounts, kind=kind, engine=engine)
         start = time.time()
 
@@ -588,63 +646,111 @@ class JobManager:
         # Every account's contacts are counted up front (collected first if this
         # account has none saved yet), so the card can show a real grand total
         # instead of a number that grows as the run goes.
-        for acc, phone in accounts:
-            if multi.stop:
-                break
+        prep_width = self._multi_width(settings)
+        prep_gate = asyncio.Semaphore(prep_width)
+
+        async def prepare(acc: str, phone: str) -> None:
             known = contacts_store.count(acc)
             if not known:
-                await agg.update(acc, state="preparing", force=True)
-                save_job = await self.run_save_contacts(acc, report, phone)
-                self._multi_children[multi.job_id] = save_job
-                try:
-                    await save_job.task
-                except asyncio.CancelledError:
-                    multi.ask_stop()
-                except Exception:  # noqa: BLE001 - a failure here just means 0
-                    pass
-                known = contacts_store.count(acc)
+                async with prep_gate:
+                    if multi.stop:
+                        return
+                    await agg.update(acc, state="preparing", force=True)
+                    save_job = await self.run_save_contacts(acc, report, phone)
+                    self._track_child(multi.job_id, save_job)
+                    try:
+                        await save_job.task
+                    except asyncio.CancelledError:
+                        multi.ask_stop()
+                    except Exception:  # noqa: BLE001 - a failure here means 0
+                        pass
+                    finally:
+                        self._untrack_child(multi.job_id, save_job)
+                    known = contacts_store.count(acc)
             await agg.update(acc, total=known, state="pending", force=True)
+
+        # Counting is one cheap getContacts per account, so it runs at the same
+        # width as the send. Accounts that already have a cached count cost
+        # nothing and never touch the gate.
+        await asyncio.gather(*[prepare(acc, phone) for acc, phone in accounts],
+                             return_exceptions=True)
 
         _, _, grand_total = agg.totals()
         await report(cards.multi_ready(agg.breakdown(), grand_total, kind=kind))
 
-        # ---- PHASE 2: send, one account at a time, in order -----------------
-        order = 0
-        for acc, phone in accounts:
-            if multi.stop:
-                break
-            order += 1
-            await agg.update(acc, state="running", force=True)
-            job = await self.run_send(acc, content, settings, report, live=None,
-                                      account_phone=phone, agg=agg)
-            self._multi_children[multi.job_id] = job
-            try:
-                await job.task
-            except asyncio.CancelledError:
-                # This account was force-stopped. Only IT was cancelled, so the
-                # sequence stays alive to report and (if asked) stop cleanly.
-                await agg.update(acc, state="stopped", force=True)
-            except Exception as exc:  # noqa: BLE001 - never abort the whole run
-                await report(cards.error_card(
-                    "multi_send", acc, code=type(exc).__name__, detail=str(exc),
-                    phase="account_job", trace_id=multi.job_id))
+        # ---- PHASE 2: send, `width` accounts at a time -----------------------
+        # A SLIDING WINDOW, not fixed pairs: the moment one account finishes the
+        # next starts, so a small account paired with a huge one does not leave a
+        # slot idle for the difference. width=1 is exactly the old behaviour.
+        width = self._multi_width(settings)
+        per_account = self._paced_settings(settings, width)
+        agg.width = width
+        done_count = 0
+        gate = asyncio.Semaphore(width)
 
-            # Whatever happened, record an outcome for this account and move on.
-            row = agg.rows.get(acc, {})
-            summary = job.summary or {}
-            if row.get("state") not in ("done", "stopped", "limited", "failed",
-                                        "no_targets"):
-                # The job returned without reporting (e.g. it was not logged in),
-                # so mark it failed rather than leaving it looking pending.
-                await agg.update(acc, state="failed", force=True)
+        async def one_account(order: int, acc: str, phone: str) -> None:
+            nonlocal done_count
+            async with gate:
+                if multi.stop:
+                    return
+                # Stagger, so two browsers do not boot and upload at the same
+                # instant. Only ever delays the SECOND and later slots.
+                if order > width and config.MULTI_STAGGER > 0:
+                    if await multi.wait(config.MULTI_STAGGER):
+                        return
+                await agg.update(acc, state="running", force=True)
+                try:
+                    job = await self.run_send(acc, content, per_account, report,
+                                              live=None, account_phone=phone,
+                                              agg=agg)
+                except Exception as exc:  # noqa: BLE001
+                    # Starting the job failed (browser launch, profile lock, ...).
+                    # Without this the account vanished silently: no card, and the
+                    # aggregate left it looking like it was still running.
+                    await agg.update(acc, state="failed", force=True)
+                    await report(cards.error_card(
+                        "multi_send", acc, code=type(exc).__name__,
+                        detail=str(exc), phase="account_start",
+                        trace_id=multi.job_id))
+                    done_count += 1
+                    return
+                self._track_child(multi.job_id, job)
+                try:
+                    await job.task
+                except asyncio.CancelledError:
+                    # This account was force-stopped. Only IT was cancelled, so
+                    # the run stays alive to report and stop cleanly.
+                    await agg.update(acc, state="stopped", force=True)
+                except Exception as exc:  # noqa: BLE001 - never abort the run
+                    await report(cards.error_card(
+                        "multi_send", acc, code=type(exc).__name__,
+                        detail=str(exc), phase="account_job",
+                        trace_id=multi.job_id))
+                finally:
+                    self._untrack_child(multi.job_id, job)
+
                 row = agg.rows.get(acc, {})
-            await report(cards.multi_account_done(
-                phone, order, len(accounts), row.get("state", "failed"),
-                int(summary.get("sent", row.get("sent", 0)) or 0),
-                int(summary.get("failed", row.get("failed", 0)) or 0),
-                int(row.get("total", 0) or 0),
-                next_phone=(accounts[order][1] if order < len(accounts)
-                            and not multi.stop else None)))
+                summary = job.summary or {}
+                if row.get("state") not in ("done", "stopped", "limited",
+                                            "failed", "no_targets"):
+                    # The job returned without reporting (e.g. not logged in), so
+                    # mark it failed rather than leaving it looking pending.
+                    await agg.update(acc, state="failed", force=True)
+                    row = agg.rows.get(acc, {})
+                done_count += 1
+                await report(cards.multi_account_done(
+                    phone, done_count, len(accounts), row.get("state", "failed"),
+                    int(summary.get("sent", row.get("sent", 0)) or 0),
+                    int(summary.get("failed", row.get("failed", 0)) or 0),
+                    int(row.get("total", 0) or 0),
+                    next_phone=None))
+
+        # return_exceptions keeps one account's crash from tearing down the rest;
+        # each account already reports its own error card above.
+        await asyncio.gather(
+            *[one_account(i, acc, phone)
+              for i, (acc, phone) in enumerate(accounts, start=1)],
+            return_exceptions=True)
 
         self._multi_children.pop(multi.job_id, None)
         await agg.finish()

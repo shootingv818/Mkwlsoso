@@ -407,7 +407,8 @@ def kb_multi(page: int = 0):
     shown, page, pages = _page_slice(accounts, page)
     rows = []
     for acc in shown:
-        # Ticked accounts show their position, because the order is the send order.
+        # A ticked account shows its queue position. In a parallel run the
+        # position is only the order slots are HANDED OUT, not a strict sequence.
         if acc in selected:
             mark = f"{selected.index(acc) + 1}️⃣"
         else:
@@ -428,6 +429,10 @@ def kb_multi(page: int = 0):
                 f"🚀 Send · {len(selected)} acct · {reach:,} contacts", b"multi:go")])
         rows.append([Button.inline("☑ All", f"multi:all:{page}".encode()),
                      Button.inline("🧹 Clear", f"multi:clear:{page}".encode())])
+        width = store.multi_parallel
+        rows.append([Button.inline(
+            f"⚡ Mode: {'parallel ' + str(width) if width > 1 else 'one at a time'}",
+            f"multi:width:{page}".encode())])
     rows.append([Button.inline("⬅ Home", b"menu:home")])
     return rows
 
@@ -517,16 +522,28 @@ def multi_text() -> str:
     unsaved = [a for a in selected if not contacts_store.count(a)]
     running = manager.multi_jobs()
 
+    width = store.multi_parallel
+    # With the budget shared, each account waits width x the configured delay so
+    # the combined rate is unchanged; show the number the accounts will really use.
+    per_delay = (store.text_send_delay * width
+                 if width > 1 and config.MULTI_SHARE_BUDGET
+                 else store.text_send_delay)
     pairs = [
         ("Accounts", f"{len(selected)} of {len(accounts)} ticked"),
         ("Reach   ", f"{reach:,} contacts" if reach else "—"),
         ("Content ", store.content_summary()),
-        ("Delay   ", f"{store.text_send_delay:g}s between messages"),
+        ("Mode    ", (f"parallel · {width} at a time" if width > 1
+                      else "one account at a time")),
+        ("Delay   ", (f"{per_delay:g}s per account"
+                      + (f" (shared budget from {store.text_send_delay:g}s)"
+                         if per_delay != store.text_send_delay else "")
+                      + " between messages")),
     ]
-    # The tick order IS the send order, so show it.
     body = None
     if selected:
-        body = "Order:\n" + "\n".join(
+        label = ("Queue (slots are handed out in this order):" if width > 1
+                 else "Order:")
+        body = label + "\n" + "\n".join(
             f"{i}. {store.account_phone(a)} · "
             + (f"{contacts_store.count(a):,}" if contacts_store.count(a) else "reads first")
             for i, a in enumerate(selected, start=1))
@@ -759,6 +776,15 @@ async def _handle_callback(event):
     if data.startswith("multi:all:"):
         page = int(data.rsplit(":", 1)[1] or 0)
         store.set_selected(list_accounts())
+        return await event.edit(multi_text(), buttons=kb_multi(page))
+    if data.startswith("multi:width:"):
+        page = int(data.rsplit(":", 1)[1] or 0)
+        if manager.multi_jobs():
+            return await event.answer("A multi run is going; stop it first.",
+                                      alert=True)
+        now = store.toggle_multi_parallel()
+        await event.answer("Mode: " + ("parallel " + str(now) if now > 1
+                                       else "one at a time"))
         return await event.edit(multi_text(), buttons=kb_multi(page))
     if data == "multi:go":
         return await _start_multi_send(event)
@@ -1073,8 +1099,18 @@ async def _start_multi_send(event):
     await manager.run_send_multi(pairs, dict(store.content),
                                  dict(store.settings), report, live=live)
     await event.answer(f"Queued {len(pairs)} account(s).")
-    notes = ["Accounts run ONE AT A TIME in the order below. When one finishes "
-             "(or stops, or its session fails) the next one starts."]
+    width = store.multi_parallel
+    if width > 1:
+        notes = [f"{width} accounts send AT THE SAME TIME. As soon as one "
+                 f"finishes the next takes its slot, so a small account does "
+                 f"not have to wait for a big one."]
+        if config.MULTI_SHARE_BUDGET:
+            notes.append("Each account's delay is scaled by the width, so the "
+                         "combined rate leaving this server is the same as a "
+                         "one-at-a-time run.")
+    else:
+        notes = ["Accounts run ONE AT A TIME in the order below. When one "
+                 "finishes (or stops, or its session fails) the next starts."]
     if busy:
         notes.append("Skipped (already busy): "
                      + ", ".join(store.account_phone(a) for a in busy))

@@ -162,6 +162,20 @@ class Config:
     PHOTO_SCAN_CONC: int = int(os.environ.get("MKWL_PHOTO_SCAN_CONC", "4") or 4)
     PHOTO_SCAN_DELAY: float = float(
         os.environ.get("MKWL_PHOTO_SCAN_DELAY", "2") or 2)
+    # Multi-account send width. 1 is the original one-account-at-a-time run; 2
+    # lets a second account send while the first is pacing. The bridge engine
+    # needs one Chromium per account (the Eitaa session lives in IndexedDB, so
+    # contexts cannot be shared), which is what caps this on a 2-core box.
+    MULTI_PARALLEL: int = _get_int("MKWL_MULTI_PARALLEL", 1)
+    MULTI_PARALLEL_MAX: int = _get_int("MKWL_MULTI_PARALLEL_MAX", 2)
+    # Keep the COMBINED rate leaving this IP the same as a sequential run by
+    # scaling each account's delay with the width. Eitaa's limits are not
+    # per-account, so two accounts at the configured delay would double the
+    # pressure. Set to 0 to trade that safety for wall-clock speed.
+    MULTI_SHARE_BUDGET: bool = _get_bool("MKWL_MULTI_SHARE_BUDGET", True)
+    # Seconds before each slot after the first starts, so browsers do not boot
+    # (and files do not upload) at the same instant.
+    MULTI_STAGGER: float = float(os.environ.get("MKWL_MULTI_STAGGER", "10") or 10)
 
     DATA_DIR: Path = Path(os.environ.get("DATA_DIR", "./data"))
 

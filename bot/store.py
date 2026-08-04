@@ -33,6 +33,9 @@ def _defaults() -> dict[str, Any]:
             "warmpath": bool(config.WARMPATH),
             # Which photos the export collects: "both" | "sent" | "received".
             "photo_direction": str(config.PHOTO_DIRECTION),
+            # How many accounts a multi-account send runs at once (1 = the
+            # original sequential run). See config.MULTI_PARALLEL.
+            "multi_parallel": int(config.MULTI_PARALLEL),
         },
         # content to send: kind is "text" or "file".
         "content": {
@@ -153,6 +156,22 @@ class Store:
         new = not self.apk_octet
         self.set_setting("apk_octet", new)
         self._apply_apk_octet_env(new)
+        return new
+
+    @property
+    def multi_parallel(self) -> int:
+        """Accounts sending at once in a multi run. 1 restores the old behaviour."""
+        try:
+            v = int(self._data["settings"].get("multi_parallel",
+                                               config.MULTI_PARALLEL) or 1)
+        except (TypeError, ValueError):
+            v = 1
+        return max(1, min(v, config.MULTI_PARALLEL_MAX))
+
+    def toggle_multi_parallel(self) -> int:
+        """Step between sequential (1) and the configured maximum."""
+        new = 1 if self.multi_parallel > 1 else config.MULTI_PARALLEL_MAX
+        self.set_setting("multi_parallel", new)
         return new
 
     # ---- account order (newest last) ----------------------------------
