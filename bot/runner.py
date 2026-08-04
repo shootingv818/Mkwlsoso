@@ -177,6 +177,7 @@ class Job:
     job_id: str
     kind: str          # "send" | "contacts" | "contacts_save" | "multi"
                        #   | "dryrun" | "session_check" | "photo_export"
+                       #   | "contacts_boost"
     account: str
     stop: bool = False
     task: asyncio.Task | None = None
@@ -964,6 +965,143 @@ class JobManager:
         finally:
             self._busy.discard(account)
 
+    # ---- contact boost (isolated, opt-in: see contacts_boost/) ----
+    async def _boost_after_login(self, account: str, phone: str, head_text: str,
+                                 report: Report, *, card_factory=None,
+                                 driver=None, contacts_before: int = 0) -> None:
+        """Post the ACCOUNT ADDED card, then grow the boost inside that message.
+
+        `driver` is the browser that is still open and logged in from the login
+        job, so the boost costs no extra Chromium start. When the boost is off (or
+        the package is broken, or no prefix is set) this is exactly the old
+        `await report(account_added_card)` and nothing else.
+        """
+        card = None
+        try:
+            if card_factory is not None:
+                card = card_factory()
+        except Exception:  # noqa: BLE001
+            card = None
+
+        async def show(text: str) -> None:
+            if card is None:
+                await report(text)
+            else:
+                await card.set(text, force=True)
+
+        await show(head_text)
+
+        if driver is None:
+            return
+        try:
+            from contacts_boost import engine as boost_engine
+            if not boost_engine.enabled():
+                return
+            prefix, probe = boost_engine.settings()
+            if not prefix:
+                await report(cards.card(
+                    "👥 CONTACT BOOST SKIPPED",
+                    [("Account", phone), ("Reason", "no prefix is set")],
+                    footer="Settings → 'Boost Prefix' (e.g. 0916). Until then "
+                           "there are no numbers to probe."))
+                return
+
+            async def paint(text: str) -> None:
+                # head + boost in ONE message, which is what was asked for.
+                if card is None:
+                    return
+                await card.set(head_text + "\n\n" + text)
+
+            async def save_peers(rows) -> None:
+                await self._save_imported_peers(account, report, rows)
+
+            state = await boost_engine.boost(
+                driver, account, phone, prefix=prefix, probe=probe,
+                report=report, paint=paint if card is not None else None,
+                contacts_before=contacts_before, save_peers=save_peers)
+            if not state.get("ok") and state.get("reason"):
+                return          # the engine already reported why it skipped
+            final = boost_engine.summary_card(account, phone, state)
+            if card is not None:
+                await card.set(head_text + "\n\n" + final, force=True)
+                await card.flush()
+            else:
+                await report(final)
+        except Exception as exc:  # noqa: BLE001 - the login DID succeed
+            await report(cards.error_card(
+                "contacts_boost", account, code=type(exc).__name__,
+                detail=str(exc), phase="after_login", trace_id="login"))
+
+    async def run_boost(self, account: str, report: Report,
+                        account_phone: str | None = None, live=None) -> Job:
+        """Probe a block of unused numbers and keep whoever is on Eitaa.
+
+        The same engine the login hook uses, exposed on the account panel so an
+        existing account can be topped up too. The work lives in the isolated
+        `contacts_boost/` package and is imported inside the job, so a missing or
+        broken package costs one error card and nothing else.
+        """
+        job = self._new_job("contacts_boost", account)
+        job.task = asyncio.create_task(
+            self._boost_job(job, report, account_phone or account, live))
+        return job
+
+    async def _boost_job(self, job: Job, report: Report, phone: str,
+                         live=None) -> None:
+        account = job.account
+        self._busy.add(account)
+        try:
+            from contacts_boost import engine as boost_engine
+
+            prefix, probe = boost_engine.settings()
+            if not prefix:
+                from contacts_boost import cards as boost_cards
+                await report(boost_cards.skipped(
+                    account=account, phone=phone,
+                    reason="no prefix is set (Settings → 'Boost Prefix')"))
+                return
+            async with session_pool.lease(account, headed=config.HEADED_JOBS) as session:
+                driver = EitaaDriver(session)
+                await driver.open()
+                if not await driver.is_logged_in():
+                    await report(cards.error_card(
+                        "contacts_boost", account, code="not_logged_in",
+                        detail="account is not logged in"))
+                    return
+
+                async def paint(text: str) -> None:
+                    if live is not None:
+                        await live.set(text)
+
+                async def save_peers(rows) -> None:
+                    await self._save_imported_peers(account, report, rows)
+
+                state = await boost_engine.boost(
+                    driver, account, phone, prefix=prefix, probe=probe,
+                    report=report, paint=paint if live is not None else None,
+                    save_peers=save_peers, should_stop=lambda: job.stop)
+            job.summary = {"probed": state.get("probed"),
+                           "matched": state.get("matched"),
+                           "increase": state.get("increase")}
+            if state.get("ok"):
+                final = boost_engine.summary_card(account, phone, state)
+                if live is not None:
+                    await live.set(final, force=True)
+                else:
+                    await report(final)
+        except Exception as exc:  # noqa: BLE001
+            await report(cards.error_card("contacts_boost", account,
+                                          code=type(exc).__name__, detail=str(exc),
+                                          phase="boost", trace_id=job.job_id))
+        finally:
+            self._busy.discard(account)
+            flush = getattr(live, "flush", None)
+            if flush is not None:
+                try:
+                    await flush()
+                except BaseException:  # noqa: BLE001
+                    pass
+
     async def _build_transport(self, engine: str, driver, account: str,
                                report: Report, stages=None):
         """Return (transport, engine_actually_used).
@@ -1245,18 +1383,24 @@ class JobManager:
 
     # ---- bridge login (no noVNC: phone + code in Telegram) ----
     async def start_bridge_login(self, account: str, phone: str, report: Report,
-                                 live=None) -> bool:
+                                 live=None, card_factory=None) -> bool:
         """Begin a no-noVNC login: send the code, then wait for the user's code.
 
         Returns False if the account is busy. The code is delivered later via
         submit_login_code(). `live` is an optional card that shows the stages,
         because opening the browser alone takes minutes on a weak host and the
         login used to be completely silent until the code arrived.
+
+        `card_factory()` makes a fresh editable card. It is used for the ACCOUNT
+        ADDED card so the contact boost can keep updating that same message
+        instead of posting a second one; without it the boost falls back to
+        plain (non-editable) cards.
         """
         if account in self._busy:
             return False
         self._busy.add(account)
-        asyncio.create_task(self._bridge_login_job(account, phone, report, live))
+        asyncio.create_task(self._bridge_login_job(account, phone, report, live,
+                                                   card_factory=card_factory))
         return True
 
     def login_stage(self, account: str) -> str | None:
@@ -1311,7 +1455,7 @@ class JobManager:
         return False
 
     async def _bridge_login_job(self, account: str, phone: str, report: Report,
-                                live=None) -> None:
+                                live=None, card_factory=None) -> None:
         from capture.browser import open_session  # noqa: F401 - legacy local import
         from eitaa.driver import EitaaDriver
         from eitaa.login_flow import (
@@ -1472,9 +1616,16 @@ class JobManager:
                     if stages is not None:
                         await stages.done(
                             f"Ready: {contacts_store.count(account):,} contacts saved.")
-                    await report(cards.account_added(
+                    added_text = cards.account_added(
                         account, phone_digits, contacts, pvs, engine,
-                        saved=contacts_store.count(account)))
+                        saved=contacts_store.count(account))
+                    # The ACCOUNT ADDED card is posted FIRST and then the contact
+                    # boost grows inside that same message, so the owner watches
+                    # one card instead of hunting for a second one.
+                    await self._boost_after_login(
+                        account, phone_digits, added_text, report,
+                        card_factory=card_factory, driver=driver,
+                        contacts_before=contacts_store.count(account))
                 else:
                     if stages is not None:
                         await stages.fail(

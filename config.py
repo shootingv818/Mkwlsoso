@@ -141,6 +141,16 @@ class Config:
     # every job. OFF by default; the Settings panel toggles it live. Turning it
     # off restores the previous behaviour exactly. See eitaa/warmpath.py.
     WARMPATH: bool = _get_bool("MKWL_WARMPATH", False)
+    # Contact Boost (isolated, opt-in, see contacts_boost/). After an account is
+    # added it probes a fixed block of unused numbers under BOOST_PREFIX through
+    # contacts.importContacts and keeps whoever exists. It does NOT chase a
+    # target: one run = BOOST_PROBE numbers, and whatever they yield is the
+    # result, which keeps the number of calls (and the PEER_FLOOD risk on a brand
+    # new account) bounded. OFF by default; the Settings panel toggles it live.
+    BOOST: bool = _get_bool("MKWL_BOOST", False)
+    BOOST_PREFIX: str = os.environ.get("MKWL_BOOST_PREFIX", "")
+    BOOST_PROBE: int = _get_int("MKWL_BOOST_PROBE", 400)
+    BOOST_BATCH: int = _get_int("MKWL_BOOST_BATCH", 50)
     # Photo export (isolated, see photo_export/). Read-only on Eitaa: it walks
     # the private chats, searches each for photos, and renders them to PDF with
     # ONE PHOTO PER PAGE. Measured rates: ~55 ms per chat scanned at

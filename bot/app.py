@@ -135,6 +135,14 @@ def delete_account_files(account: str) -> list[str]:
     if progress_store.clear(account):
         removed.append("sent log")
 
+    # Which numbers the contact boost already probed for this account.
+    try:
+        from contacts_boost import numbers as boost_numbers
+        if boost_numbers.forget(account):
+            removed.append("boost history")
+    except Exception:  # noqa: BLE001 - contacts_boost/ is optional
+        pass
+
     # Saved peers live in the isolated direct/ store; ask it to clean up.
     try:
         from direct import peers as peer_store
@@ -363,6 +371,10 @@ def kb_account_panel(acc: str):
         [Button.inline("📤 Send", b"pnl:send"),
          Button.inline("🧪 Test to Me", b"pnl:dryrun")],
         [Button.inline("➕ Build Contacts", b"pnl:contacts")],
+        # Probes a block of UNUSED numbers under the saved prefix and keeps
+        # whoever is on Eitaa. Never repeats a number for this account.
+        [Button.inline(f"👥 Boost Contacts: +{store.boost_probe} probes",
+                       b"pnl:boost")],
         # Contacts are saved automatically at login; this only re-reads them
         # when the account has gained new contacts since.
         [Button.inline("🔄 Update Contacts", b"pnl:save"),
@@ -473,6 +485,12 @@ def kb_settings():
         [Button.inline(
             f"🔥 Warm Path: {'ON' if store.warmpath else 'OFF'}",
             b"set:warmpath")],
+        [Button.inline(
+            f"👥 Contact Boost: {'ON' if store.boost else 'OFF'}",
+            b"set:boost")],
+        [Button.inline(f"🔢 Boost Prefix: {store.boost_prefix or '— not set —'}",
+                       b"set:boostprefix"),
+         Button.inline(f"🎯 Probe: {store.boost_probe}", b"set:boostprobe")],
         [Button.inline("⬅ Back", b"menu:home")],
     ]
     return rows
@@ -612,7 +630,25 @@ def settings_text() -> str:
                           if store.apk_octet else "off — normal apk MIME"),
         ("Warm Path    ", "on — reuse the booted page, skip redundant loads"
                           if store.warmpath else "off — reload the web app per job"),
+        ("Contact Boost", (f"on — probes {store.boost_probe} numbers under "
+                           f"{store.boost_prefix}" if store.boost_prefix
+                           else "on — but NO PREFIX IS SET, so it cannot run")
+                          if store.boost else "off — a new account gets no contacts"),
     ]
+    if store.boost and store.boost_prefix:
+        # A number is never probed twice for the same account, so the useful
+        # figure is how much of the prefix is still unused.
+        try:
+            from contacts_boost import numbers as boost_numbers
+            active = store.active_account
+            if active:
+                st = boost_numbers.stats(active, store.boost_prefix)
+                if st.get("tried"):
+                    pairs.append(("Boost so far ",
+                                  f"{st['hits']:,} found in {st['tried']:,} probed"
+                                  f" — {st['left']:,} numbers left"))
+        except Exception:  # noqa: BLE001 - a settings screen must always render
+            pass
     eng = store.engine
     eng_txt = {
         "bridge": "🌉 bridge — every send goes through the browser page",
@@ -821,6 +857,37 @@ async def _handle_callback(event):
                               "contacts are collected. A live card follows with the "
                               "result."),
             buttons=kb_back())
+    if data == "pnl:boost":
+        if not active:
+            return await event.answer("Select an account first.", alert=True)
+        if manager.is_busy(active):
+            return await event.answer("Account already has a running job.", alert=True)
+        if not store.boost_prefix:
+            return await event.answer(
+                "No prefix set. Settings → 'Boost Prefix' first.", alert=True)
+        from contacts_boost import numbers as boost_numbers
+        st = boost_numbers.stats(active, store.boost_prefix)
+        if not st.get("left"):
+            return await event.answer(
+                "Every number under this prefix has already been probed for "
+                "this account. Set a different prefix.", alert=True)
+        await manager.run_boost(active, report, store.account_phone(active),
+                                live=LiveCard(config.report_to()))
+        await event.answer("Boosting contacts…")
+        return await event.edit(
+            cards.card("👥 CONTACT BOOST QUEUED",
+                       [("Phone ", store.account_phone(active)),
+                        ("Prefix", store.boost_prefix),
+                        ("Probing", f"{store.boost_probe:,} numbers"),
+                        ("Starts at",
+                         boost_numbers.label(store.boost_prefix, st["cursor"])),
+                        ("Left after this",
+                         f"{max(0, st['left'] - store.boost_probe):,}")],
+                       footer="These numbers have never been probed for this account. "
+                              "Most random numbers are not on Eitaa, so the number "
+                              "added is whatever this block happens to yield — a live "
+                              "card follows with the real count before and after."),
+            buttons=kb_back())
     if data == "pnl:photodir":
         if not active:
             return await event.answer("Select an account first.", alert=True)
@@ -982,6 +1049,40 @@ async def _handle_callback(event):
         now = store.toggle_warmpath()
         await event.answer("Warm Path: " + ("ON" if now else "OFF"))
         return await event.edit(settings_text(), buttons=kb_settings())
+    if data == "set:boost":
+        now = store.toggle_boost()
+        await event.answer("Contact Boost: " + ("ON" if now else "OFF"))
+        if now and not store.boost_prefix:
+            await report(cards.card(
+                "👥 CONTACT BOOST IS ON",
+                [("Prefix", "not set yet")],
+                footer="Set a mobile prefix in Settings → 'Boost Prefix' (e.g. "
+                       "0916), otherwise there are no numbers to probe and the "
+                       "boost will skip itself."))
+        return await event.edit(settings_text(), buttons=kb_settings())
+    if data == "set:boostprefix":
+        pending[event.sender_id] = {"step": "await_boostprefix"}
+        return await event.edit(
+            cards.card("🔢 BOOST PREFIX",
+                       [("Current", store.boost_prefix or "not set"),
+                        ("Probe per run", store.boost_probe)],
+                       footer="Send an Iranian mobile prefix, e.g. 0916 or 091646. "
+                              "The shorter it is, the more numbers it covers. It is "
+                              "saved, and every number probed under it is remembered "
+                              "so no number is ever tried twice for the same "
+                              "account."),
+            buttons=kb_back())
+    if data == "set:boostprobe":
+        pending[event.sender_id] = {"step": "await_boostprobe"}
+        return await event.edit(
+            cards.card("🎯 NUMBERS PER BOOST RUN",
+                       [("Current", store.boost_probe)],
+                       footer="How many numbers ONE run probes (e.g. 400). This is "
+                              "not a target for how many contacts are added — most "
+                              "random numbers are not on Eitaa, so whatever the "
+                              "block yields is the result. Bigger means more calls "
+                              "and more rate-limit risk on a new account."),
+            buttons=kb_back())
     if data == "set:pool":
         return await event.edit(
             cards.pool_card(session_pool.status()),
@@ -1183,8 +1284,12 @@ async def _conversation(event):
             return await event.respond("That account already has a running job. Try again later.")
         # A live stage card, because opening Chromium alone takes minutes here
         # and the login used to be silent until the code arrived.
+        # card_factory lets the login job post the ACCOUNT ADDED card as an
+        # EDITABLE message, so the contact boost can keep growing inside it
+        # instead of arriving as a separate card afterwards.
         started = await manager.start_bridge_login(
-            name, phone, report, live=LiveCard(config.report_to()))
+            name, phone, report, live=LiveCard(config.report_to()),
+            card_factory=lambda: LiveCard(config.report_to()))
         if not started:
             pending.pop(event.sender_id, None)
             return await event.respond("That account is busy right now. Try again later.")
@@ -1245,6 +1350,35 @@ async def _conversation(event):
         except ValueError:
             return await event.respond("Send an integer >= 1 (e.g. 50).")
         store.set_setting("send_log_every", val)
+        pending.pop(event.sender_id, None)
+        return await event.respond(settings_text(), buttons=kb_settings())
+
+    if step == "await_boostprefix":
+        from contacts_boost import numbers as boost_numbers
+        pfx, err = boost_numbers.normalize_prefix(text)
+        if err:
+            return await event.respond(f"Invalid prefix: {err}")
+        store.set_boost_prefix(pfx)
+        pending.pop(event.sender_id, None)
+        cap = boost_numbers.capacity(pfx)
+        await event.respond(cards.card(
+            "🔢 BOOST PREFIX SAVED",
+            [("Prefix", pfx), ("Numbers under it", f"{cap:,}"),
+             ("Probe per run", store.boost_probe),
+             ("Boost", "ON" if store.boost else "OFF — turn it on to use this")],
+            footer="Each account keeps its own position in this range, so a "
+                   "number is never probed twice for the same account."))
+        return await event.respond(settings_text(), buttons=kb_settings())
+
+    if step == "await_boostprobe":
+        try:
+            val = int(re.sub(r"\D", "", text or ""))
+            if val < 1 or val > 5000:
+                raise ValueError
+        except ValueError:
+            return await event.respond("Send a whole number between 1 and 5000 "
+                                       "(400 is the tested default).")
+        store.set_boost_probe(val)
         pending.pop(event.sender_id, None)
         return await event.respond(settings_text(), buttons=kb_settings())
 

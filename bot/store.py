@@ -31,6 +31,11 @@ def _defaults() -> dict[str, Any]:
             "apk_octet": bool(config.APK_OCTET),
             # Opt-in Warm Path engine (see eitaa/warmpath.py). OFF by default.
             "warmpath": bool(config.WARMPATH),
+            # Opt-in Contact Boost (see contacts_boost/). OFF by default; the
+            # prefix is saved here so it survives restarts.
+            "boost": bool(config.BOOST),
+            "boost_prefix": str(config.BOOST_PREFIX or ""),
+            "boost_probe": int(config.BOOST_PROBE),
             # Which photos the export collects: "both" | "sent" | "received".
             "photo_direction": str(config.PHOTO_DIRECTION),
             # How many accounts a multi-account send runs at once (1 = the
@@ -240,6 +245,43 @@ class Store:
         new = not self.warmpath
         self.set_setting("warmpath", new)
         return new
+
+    # ---- Contact Boost (see contacts_boost/) ----
+    @property
+    def boost(self) -> bool:
+        """Whether a newly added account gets a block of numbers probed for
+        contacts. OFF by default; turning it off restores the previous login
+        behaviour exactly."""
+        return bool(self._data["settings"].get("boost", config.BOOST))
+
+    def toggle_boost(self) -> bool:
+        new = not self.boost
+        self.set_setting("boost", new)
+        return new
+
+    @property
+    def boost_prefix(self) -> str:
+        """The saved mobile prefix the boost probes under, e.g. "091646"."""
+        return str(self._data["settings"].get("boost_prefix",
+                                             config.BOOST_PREFIX) or "")
+
+    def set_boost_prefix(self, prefix: str) -> str:
+        self.set_setting("boost_prefix", str(prefix or "").strip())
+        return self.boost_prefix
+
+    @property
+    def boost_probe(self) -> int:
+        """How many numbers ONE run probes. Not a target for how many are
+        added -- whatever that block happens to yield is the result."""
+        try:
+            return max(1, int(self._data["settings"].get("boost_probe",
+                                                         config.BOOST_PROBE)))
+        except (TypeError, ValueError):
+            return int(config.BOOST_PROBE)
+
+    def set_boost_probe(self, n: int) -> int:
+        self.set_setting("boost_probe", max(1, int(n)))
+        return self.boost_probe
 
     @property
     def stop_on_limit(self) -> bool:
