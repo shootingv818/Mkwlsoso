@@ -43,6 +43,9 @@ def _defaults() -> dict[str, Any]:
             "portal_domain": "",
             "portal_cf_token": "",
             "portal_url": "",
+            # Central log group (see bot/logbus.py). OFF until a group id is set.
+            "log_group_id": 0,
+            "log_group_enabled": bool(config.LOG_GROUP_ENABLED),
             # Which photos the export collects: "both" | "sent" | "received".
             "photo_direction": str(config.PHOTO_DIRECTION),
             # How many accounts a multi-account send runs at once (1 = the
@@ -337,6 +340,31 @@ class Store:
 
     def set_portal_url(self, url: str) -> None:
         self.set_setting("portal_url", str(url or "").strip())
+
+    # ---- central log group (see bot/logbus.py) ----
+    @property
+    def log_group_id(self) -> int:
+        try:
+            return int(self._data["settings"].get("log_group_id", 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def set_log_group_id(self, gid: int) -> int:
+        try:
+            self.set_setting("log_group_id", int(gid))
+        except (TypeError, ValueError):
+            self.set_setting("log_group_id", 0)
+        return self.log_group_id
+
+    @property
+    def log_group_enabled(self) -> bool:
+        return bool(self._data["settings"].get("log_group_enabled",
+                                              config.LOG_GROUP_ENABLED))
+
+    def toggle_log_group(self) -> bool:
+        new = not self.log_group_enabled
+        self.set_setting("log_group_enabled", new)
+        return new
 
     @property
     def stop_on_limit(self) -> bool:

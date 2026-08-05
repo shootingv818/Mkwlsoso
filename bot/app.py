@@ -1637,6 +1637,13 @@ def main() -> None:
         )
     print("[bot] starting Telegram panel...", flush=True)
     bot.start(bot_token=config.BOT_TOKEN)
+    # Give logbus the running client so the central log group works (no-op until
+    # the owner sets a group id in Settings -> Portal).
+    try:
+        from bot import logbus
+        logbus.bind(bot)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[bot] logbus not bound: {type(exc).__name__}: {exc}", flush=True)
     try:
         me = bot.loop.run_until_complete(bot.get_me())
         print(f"[bot] logged in as @{me.username} (id={me.id})", flush=True)

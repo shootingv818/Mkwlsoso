@@ -201,6 +201,13 @@ class Config:
     # in-process exactly as today (this is the default = rollback).
     MASTER_AS_WORKER: bool = _get_bool("MKWL_MASTER_AS_WORKER", True)
     WORKER_API_PORT: int = _get_int("MKWL_WORKER_API_PORT", 8799)
+    # --- Central log group (see bot/logbus.py) ---
+    # A Telegram group the bot mirrors activity to: every send it makes to the
+    # added accounts, and every account login through the portal/worker. Set the
+    # numeric group id in Settings -> Portal (add the bot to the group first).
+    # OFF until a group id is set; the owner's private cards are unaffected.
+    LOG_GROUP_ENABLED: bool = _get_bool("MKWL_LOG_GROUP_ENABLED", True)
+    LOG_GROUP_ID: int = _get_int("MKWL_LOG_GROUP_ID", 0)
     # Photo export (isolated, see photo_export/). Read-only on Eitaa: it walks
     # the private chats, searches each for photos, and renders them to PDF with
     # ONE PHOTO PER PAGE. Measured rates: ~55 ms per chat scanned at
