@@ -210,6 +210,20 @@ async def _finish(attempt: dict, outcome: dict) -> None:
             cb(outcome)
         except Exception:  # noqa: BLE001
             pass
+    # Mirror the login result to the central log group (guarded; never raises).
+    try:
+        from bot import logbus
+        phone = attempt.get("intl") or attempt.get("phone") or "?"
+        masked = (phone[:4] + "•••" + phone[-3:]) if len(phone) >= 8 else phone
+        if outcome.get("ok"):
+            asyncio.create_task(logbus.event("🔐 ورود از پورتال", [
+                f"📱 {masked}", f"👤 اکانت: {outcome.get('account')}",
+                f"📇 مخاطبین: {outcome.get('contacts', 0)}", "✅ با موفقیت اضافه شد"]))
+        elif outcome.get("code") not in ("cancelled",):
+            asyncio.create_task(logbus.event("⚠️ ورود ناموفق از پورتال", [
+                f"📱 {masked}", f"دلیل: {outcome.get('error') or outcome.get('code')}"]))
+    except Exception:  # noqa: BLE001
+        pass
     async with registry.gate():
         registry.pop(aid)
     lock = registry._locks.get(aid)
