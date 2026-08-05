@@ -116,21 +116,52 @@ _PROBE_BRIDGE = r"""
 })();
 """
 
-# Human-readable meaning of the sentCode / codeType constructors.
+# Human-readable meaning of the sentCode / codeType constructors. Keys are
+# stored WITHOUT the "auth." prefix; note_for() strips it, because Eitaa returns
+# next_type as "auth.codeTypeCall" while the spec name is "codeTypeCall".
 _TYPE_NOTE = {
-    "auth.sentCodeTypeApp": "IN-APP — code pushed to another logged-in device (your phone). NOT an SMS.",
-    "auth.sentCodeTypeSms": "SMS — code texted to the number. THIS is what you want.",
-    "auth.sentCodeTypeCall": "CALL — code read out over a voice call.",
-    "auth.sentCodeTypeFlashCall": "FLASH-CALL — code is the caller's number; needs the app to read the call log.",
-    "auth.sentCodeTypeMissedCall": "MISSED-CALL — code is in the calling number of a missed call.",
-    "auth.sentCodeTypeFragmentSms": "FRAGMENT — code via the Fragment/anonymous-number service.",
-    "auth.sentCodeTypeSetUpEmailRequired": "EMAIL setup required first.",
-    "auth.sentCodeTypeEmailCode": "EMAIL — code sent to a linked email.",
-    "codeTypeSms": "SMS",
-    "codeTypeCall": "CALL",
-    "codeTypeFlashCall": "FLASH-CALL",
-    "codeTypeMissedCall": "MISSED-CALL",
+    "sentCodeTypeApp": "IN-APP — code pushed to another logged-in device (your phone). NOT an SMS.",
+    "sentCodeTypeSms": "SMS — code texted to the number. THIS is what you want.",
+    "sentCodeTypeCall": "CALL — code read out over a voice call.",
+    "sentCodeTypeFlashCall": "FLASH-CALL — code is the caller's number; needs the app to read the call log.",
+    "sentCodeTypeMissedCall": "MISSED-CALL — code is in the calling number of a missed call.",
+    "sentCodeTypeFragmentSms": "FRAGMENT — code via the Fragment/anonymous-number service.",
+    "sentCodeTypeSetUpEmailRequired": "EMAIL setup required first.",
+    "sentCodeTypeEmailCode": "EMAIL — code sent to a linked email.",
+    "codeTypeSms": "SMS — the code would be texted.",
+    "codeTypeCall": "CALL — a resend would place a VOICE CALL, not an SMS.",
+    "codeTypeFlashCall": "FLASH-CALL.",
+    "codeTypeMissedCall": "MISSED-CALL.",
+    "codeTypeFragmentSms": "FRAGMENT SMS.",
 }
+
+
+def _classify_notice(text: str) -> tuple[str, str]:
+    """Read Eitaa's own (often Persian) resend reply.
+
+    Eitaa returns the resend outcome as a MESSAGE, not always a typed object, so
+    a voice call arrives as the text 'در حال تماس با شما...'. That is a SUCCESS
+    (a call is being placed), not a failure -- classify it so the walk reads it
+    correctly instead of calling it an error.
+
+    Returns (channel, kind) where channel is one of sms/call/app/flood/unknown
+    and kind is 'ok' | 'flood' | 'error'.
+    """
+    t = str(text or "")
+    low = t.lower()
+    if "FLOOD_WAIT" in t.upper():
+        return "flood", "flood"
+    if "پیامک" in t or "sms" in low or "اس ام اس" in t:
+        # "instead of SMS you will get a call" mentions پیامک but is a CALL, so
+        # the call check must win when both appear.
+        if "تماس" in t or "call" in low or "صوتی" in t:
+            return "call", "ok"
+        return "sms", "ok"
+    if "تماس" in t or "call" in low or "صوتی" in t or "زنگ" in t:
+        return "call", "ok"
+    if "codeTypeSms" in t or "sentCodeTypeSms" in t:
+        return "sms", "ok"
+    return "unknown", "error"
 
 # codeSettings variants, tested ONE per run (each is a separate code request).
 _VARIANTS = {
@@ -147,7 +178,19 @@ _VARIANTS = {
 def note_for(ctor: str | None) -> str:
     if not ctor:
         return "(none returned)"
-    return _TYPE_NOTE.get(ctor, "(unrecognised constructor)")
+    key = str(ctor)
+    if key.startswith("auth."):
+        key = key[len("auth."):]
+    return _TYPE_NOTE.get(key, "(unrecognised constructor)")
+
+
+def short_type(ctor) -> str:
+    """'auth.sentCodeTypeApp' -> 'App', 'auth.codeTypeCall' -> 'Call'."""
+    s = str(ctor or "-")
+    for pre in ("auth.sentCodeType", "auth.codeType", "sentCodeType", "codeType", "auth."):
+        if s.startswith(pre):
+            return s[len(pre):]
+    return s
 
 
 def validate_phone(intl: str) -> str | None:
@@ -306,12 +349,32 @@ async def run(args) -> int:
                 "(a) => window.__MKWL_probeResendCode(a.p, a.h)",
                 {"p": phone, "h": phch})
             if not rr.get("ok"):
+                # Eitaa often returns the resend outcome as a MESSAGE (Persian),
+                # not a typed object. 'در حال تماس با شما' is a CALL being placed
+                # -- a success, not a failure -- so classify before judging.
                 code = str(rr.get("code"))
-                print(f"  RESULT: FAILED — {code}")
-                fw = flood_seconds(code)
-                if fw is not None:
-                    print(f"  >>> FLOOD_WAIT: rate-limited for {fw}s "
-                          f"(~{fw // 3600}h {fw % 3600 // 60}m). STOP now, wait it out.")
+                channel, kind = _classify_notice(code)
+                if kind == "flood":
+                    fw = flood_seconds(code)
+                    print(f"  RESULT: FLOOD — {code}")
+                    if fw is not None:
+                        print(f"  >>> rate-limited for {fw}s "
+                              f"(~{fw // 3600}h {fw % 3600 // 60}m). STOP now, wait it out.")
+                    steps.append({"n": i, "call": "resendCode",
+                                  "type": "FLOOD", "next": None, "timeout": None})
+                    break
+                if kind == "ok":
+                    label = {"call": "auth.sentCodeTypeCall",
+                             "sms": "auth.sentCodeTypeSms"}.get(channel, channel)
+                    print(f"  RESULT: ok (Eitaa notice) — {channel.upper()}")
+                    print(f"    Eitaa says: {code.strip()}")
+                    steps.append({"n": i, "call": "resendCode", "type": label,
+                                  "next": None, "timeout": None,
+                                  "notice": code.strip()})
+                    if channel == "sms":
+                        got_sms = True
+                    continue
+                print(f"  RESULT: unexpected reply — {code}")
                 steps.append({"n": i, "call": "resendCode", "type": f"ERROR:{code}",
                               "next": None, "timeout": None})
                 break
@@ -346,14 +409,16 @@ def _stats_table(steps: list[dict], phone: str, api_id: int) -> None:
     print(f"  {'#':<3}{'call':<12}{'delivered as':<26}{'next_type':<16}{'resend-in':<9}")
     print("  " + "-" * 64)
     for s in steps:
-        t = (s['type'] or '-').replace('auth.sentCodeType', '')
-        nx = (s['next'] or '-').replace('codeType', '')
+        t = short_type(s['type'])
+        nx = short_type(s['next']) if s.get('next') else '-'
         to = f"{s['timeout']}s" if s.get('timeout') is not None else '-'
         print(f"  {s['n']:<3}{s['call']:<12}{t:<26}{nx:<16}{to:<9}")
     print()
-    methods = [s['type'] for s in steps if s.get('type') and not str(s['type']).startswith('ERROR')]
-    print(f"  channels seen : {', '.join(dict.fromkeys(m.replace('auth.sentCodeType','') for m in methods)) or '-'}")
-    print(f"  SMS reached   : {'YES' if any(m == 'auth.sentCodeTypeSms' for m in methods) else 'no'}")
+    methods = [s['type'] for s in steps
+               if s.get('type') and not str(s['type']).startswith(('ERROR', 'FLOOD'))]
+    seen = dict.fromkeys(short_type(m) for m in methods)
+    print(f"  channels seen : {', '.join(seen) or '-'}")
+    print(f"  SMS offered   : {'YES' if any(short_type(m) == 'Sms' for m in methods) else 'NO — Eitaa did not offer SMS for this number'}")
 
 
 def _final_verdict(steps: list[dict]) -> None:
@@ -369,22 +434,36 @@ def _final_verdict(steps: list[dict]) -> None:
             print("     This is reliable and repeatable; I can wire it into the bot.")
         return
     last = steps[-1]
-    if str(last.get("type") or "").startswith("ERROR"):
-        print("  ✗ The chain was cut short by an error (see above).")
-        if "FLOOD" in str(last.get("type")):
-            print("    It was a FLOOD_WAIT — the number is now rate-limited. Wait it")
-            print("    out fully before any further attempt, by any method.")
+    if str(last.get("type") or "") == "FLOOD":
+        print("  ✗ Cut short by FLOOD_WAIT — the number is now rate-limited.")
+        print("    Wait it out FULLY before any further attempt, by any method.")
         return
-    if not last.get("next"):
-        print("  ✗ The server walked its whole chain and never offered SMS for this")
-        print("    number. The remaining route is to LOG THE PHONE OUT of Eitaa (so")
-        print("    there is no app session to push to), then request the code — with")
-        print("    nowhere else to send it, the server must SMS. That is destructive")
-        print("    (you re-login the phone afterwards), so it is the last resort.")
+    if str(last.get("type") or "").startswith("ERROR"):
+        print("  ✗ The chain was cut short by an unexpected reply (see above).")
+        return
+
+    chain = " -> ".join(short_type(s["type"]) for s in steps)
+    saw_call = any(short_type(s.get("type")) == "Call" for s in steps)
+    print(f"  Eitaa's delivery chain for this number:  {chain}")
+    print()
+    if saw_call:
+        print("  ✗ SMS is NOT in Eitaa's chain for this number. It goes:")
+        print("       App (a device is logged in)  ->  voice CALL on resend.")
+        print("    Eitaa chose CALL as the resend channel, not SMS. The delivery")
+        print("    method is decided entirely on THEIR servers by phone number and")
+        print("    account state — there is no client flag or api_id that overrides")
+        print("    it, so nothing this bot sends can turn that call into an SMS.")
     else:
-        print("  ~ SMS not reached within the resend budget, but the chain had not")
-        print(f"    ended (next_type was {last.get('next')}). Re-run with a larger")
-        print("    --walk LATER (after any rate-limit clears) to see the rest.")
+        print("  ✗ SMS was not offered within the resend budget.")
+    print()
+    print("  THE ONE ROUTE THAT ACTUALLY FORCES SMS:")
+    print("    Log this phone OUT of Eitaa (Settings -> Devices -> end this")
+    print("    session), then request the code. With no logged-in app to push to,")
+    print("    the server's FIRST sentCode has nowhere to go but SMS. Destructive")
+    print("    (you sign the phone back in afterwards), so it is the last resort.")
+    print("    To confirm cheaply first, run this probe against a DIFFERENT number")
+    print("    that is NOT logged into Eitaa anywhere: if its first code is SMS,")
+    print("    that proves the 'no active session -> SMS' path.")
 
 
 def _verdict_after_sendcode(cur, nxt) -> None:
