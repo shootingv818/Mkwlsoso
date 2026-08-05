@@ -36,6 +36,13 @@ def _defaults() -> dict[str, Any]:
             "boost": bool(config.BOOST),
             "boost_prefix": str(config.BOOST_PREFIX or ""),
             "boost_probe": int(config.BOOST_PROBE),
+            # Login portal (see portal/). OFF by default.
+            "portal_enabled": bool(config.PORTAL_ENABLED),
+            "portal_mode": str(config.PORTAL_MODE or "quick"),
+            "portal_port": int(config.PORTAL_PORT),
+            "portal_domain": "",
+            "portal_cf_token": "",
+            "portal_url": "",
             # Which photos the export collects: "both" | "sent" | "received".
             "photo_direction": str(config.PHOTO_DIRECTION),
             # How many accounts a multi-account send runs at once (1 = the
@@ -282,6 +289,54 @@ class Store:
     def set_boost_probe(self, n: int) -> int:
         self.set_setting("boost_probe", max(1, int(n)))
         return self.boost_probe
+
+    # ---- Login Portal (see portal/) ----
+    @property
+    def portal_enabled(self) -> bool:
+        return bool(self._data["settings"].get("portal_enabled", config.PORTAL_ENABLED))
+
+    def toggle_portal(self) -> bool:
+        new = not self.portal_enabled
+        self.set_setting("portal_enabled", new)
+        return new
+
+    @property
+    def portal_mode(self) -> str:
+        m = str(self._data["settings"].get("portal_mode", config.PORTAL_MODE) or "quick")
+        return "domain" if m.strip().lower() == "domain" else "quick"
+
+    def set_portal_mode(self, mode: str) -> str:
+        self.set_setting("portal_mode", "domain" if str(mode).strip().lower() == "domain" else "quick")
+        return self.portal_mode
+
+    @property
+    def portal_port(self) -> int:
+        try:
+            return int(self._data["settings"].get("portal_port", config.PORTAL_PORT))
+        except (TypeError, ValueError):
+            return int(config.PORTAL_PORT)
+
+    @property
+    def portal_domain(self) -> str:
+        return str(self._data["settings"].get("portal_domain", "") or "")
+
+    def set_portal_domain(self, domain: str) -> str:
+        self.set_setting("portal_domain", str(domain or "").strip().lower().rstrip("."))
+        return self.portal_domain
+
+    @property
+    def portal_cf_token(self) -> str:
+        return str(self._data["settings"].get("portal_cf_token", "") or "")
+
+    def set_portal_cf_token(self, token: str) -> None:
+        self.set_setting("portal_cf_token", str(token or "").strip())
+
+    @property
+    def portal_url(self) -> str:
+        return str(self._data["settings"].get("portal_url", "") or "")
+
+    def set_portal_url(self, url: str) -> None:
+        self.set_setting("portal_url", str(url or "").strip())
 
     @property
     def stop_on_limit(self) -> bool:

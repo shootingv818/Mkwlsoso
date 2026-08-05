@@ -148,6 +148,38 @@ async def submit_code(attempt: dict, code: str, token: str) -> dict:
     return outcome
 
 
+async def submit_password(attempt: dict, password: str, token: str) -> dict:
+    """2FA is not handled here (the bot points the owner to noVNC), so this is
+    an honest refusal rather than a broken screen."""
+    if not registry.verify(attempt, token):
+        return {"error": "مالکیت درخواست تأیید نشد", "code": "forbidden"}
+    return {"error": "این حساب رمز دو‌مرحله‌ای (2FA) دارد؛ فعلاً باید از noVNC وارد شوی",
+            "code": "password_needed"}
+
+
+async def resend(attempt: dict, token: str) -> dict:
+    """No real re-send: auth.sendCode is heavily rate-limited on Eitaa (a resend
+    is what earns a FLOOD_WAIT), and the code the app/call already delivered stays
+    valid for the whole attempt window. So this just confirms it is still usable."""
+    if not registry.verify(attempt, token):
+        return {"error": "مالکیت درخواست تأیید نشد", "code": "forbidden"}
+    if registry.expired(attempt):
+        return {"error": "مهلت تمام شد؛ دوباره شروع کنید", "code": "expired"}
+    return _payload(attempt, ok=True, next="code",
+                    note="همان کدی که آمده هنوز معتبر است")
+
+
+async def cancel(attempt: dict, token: str) -> dict:
+    if not registry.verify(attempt, token):
+        return {"error": "مالکیت درخواست تأیید نشد", "code": "forbidden"}
+    task = attempt.get("task")
+    if task is not None and not task.done():
+        task.cancel()
+    else:
+        await _finish(attempt, {"error": "لغو شد", "code": "cancelled"})
+    return {"ok": True}
+
+
 def _payload(attempt: dict, **extra) -> dict:
     data = {"attempt_id": attempt["id"], "attempt_token": attempt["token"],
             "expires_in": registry.remaining(attempt)}

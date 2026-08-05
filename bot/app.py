@@ -12,6 +12,7 @@ Live jobs (contact build / send) edit ONE card in place (LiveCard).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import re
 import socket
 import time
@@ -489,7 +490,9 @@ def kb_settings():
          Button.inline(f"🔧 Engine: {_ENGINE_MARK.get(store.engine, store.engine)}",
                        b"set:cat:engine")],
         [Button.inline("👥 Contacts & Boost", b"set:cat:contacts")],
-        [Button.inline("🏠 Browser Standby", b"set:pool")],
+        [Button.inline("🏠 Browser Standby", b"set:pool"),
+         Button.inline(f"🌐 Portal: {'ON' if store.portal_enabled else 'OFF'}",
+                       b"set:portal")],
         [Button.inline("⬅ Back", b"menu:home")],
     ]
 
@@ -748,7 +751,78 @@ async def show_home(event, edit=False):
         await event.respond(text, buttons=kb_home())
 
 
+@bot.on(events.NewMessage(pattern=r"^/portal"))
+async def _portal_cmd(event):
+    if not is_owner(event):
+        return
+    try:
+        from portal import panel as _pp
+        await event.respond(_pp.panel_text(store), buttons=_pp.panel_kb(Button, store))
+    except Exception as exc:  # noqa: BLE001
+        await event.respond(f"Portal unavailable: {type(exc).__name__}: {exc}")
+
+
 @bot.on(events.NewMessage(pattern=r"^/start"))
+async def _handle_portal_cb(event, data: str):
+    """Portal panel callbacks (portal:*), delegated to portal.panel builders."""
+    from portal import panel as _pp
+    from portal import app as _papp
+    from portal import net as _pnet, status as _pstatus
+    if data == "portal:toggle":
+        now = store.toggle_portal()
+        _papp.request_restart()
+        await event.answer("Portal: " + ("ON" if now else "OFF"))
+        return await event.edit(_pp.panel_text(store), buttons=_pp.panel_kb(Button, store))
+    if data == "portal:restart":
+        _papp.request_restart()
+        await event.answer("restart queued")
+        return await event.edit(_pp.panel_text(store), buttons=_pp.panel_kb(Button, store))
+    if data == "portal:mode:quick":
+        store.set_portal_mode("quick")
+        _papp.request_restart()
+        return await event.edit(_pp.panel_text(store), buttons=_pp.panel_kb(Button, store))
+    if data == "portal:stats":
+        return await event.edit(_pp.stats_text(),
+                                buttons=[[Button.inline("♻️", b"portal:stats")],
+                                         [Button.inline("⬅ پورتال", b"portal:panel")]])
+    if data == "portal:domain":
+        return await event.edit(_pp.domain_text(store), buttons=_pp.domain_kb(Button))
+    if data == "portal:domain:set":
+        pending[event.sender_id] = {"step": "await_portal_domain"}
+        return await event.edit(
+            cards.card("🌐 دامنه پورتال", [("Current", store.portal_domain or "—")],
+                       footer="دامنه‌ی کامل را بفرست، مثال: portal.example.com"),
+            buttons=kb_back())
+    if data == "portal:token:set":
+        pending[event.sender_id] = {"step": "await_portal_token"}
+        return await event.edit(
+            cards.card("🔑 توکن Cloudflare", [("Status", "ثبت شده" if store.portal_cf_token else "—")],
+                       footer="API Token کلادفلر را بفرست (در کارت نمایش داده نمی‌شود)."),
+            buttons=kb_back())
+    if data == "portal:domain:test":
+        await event.answer("در حال تست DNS/SSL ...")
+        res = await _pnet.inspect_domain(store.portal_domain, store.portal_cf_token)
+        _pstatus.update(dns=res["dns"], ssl=res["ssl"], domain_ping=res["domain_ping"],
+                        detail=res["detail"])
+        return await event.edit(_pp.domain_text(store), buttons=_pp.domain_kb(Button))
+    if data == "portal:domain:go":
+        if not store.portal_domain or not store.portal_cf_token:
+            return await event.answer("اول دامنه و توکن را ثبت کن.", alert=True)
+        store.set_portal_mode("domain")
+        store.set_setting("portal_enabled", True)
+        _papp.request_restart()
+        return await event.edit("🚀 فعال‌سازی دامنه شروع شد.\n\n" + _pp.domain_text(store),
+                                buttons=_pp.domain_kb(Button))
+    if data == "portal:domain:del":
+        store.set_portal_domain("")
+        store.set_portal_cf_token("")
+        store.set_portal_mode("quick")
+        _papp.request_restart()
+        return await event.edit("✅ تنظیمات دامنه پاک شد.\n\n" + _pp.domain_text(store),
+                                buttons=_pp.domain_kb(Button))
+    return await event.answer("unknown portal action", alert=True)
+
+
 async def _start(event):
     if not is_owner(event):
         try:
@@ -824,6 +898,15 @@ async def _handle_callback(event):
         return await event.edit(content_text(), buttons=kb_content())
     if data == "menu:settings":
         return await event.edit(settings_text(), buttons=kb_settings())
+    # ---- login portal (isolated, see portal/) ----
+    if data == "set:portal" or data == "portal:panel":
+        try:
+            from portal import panel as _pp
+            return await event.edit(_pp.panel_text(store), buttons=_pp.panel_kb(Button, store))
+        except Exception as exc:  # noqa: BLE001
+            return await event.answer(f"Portal unavailable: {type(exc).__name__}", alert=True)
+    if data.startswith("portal:"):
+        return await _handle_portal_cb(event, data)
     if data.startswith("set:cat:"):
         cat = data.split(":", 2)[2]
         kb = _SETTINGS_CATS.get(cat)
@@ -1404,6 +1487,27 @@ async def _conversation(event):
         pending.pop(event.sender_id, None)
         return await event.respond("No active login for that account. Tap Add Account to start again.")
 
+    if step == "await_portal_domain":
+        from portal import panel as _pp, app as _papp
+        domain = (text or "").strip().lower().rstrip(".")
+        if "." not in domain or " " in domain or "/" in domain or len(domain) > 253:
+            return await event.respond("دامنه نامعتبر است؛ دوباره بفرست (مثال: portal.example.com).")
+        store.set_portal_domain(domain)
+        pending.pop(event.sender_id, None)
+        return await event.respond("✅ دامنه ذخیره شد.\n\n" + _pp.domain_text(store),
+                                   buttons=_pp.domain_kb(Button))
+    if step == "await_portal_token":
+        from portal import panel as _pp
+        token = (text or "").strip()
+        if not token:
+            return await event.respond("توکن خالی است؛ دوباره بفرست.")
+        store.set_portal_cf_token(token)
+        pending.pop(event.sender_id, None)
+        with contextlib.suppress(Exception):
+            await event.delete()   # don't leave the token in the chat
+        return await event.respond("✅ توکن ذخیره شد (رمز‌نشده روی سرور خودت).",
+                                   buttons=_pp.domain_kb(Button))
+
     if step in ("await_textdelay", "await_contactdelay"):
         try:
             val = float(text)
@@ -1539,6 +1643,14 @@ def main() -> None:
     except Exception as exc:  # noqa: BLE001
         print(f"[bot] warning: could not fetch bot identity: {exc}", flush=True)
     print(f"[bot] online. OWNER_ID={config.OWNER_ID} REPORT_TO={config.report_to()}", flush=True)
+    # ---- login portal (isolated, opt-in). Guarded so a broken/absent portal
+    # package or a missing fastapi can NEVER stop the bot from starting. ----
+    try:
+        from portal import run_portal
+        bot.loop.create_task(run_portal(log=report))
+        print("[bot] portal task scheduled (enable it in Settings -> Portal)", flush=True)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[bot] portal not started: {type(exc).__name__}: {exc}", flush=True)
     bot.run_until_disconnected()
 
 
