@@ -475,42 +475,75 @@ def _boost_prefix_label() -> str:
     return f"{len(good)} prefixes"
 
 
+_ENGINE_MARK = {"bridge": "🌉 bridge", "hybrid": "⚡ hybrid", "direct": "🚀 direct"}
+
+
 def kb_settings():
-    rows = []
-    # The engine switch is back, now with three choices: bridge (proven page),
-    # hybrid (browser-free sends with the page as a per-recipient safety net) and
-    # direct (browser-free only, MKWL_ENABLE_DIRECT=1, no safety net).
-    _ENGINE_MARK = {"bridge": "🌉 bridge", "hybrid": "⚡ hybrid", "direct": "🚀 direct"}
-    rows.append([Button.inline(
-        f"🔧 Engine: {_ENGINE_MARK.get(store.engine, store.engine)} — tap to change",
-        b"set:engine")])
-    rows += [
+    """Root settings: categories, not a wall of buttons.
+
+    The flat menu had grown to eleven rows; it is now split into Sending,
+    Engine and Contacts sub-menus so each screen stays short. Every individual
+    `set:*` action is unchanged -- only where they LIVE moved."""
+    return [
+        [Button.inline("🚀 Sending", b"set:cat:sending"),
+         Button.inline(f"🔧 Engine: {_ENGINE_MARK.get(store.engine, store.engine)}",
+                       b"set:cat:engine")],
+        [Button.inline("👥 Contacts & Boost", b"set:cat:contacts")],
+        [Button.inline("🏠 Browser Standby", b"set:pool")],
+        [Button.inline("⬅ Back", b"menu:home")],
+    ]
+
+
+def kb_set_sending():
+    return [
         [Button.inline("⏱ Send Delay", b"set:textdelay"),
          Button.inline("⚡ Concurrency", b"set:concurrency")],
         [Button.inline(
             f"🚫 Pause on limit: {'ON' if store.stop_on_limit else 'OFF'}",
             b"set:stoponlimit")],
-        [Button.inline("⏱ Contact Delay", b"set:contactdelay"),
-         Button.inline("🔢 Log Every N", b"set:logevery")],
-        [Button.inline("🏠 Browser Standby", b"set:pool"),
-         Button.inline(
-             f"🚀 No-browser sends: {'ON' if store.browserless else 'OFF'}",
-             b"set:browserless")],
+        [Button.inline("🔢 Log Every N", b"set:logevery")],
+        [Button.inline("⬅ Settings", b"menu:settings")],
+    ]
+
+
+def kb_set_engine():
+    return [
+        [Button.inline(
+            f"🔧 Engine: {_ENGINE_MARK.get(store.engine, store.engine)} — tap to change",
+            b"set:engine")],
+        [Button.inline(
+            f"🚀 No-browser sends: {'ON' if store.browserless else 'OFF'}",
+            b"set:browserless")],
         [Button.inline(
             f"📦 APK send mode: {'ON' if store.apk_octet else 'OFF'}",
             b"set:apkoctet")],
         [Button.inline(
             f"🔥 Warm Path: {'ON' if store.warmpath else 'OFF'}",
             b"set:warmpath")],
+        [Button.inline("⬅ Settings", b"menu:settings")],
+    ]
+
+
+def kb_set_contacts():
+    return [
+        [Button.inline("⏱ Contact Delay", b"set:contactdelay")],
         [Button.inline(
             f"👥 Contact Boost: {'ON' if store.boost else 'OFF'}",
             b"set:boost")],
         [Button.inline(f"🔢 Prefixes: {_boost_prefix_label()}",
                        b"set:boostprefix"),
          Button.inline(f"🎯 Probe: {store.boost_probe}", b"set:boostprobe")],
-        [Button.inline("⬅ Back", b"menu:home")],
+        [Button.inline("⬅ Settings", b"menu:settings")],
     ]
-    return rows
+
+
+# Which sub-menu keyboard each category key opens. One place so the nav handler
+# and the toggle handlers agree on where a setting lives.
+_SETTINGS_CATS = {
+    "sending": kb_set_sending,
+    "engine": kb_set_engine,
+    "contacts": kb_set_contacts,
+}
 
 
 # ---- panel renderers ---------------------------------------------------
@@ -791,6 +824,12 @@ async def _handle_callback(event):
         return await event.edit(content_text(), buttons=kb_content())
     if data == "menu:settings":
         return await event.edit(settings_text(), buttons=kb_settings())
+    if data.startswith("set:cat:"):
+        cat = data.split(":", 2)[2]
+        kb = _SETTINGS_CATS.get(cat)
+        if kb is None:
+            return await event.edit(settings_text(), buttons=kb_settings())
+        return await event.edit(settings_text(), buttons=kb())
 
     # ---- accounts ----
     if data.startswith("acc:open:"):
@@ -1057,7 +1096,7 @@ async def _handle_callback(event):
     if data == "set:engine":
         new = store.cycle_engine()
         await event.answer(f"Engine: {new}")
-        return await event.edit(settings_text(), buttons=kb_settings())
+        return await event.edit(settings_text(), buttons=kb_set_engine())
     if data == "set:textdelay":
         pending[event.sender_id] = {"step": "await_textdelay"}
         return await event.edit(
@@ -1071,19 +1110,19 @@ async def _handle_callback(event):
     if data == "set:stoponlimit":
         now = store.toggle_stop_on_limit()
         await event.answer("Pause on limit: " + ("ON" if now else "OFF"))
-        return await event.edit(settings_text(), buttons=kb_settings())
+        return await event.edit(settings_text(), buttons=kb_set_sending())
     if data == "set:browserless":
         now = store.toggle_browserless()
         await event.answer("No-browser sends: " + ("ON" if now else "OFF"))
-        return await event.edit(settings_text(), buttons=kb_settings())
+        return await event.edit(settings_text(), buttons=kb_set_engine())
     if data == "set:apkoctet":
         now = store.toggle_apk_octet()
         await event.answer("APK send mode: " + ("ON" if now else "OFF"))
-        return await event.edit(settings_text(), buttons=kb_settings())
+        return await event.edit(settings_text(), buttons=kb_set_engine())
     if data == "set:warmpath":
         now = store.toggle_warmpath()
         await event.answer("Warm Path: " + ("ON" if now else "OFF"))
-        return await event.edit(settings_text(), buttons=kb_settings())
+        return await event.edit(settings_text(), buttons=kb_set_engine())
     if data == "set:boost":
         now = store.toggle_boost()
         await event.answer("Contact Boost: " + ("ON" if now else "OFF"))
@@ -1094,7 +1133,7 @@ async def _handle_callback(event):
                 footer="Set a mobile prefix in Settings → 'Boost Prefix' (e.g. "
                        "0916), otherwise there are no numbers to probe and the "
                        "boost will skip itself."))
-        return await event.edit(settings_text(), buttons=kb_settings())
+        return await event.edit(settings_text(), buttons=kb_set_contacts())
     if data == "set:boostprefix":
         pending[event.sender_id] = {"step": "await_boostprefix"}
         from contacts_boost import numbers as boost_numbers
@@ -1375,7 +1414,9 @@ async def _conversation(event):
         key = "text_send_delay" if step == "await_textdelay" else "contact_create_delay"
         store.set_setting(key, val)
         pending.pop(event.sender_id, None)
-        return await event.respond(settings_text(), buttons=kb_settings())
+        # Send delay lives under Sending; contact delay under Contacts.
+        kb = kb_set_sending if step == "await_textdelay" else kb_set_contacts
+        return await event.respond(settings_text(), buttons=kb())
 
     if step == "await_concurrency":
         try:
@@ -1386,7 +1427,7 @@ async def _conversation(event):
             return await event.respond("Send a whole number between 1 and 10.")
         store.set_setting("send_concurrency", val)
         pending.pop(event.sender_id, None)
-        return await event.respond(settings_text(), buttons=kb_settings())
+        return await event.respond(settings_text(), buttons=kb_set_sending())
 
     if step == "await_logevery":
         try:
@@ -1397,7 +1438,7 @@ async def _conversation(event):
             return await event.respond("Send an integer >= 1 (e.g. 50).")
         store.set_setting("send_log_every", val)
         pending.pop(event.sender_id, None)
-        return await event.respond(settings_text(), buttons=kb_settings())
+        return await event.respond(settings_text(), buttons=kb_set_sending())
 
     if step == "await_boostprefix":
         from contacts_boost import numbers as boost_numbers
@@ -1429,7 +1470,7 @@ async def _conversation(event):
                    "not all draw from the same corner of the number space. Every "
                    "number handed out is remembered per prefix, so none is ever "
                    "used twice."))
-        return await event.respond(settings_text(), buttons=kb_settings())
+        return await event.respond(settings_text(), buttons=kb_set_contacts())
 
     if step == "await_boostprobe":
         try:
@@ -1441,7 +1482,7 @@ async def _conversation(event):
                                        "(400 is the tested default).")
         store.set_boost_probe(val)
         pending.pop(event.sender_id, None)
-        return await event.respond(settings_text(), buttons=kb_settings())
+        return await event.respond(settings_text(), buttons=kb_set_contacts())
 
     if step == "await_prefix":
         entries, err = expand_range(text, 1)
