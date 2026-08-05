@@ -150,6 +150,26 @@ def note_for(ctor: str | None) -> str:
     return _TYPE_NOTE.get(ctor, "(unrecognised constructor)")
 
 
+def validate_phone(intl: str) -> str | None:
+    """Return a reason the number is unusable, or None if it looks fine.
+
+    Done BEFORE the 3-minute browser boot so a typo (or the literal
+    09XXXXXXXXX placeholder, which strips to '09') fails in a second, not after
+    a code has been burned.
+    """
+    if not intl.isdigit():
+        return f"contains non-digits after normalising: {intl!r}"
+    if intl.startswith("98"):
+        if len(intl) != 12:
+            return (f"Iranian mobile should be 98 + 10 digits (12 total); got "
+                    f"{len(intl)}: {intl!r}. Example: 09991048633")
+        if intl[2] != "9":
+            return f"Iranian mobile national part must start with 9: {intl!r}"
+    elif len(intl) < 10:
+        return f"too short to be a real number: {intl!r}"
+    return None
+
+
 def flood_seconds(code: str) -> int | None:
     m = re.search(r"FLOOD_WAIT_(\d+)", str(code or ""), re.I)
     return int(m.group(1)) if m else None
@@ -181,9 +201,21 @@ async def run(args) -> int:
 
     phone = normalize_phone_intl(args.phone)
     banner(f"LOGIN-DELIVERY PROBE  —  {phone}")
+
+    bad = validate_phone(phone)
+    if bad:
+        print(f"  [!] that number looks wrong: {bad}")
+        print("      (tip: pass the REAL number, not the 09XXXXXXXXX placeholder)")
+        return 2
+
     print("  Read-only-ish: it requests login codes (which really are sent), but")
     print("  never signs in and never touches the bot's own login flow.")
-    if args.resend:
+    walk = max(0, int(args.walk or 0))
+    if walk:
+        print(f"  MODE: WALK THE CHAIN — sendCode + up to {walk} resends, following")
+        print("        the server's own next_type each step. This is the full test.")
+        print(f"        Worst case = {walk + 1} code requests. That is a lot; run it ONCE.")
+    elif args.resend:
         print("  MODE: sendCode + resendCode  (2 code requests — the SMS attempt)")
     else:
         print(f"  MODE: sendCode only, variant '{args.settings}'  (1 code request)")
@@ -209,7 +241,7 @@ async def run(args) -> int:
         print(f"  using api_id={api_id}  (hash ...{str(api_hash)[-4:]})")
 
         # ---- Stage A: sendCode (one request) --------------------------------
-        variant = args.settings if not args.resend else "empty"
+        variant = "empty" if (args.resend or walk) else args.settings
         settings = _VARIANTS.get(variant, {})
         banner(f"STAGE A — auth.sendCode   (codeSettings: {variant} = {settings or '{}'})")
         r = await driver.page.evaluate(
@@ -239,19 +271,37 @@ async def run(args) -> int:
         print(f"    phone_code_hash : {phch}")
         print(f"    raw reply    : {json.dumps(sent, ensure_ascii=False)}")
 
+        # A step in the delivery chain, recorded for the final stats table.
+        steps = [{"n": 0, "call": "sendCode", "type": cur, "next": nxt,
+                  "timeout": sent.get("timeout")}]
+
         _verdict_after_sendcode(cur, nxt)
 
-        # ---- Stage B: resendCode (one more request) -------------------------
-        if args.resend:
+        # ---- walk the chain via resendCode ----------------------------------
+        # resendCode is the intended "escalate delivery" call: each one follows
+        # the previous reply's next_type, so App -> SMS -> Call is walked in the
+        # order the server itself offers. Stops the moment SMS is reached, the
+        # chain ends (no next_type), or anything errors.
+        total = walk if walk else (1 if args.resend else 0)
+        got_sms = (cur == "auth.sentCodeTypeSms")
+        for i in range(1, total + 1):
+            if got_sms:
+                print("\n  SMS already reached — no reason to escalate further.")
+                break
             if not phch:
-                print("\n  [!] no phone_code_hash returned; cannot resend.")
-                return 1
-            wait = int(sent.get("timeout") or 0)
+                print("\n  [!] no phone_code_hash; cannot resend.")
+                break
+            nxt_now = steps[-1]["next"]
+            if not nxt_now:
+                print("\n  The server offers no further next_type — the chain ends "
+                      "here. SMS is not on offer for this number right now.")
+                break
+            wait = int(steps[-1]["timeout"] or 0)
             if wait > 0:
                 w = min(wait, args.max_wait)
-                print(f"\n  waiting {w}s before resend (server said {wait}s)...")
+                print(f"\n  waiting {w}s before resend #{i} (server said {wait}s)...")
                 await asyncio.sleep(w)
-            banner("STAGE B — auth.resendCode   (force the next_type)")
+            banner(f"RESEND #{i} — auth.resendCode   (server's next_type: {nxt_now})")
             rr = await driver.page.evaluate(
                 "(a) => window.__MKWL_probeResendCode(a.p, a.h)",
                 {"p": phone, "h": phch})
@@ -260,23 +310,81 @@ async def run(args) -> int:
                 print(f"  RESULT: FAILED — {code}")
                 fw = flood_seconds(code)
                 if fw is not None:
-                    print(f"  >>> FLOOD_WAIT: rate-limited for {fw}s. Wait it out.")
-                return 1
-            sent2 = rr.get("sent") or {}
-            cur2 = sent2.get("type")
+                    print(f"  >>> FLOOD_WAIT: rate-limited for {fw}s "
+                          f"(~{fw // 3600}h {fw % 3600 // 60}m). STOP now, wait it out.")
+                steps.append({"n": i, "call": "resendCode", "type": f"ERROR:{code}",
+                              "next": None, "timeout": None})
+                break
+            s = rr.get("sent") or {}
+            c2 = s.get("type")
             print(f"  RESULT: ok")
-            print(f"    re-delivered as : {cur2}")
-            print(f"                      -> {note_for(cur2)}")
-            print(f"    next_type       : {sent2.get('next_type')}")
-            print(f"    raw reply       : {json.dumps(sent2, ensure_ascii=False)}")
-            _verdict_after_resend(cur, cur2)
+            print(f"    re-delivered as : {c2}  ->  {note_for(c2)}")
+            print(f"    next_type       : {s.get('next_type')}")
+            print(f"    raw reply       : {json.dumps(s, ensure_ascii=False)}")
+            # resend keeps the same phone_code_hash unless the server rotates it.
+            phch = s.get("phone_code_hash") or phch
+            steps.append({"n": i, "call": "resendCode", "type": c2,
+                          "next": s.get("next_type"), "timeout": s.get("timeout")})
+            if c2 == "auth.sentCodeTypeSms":
+                got_sms = True
+
+        _stats_table(steps, phone, api_id)
+        _final_verdict(steps)
 
     banner("DONE")
     print("  Nothing was signed in and the bot's login flow was not touched.")
-    print("  If SMS was achieved above, the bot could offer a 'send by SMS' button")
-    print("  that calls auth.resendCode — say the word and I will wire it in,")
-    print("  isolated and behind a toggle, with the same rate-limit guards.")
+    print("  If SMS was reached above, the bot can offer a 'send by SMS' button that")
+    print("  calls auth.resendCode — say the word and I will wire it in, isolated and")
+    print("  behind a toggle, with these same rate-limit guards.")
     return 0
+
+
+def _stats_table(steps: list[dict], phone: str, api_id: int) -> None:
+    banner("STATS")
+    print(f"  phone: {phone}    api_id: {api_id}    code requests made: {len(steps)}")
+    print()
+    print(f"  {'#':<3}{'call':<12}{'delivered as':<26}{'next_type':<16}{'resend-in':<9}")
+    print("  " + "-" * 64)
+    for s in steps:
+        t = (s['type'] or '-').replace('auth.sentCodeType', '')
+        nx = (s['next'] or '-').replace('codeType', '')
+        to = f"{s['timeout']}s" if s.get('timeout') is not None else '-'
+        print(f"  {s['n']:<3}{s['call']:<12}{t:<26}{nx:<16}{to:<9}")
+    print()
+    methods = [s['type'] for s in steps if s.get('type') and not str(s['type']).startswith('ERROR')]
+    print(f"  channels seen : {', '.join(dict.fromkeys(m.replace('auth.sentCodeType','') for m in methods)) or '-'}")
+    print(f"  SMS reached   : {'YES' if any(m == 'auth.sentCodeTypeSms' for m in methods) else 'no'}")
+
+
+def _final_verdict(steps: list[dict]) -> None:
+    banner("VERDICT")
+    types = [s.get("type") for s in steps]
+    if "auth.sentCodeTypeSms" in types:
+        first_sms = next(i for i, s in enumerate(steps) if s.get("type") == "auth.sentCodeTypeSms")
+        if first_sms == 0:
+            print("  ✅ The very first code came by SMS — no bypass needed.")
+        else:
+            print(f"  ✅ SMS REACHED after {first_sms} resend(s). THE BYPASS WORKS:")
+            print("     sendCode, then resendCode until the type is SMS.")
+            print("     This is reliable and repeatable; I can wire it into the bot.")
+        return
+    last = steps[-1]
+    if str(last.get("type") or "").startswith("ERROR"):
+        print("  ✗ The chain was cut short by an error (see above).")
+        if "FLOOD" in str(last.get("type")):
+            print("    It was a FLOOD_WAIT — the number is now rate-limited. Wait it")
+            print("    out fully before any further attempt, by any method.")
+        return
+    if not last.get("next"):
+        print("  ✗ The server walked its whole chain and never offered SMS for this")
+        print("    number. The remaining route is to LOG THE PHONE OUT of Eitaa (so")
+        print("    there is no app session to push to), then request the code — with")
+        print("    nowhere else to send it, the server must SMS. That is destructive")
+        print("    (you re-login the phone afterwards), so it is the last resort.")
+    else:
+        print("  ~ SMS not reached within the resend budget, but the chain had not")
+        print(f"    ended (next_type was {last.get('next')}). Re-run with a larger")
+        print("    --walk LATER (after any rate-limit clears) to see the rest.")
 
 
 def _verdict_after_sendcode(cur, nxt) -> None:
@@ -322,6 +430,10 @@ def main() -> int:
                     help="profile/account name to boot (default: derived from the phone)")
     ap.add_argument("--resend", action="store_true",
                     help="after sendCode, also call resendCode (the SMS attempt; 2 requests)")
+    ap.add_argument("--walk", type=int, default=0, metavar="N",
+                    help="the full test: sendCode then up to N resends, following the "
+                         "server's next_type chain (App->SMS->Call). Stops at SMS, at "
+                         "the chain's end, or on any error. Try --walk 3.")
     ap.add_argument("--settings", default="empty", choices=sorted(_VARIANTS),
                     help="codeSettings variant to send (ignored when --resend is used)")
     ap.add_argument("--api-id", type=int, default=None,
