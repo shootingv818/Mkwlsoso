@@ -127,7 +127,8 @@ def ensure_master() -> dict:
 
 
 def add_remote(ip: str, ssh_port: int, api_port: int, tag: str | None = None,
-               max_accounts: int = 0) -> int:
+               max_accounts: int = 0, ssh_user: str = "", ssh_pass: str = "",
+               api_token: str = "") -> int:
     with _LOCK:
         data = _load()
         tags = {w["tag"] for w in data["workers"]}
@@ -135,6 +136,10 @@ def add_remote(ip: str, ssh_port: int, api_port: int, tag: str | None = None,
                "tag": tag or gen_tag(tags, is_master=False),
                "is_master": False, "enabled": True, "ip": ip,
                "ssh_port": int(ssh_port or 22), "api_port": int(api_port),
+               # Credentials for the SSH tunnel + the worker API. This file lives
+               # only on the owner's own master server; treat it as a secret.
+               "ssh_user": str(ssh_user or ""), "ssh_pass": str(ssh_pass or ""),
+               "api_token": str(api_token or ""),
                "created": time.time(), "status": "unchecked",
                "ping_ms": -1, "health_ts": 0.0,
                # 0 = unlimited. A worker's real ceiling is its RAM (one Chromium
