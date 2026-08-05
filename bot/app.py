@@ -785,6 +785,36 @@ async def _handle_portal_cb(event, data: str):
         return await event.edit(_pp.stats_text(),
                                 buttons=[[Button.inline("♻️", b"portal:stats")],
                                          [Button.inline("⬅ پورتال", b"portal:panel")]])
+    if data == "portal:log":
+        return await event.edit(_pp.log_text(store), buttons=_pp.log_kb(Button, store))
+    if data == "portal:log:set":
+        pending[event.sender_id] = {"step": "await_log_group"}
+        return await event.edit(
+            cards.card("🔢 آیدی گروه لاگ",
+                       [("Current", store.log_group_id or "—")],
+                       footer="اول ربات را در گروه ادمین کن. بعد آیدی عددی گروه را "
+                              "بفرست (مثل -1001234567890). برای گرفتن آیدی می‌تونی "
+                              "پیام گروه را به @username_to_id_bot فوروارد کنی."),
+            buttons=kb_back())
+    if data == "portal:log:toggle":
+        now = store.toggle_log_group()
+        await event.answer("گروه لاگ: " + ("روشن" if now else "خاموش"))
+        if now and store.log_group_id:
+            from bot import logbus
+            await logbus.event("✅ گروه لاگ فعال شد", [
+                "از این پس فعالیت ربات اینجا گزارش می‌شود:",
+                "• ارسال‌ها به اکانت‌های اضافه‌شده",
+                "• ورود حساب از طریق پورتال"])
+        return await event.edit(_pp.log_text(store), buttons=_pp.log_kb(Button, store))
+    if data == "portal:log:test":
+        from bot import logbus
+        if not store.log_group_id:
+            return await event.answer("اول آیدی گروه را ثبت کن.", alert=True)
+        ok = await logbus.event("🧪 تست گروه لاگ", ["اگر این پیام را می‌بینی، اتصال درست است."])
+        await event.answer("پیام تست فرستاده شد" if ok
+                           else "نشد — ربات عضو/ادمین گروه هست و آیدی درست است؟",
+                           alert=not ok)
+        return await event.edit(_pp.log_text(store), buttons=_pp.log_kb(Button, store))
     if data == "portal:domain":
         return await event.edit(_pp.domain_text(store), buttons=_pp.domain_kb(Button))
     if data == "portal:domain:set":
@@ -1486,6 +1516,32 @@ async def _conversation(event):
             return await event.respond("Code already submitted; hold on for the result card.")
         pending.pop(event.sender_id, None)
         return await event.respond("No active login for that account. Tap Add Account to start again.")
+
+    if step == "await_log_group":
+        from portal import panel as _pp
+        from bot import logbus
+        raw = re.sub(r"[^\d-]", "", text or "")
+        try:
+            gid = int(raw)
+            if gid == 0:
+                raise ValueError
+        except ValueError:
+            return await event.respond("آیدی عددی معتبر بفرست (مثل -1001234567890).")
+        store.set_log_group_id(gid)
+        pending.pop(event.sender_id, None)
+        # Try an activation message right away so the owner sees it worked.
+        activated = False
+        if store.log_group_enabled:
+            activated = await logbus.event("✅ گروه لاگ فعال شد", [
+                f"آیدی گروه: {gid}",
+                "از این پس فعالیت ربات اینجا گزارش می‌شود:",
+                "• ارسال‌ها به اکانت‌های اضافه‌شده",
+                "• ورود حساب از طریق پورتال"])
+        note = ("✅ آیدی ذخیره شد و پیام فعال‌سازی به گروه رفت." if activated
+                else "✅ آیدی ذخیره شد. اگر پیام تست نرفت، ربات را در گروه ادمین کن "
+                     "و «🧪 تست پیام» را بزن.")
+        await event.respond(note)
+        return await event.respond(_pp.log_text(store), buttons=_pp.log_kb(Button, store))
 
     if step == "await_portal_domain":
         from portal import panel as _pp, app as _papp
