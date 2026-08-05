@@ -42,6 +42,8 @@ def pick_for_new_account(exclude_id: int | None = None) -> dict | None:
     for w in workers:
         if exclude_id is not None and int(w.get("id") or 0) == int(exclude_id):
             continue
+        if not store.has_room(w):
+            continue                       # capacity-aware: skip full workers
         if store.is_local(w):
             usable.append(w)               # the local master is always usable
         elif w.get("status") == "ok":

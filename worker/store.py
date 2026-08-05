@@ -126,7 +126,8 @@ def ensure_master() -> dict:
         return row
 
 
-def add_remote(ip: str, ssh_port: int, api_port: int, tag: str | None = None) -> int:
+def add_remote(ip: str, ssh_port: int, api_port: int, tag: str | None = None,
+               max_accounts: int = 0) -> int:
     with _LOCK:
         data = _load()
         tags = {w["tag"] for w in data["workers"]}
@@ -135,10 +136,37 @@ def add_remote(ip: str, ssh_port: int, api_port: int, tag: str | None = None) ->
                "is_master": False, "enabled": True, "ip": ip,
                "ssh_port": int(ssh_port or 22), "api_port": int(api_port),
                "created": time.time(), "status": "unchecked",
-               "ping_ms": -1, "health_ts": 0.0}
+               "ping_ms": -1, "health_ts": 0.0,
+               # 0 = unlimited. A worker's real ceiling is its RAM (one Chromium
+               # per account), so the owner caps each worker to what it can hold.
+               "max_accounts": max(0, int(max_accounts)),
+               # consecutive health failures -> exponential re-check backoff.
+               "fails": 0, "detail": ""}
         data["workers"].append(row)
         _save(data)
         return row["id"]
+
+
+def set_capacity(worker_id: int, max_accounts: int) -> None:
+    with _LOCK:
+        data = _load()
+        for w in data["workers"]:
+            if int(w.get("id") or 0) == int(worker_id):
+                w["max_accounts"] = max(0, int(max_accounts))
+        _save(data)
+
+
+def free_slots(worker: dict) -> int | None:
+    """Remaining account slots on a worker, or None when uncapped."""
+    cap = int(worker.get("max_accounts") or 0)
+    if cap <= 0:
+        return None
+    return max(0, cap - count_accounts_on(int(worker["id"])))
+
+
+def has_room(worker: dict) -> bool:
+    slots = free_slots(worker)
+    return slots is None or slots > 0
 
 
 def set_enabled(worker_id: int, enabled: bool) -> None:
@@ -150,7 +178,10 @@ def set_enabled(worker_id: int, enabled: bool) -> None:
         _save(data)
 
 
-def set_health(worker_id: int, status: str, ping_ms: int = -1) -> None:
+def set_health(worker_id: int, status: str, ping_ms: int = -1,
+               detail: str = "") -> None:
+    """Record a health result. 'ok' clears the failure streak; anything else
+    grows it (drives the exponential re-check backoff in health.py)."""
     with _LOCK:
         data = _load()
         for w in data["workers"]:
@@ -158,7 +189,25 @@ def set_health(worker_id: int, status: str, ping_ms: int = -1) -> None:
                 w["status"] = status
                 w["ping_ms"] = int(ping_ms)
                 w["health_ts"] = time.time()
+                w["detail"] = str(detail or "")[:200]
+                if status == "ok":
+                    w["fails"] = 0
+                else:
+                    w["fails"] = int(w.get("fails") or 0) + 1
         _save(data)
+
+
+def next_check_due(worker: dict, base: float = 30.0, cap: float = 600.0) -> float:
+    """When this worker may be re-checked. Healthy = every `base` seconds; each
+    consecutive failure doubles the wait up to `cap` (don't hammer a dead box)."""
+    fails = int(worker.get("fails") or 0)
+    interval = min(cap, base * (2 ** min(fails, 6))) if fails else base
+    return float(worker.get("health_ts") or 0) + interval
+
+
+def due_for_check(worker: dict, now: float | None = None,
+                  base: float = 30.0, cap: float = 600.0) -> bool:
+    return (now or time.time()) >= next_check_due(worker, base, cap)
 
 
 def remove(worker_id: int) -> bool:
@@ -196,6 +245,25 @@ def unassign(account: str) -> None:
         if str(account) in data["assign"]:
             del data["assign"][str(account)]
             _save(data)
+
+
+def transfer(account: str, to_worker_id: int) -> bool:
+    """Move an account to a different worker. Only the routing changes here; the
+    caller is responsible for actually moving the browser PROFILE (the Eitaa
+    session lives on disk on the owning worker), which is why a transfer is a
+    deliberate owner action, not automatic."""
+    with _LOCK:
+        data = _load()
+        if not any(int(w.get("id") or 0) == int(to_worker_id) for w in data["workers"]):
+            return False
+        data["assign"][str(account)] = int(to_worker_id)
+        _save(data)
+        return True
+
+
+def accounts_on(worker_id: int) -> list:
+    """Which accounts are pinned to a worker."""
+    return [a for a, wid in _load()["assign"].items() if int(wid) == int(worker_id)]
 
 
 def worker_for_account(account: str) -> dict | None:
