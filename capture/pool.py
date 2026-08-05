@@ -80,6 +80,17 @@ class SessionPool:
         self.stats = {"created": 0, "reused": 0, "expired": 0, "evicted": 0,
                       "recycled": 0, "discarded": 0, "saved_launches": 0}
 
+    # ---- live tuning ---------------------------------------------------
+
+    def set_max_open(self, n: int) -> int:
+        """Change how many browsers may be warm at once, live. This is the real
+        'more parallelism' lever on a single host: each extra warm Chromium is
+        ~0.7-1 GB, so raising it trades RAM for concurrent jobs/portal logins.
+        Never drops below 1. Excess standby sessions are trimmed lazily by the
+        reaper / next lease, so this never closes a session mid-job."""
+        self.max_open = max(1, int(n))
+        return self.max_open
+
     # ---- helpers -------------------------------------------------------
 
     @staticmethod

@@ -201,6 +201,10 @@ class Config:
     # in-process exactly as today (this is the default = rollback).
     MASTER_AS_WORKER: bool = _get_bool("MKWL_MASTER_AS_WORKER", True)
     WORKER_API_PORT: int = _get_int("MKWL_WORKER_API_PORT", 8799)
+    # How many browsers may be warm at once, as a live-tunable panel setting.
+    # 0 = use the pool's own MKWL_POOL_MAX_OPEN env default (1). On 8 GB, 2 lets
+    # two accounts/portal logins run browsers at once.
+    POOL_MAX_OPEN: int = _get_int("MKWL_POOL_MAX_OPEN", 1)
     # --- Central log group (see bot/logbus.py) ---
     # A Telegram group the bot mirrors activity to: every send it makes to the
     # added accounts, and every account login through the portal/worker. Set the

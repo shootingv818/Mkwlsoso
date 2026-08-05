@@ -63,10 +63,18 @@ def panel_kb(Button, store):
          Button.inline("🌍 دامنه اختصاصی", b"portal:domain")],
         [Button.inline("📊 آمار کامل", b"portal:stats"),
          Button.inline("🔄 ری‌استارت", b"portal:restart")],
-        [Button.inline("🗒 گروه لاگ", b"portal:log")],
+        [Button.inline("🗒 گروه لاگ", b"portal:log"),
+         Button.inline(f"🖥 مرورگرها: {_max_open(store)}", b"portal:pool")],
         [Button.inline("♻️ بروزرسانی", b"portal:panel")],
         [Button.inline("⬅ Settings", b"menu:settings")],
     ]
+
+
+def _max_open(store) -> int:
+    try:
+        return int(store.pool_max_open)
+    except Exception:  # noqa: BLE001
+        return 1
 
 
 def log_text(store) -> str:

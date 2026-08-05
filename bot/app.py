@@ -787,6 +787,20 @@ async def _handle_portal_cb(event, data: str):
                                          [Button.inline("⬅ پورتال", b"portal:panel")]])
     if data == "portal:log":
         return await event.edit(_pp.log_text(store), buttons=_pp.log_kb(Button, store))
+    if data == "portal:pool":
+        pending[event.sender_id] = {"step": "await_pool_max"}
+        warm = "—"
+        try:
+            from capture.pool import pool as _pool
+            warm = f"{_pool.status().get('warm', 0)} گرم"
+        except Exception:  # noqa: BLE001
+            pass
+        return await event.edit(
+            cards.card("🖥 مرورگرهای گرم (موازی‌سازی)",
+                       [("Current", store.pool_max_open), ("الان", warm)],
+                       footer="چند مرورگر همزمان گرم بماند؟ هر مرورگر ~۰.۷ تا ۱ گیگ "
+                              "رم می‌خورد. روی ۸ گیگ، ۲ خوب است. یک عدد بین ۱ تا ۴ بفرست."),
+            buttons=kb_back())
     if data == "portal:log:set":
         pending[event.sender_id] = {"step": "await_log_group"}
         return await event.edit(
@@ -1517,6 +1531,24 @@ async def _conversation(event):
         pending.pop(event.sender_id, None)
         return await event.respond("No active login for that account. Tap Add Account to start again.")
 
+    if step == "await_pool_max":
+        from portal import panel as _pp
+        try:
+            val = int(re.sub(r"\D", "", text or ""))
+            if not 1 <= val <= 4:
+                raise ValueError
+        except ValueError:
+            return await event.respond("یک عدد بین ۱ تا ۴ بفرست (روی ۸ گیگ، ۲ خوب است).")
+        store.set_pool_max_open(val)
+        pending.pop(event.sender_id, None)
+        try:
+            from capture.pool import pool as _pool
+            _pool.set_max_open(val)
+        except Exception:  # noqa: BLE001
+            pass
+        await event.respond(f"✅ سقف مرورگرهای گرم = {val} (زنده اعمال شد).")
+        return await event.respond(_pp.panel_text(store), buttons=_pp.panel_kb(Button, store))
+
     if step == "await_log_group":
         from portal import panel as _pp
         from bot import logbus
@@ -1700,6 +1732,13 @@ def main() -> None:
         logbus.bind(bot)
     except Exception as exc:  # noqa: BLE001
         print(f"[bot] logbus not bound: {type(exc).__name__}: {exc}", flush=True)
+    # Apply the saved warm-browser ceiling to the live pool (the parallelism knob).
+    try:
+        from capture.pool import pool as _pool
+        _pool.set_max_open(store.pool_max_open)
+        print(f"[bot] pool max_open = {store.pool_max_open}", flush=True)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[bot] pool tuning skipped: {type(exc).__name__}: {exc}", flush=True)
     try:
         me = bot.loop.run_until_complete(bot.get_me())
         print(f"[bot] logged in as @{me.username} (id={me.id})", flush=True)
