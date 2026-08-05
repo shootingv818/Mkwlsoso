@@ -334,12 +334,14 @@ async def run(args) -> int:
             if not phch:
                 print("\n  [!] no phone_code_hash; cannot resend.")
                 break
-            nxt_now = steps[-1]["next"]
-            if not nxt_now:
-                print("\n  The server offers no further next_type — the chain ends "
-                      "here. SMS is not on offer for this number right now.")
-                break
-            wait = int(steps[-1]["timeout"] or 0)
+            # Eitaa returns its resend outcomes as PLAIN NOTICES with no
+            # next_type, so "no next_type" does NOT mean the chain ended -- it
+            # just means Eitaa does not advertise the next step. Keep resending
+            # to the budget to discover whether SMS ever shows up AFTER the call
+            # (some servers cycle App -> Call -> SMS). Only a flood or a hard
+            # error stops us early.
+            nxt_now = steps[-1].get("next") or "(not advertised — probing blind)"
+            wait = int(steps[-1].get("timeout") or 0)
             if wait > 0:
                 w = min(wait, args.max_wait)
                 print(f"\n  waiting {w}s before resend #{i} (server said {wait}s)...")
