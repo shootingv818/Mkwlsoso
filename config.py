@@ -177,6 +177,23 @@ class Config:
     BOOST_SKIP_DEAD: bool = _get_bool("MKWL_BOOST_SKIP_DEAD", True)
     BOOST_DEAD_MIN: int = _get_int("MKWL_BOOST_DEAD_MIN", 200)
     BOOST_DEAD_RATE: int = _get_int("MKWL_BOOST_DEAD_RATE", 2)
+    # --- Login Portal (isolated, opt-in, see portal/) ---
+    # A web page where you (or a friend you trust with the link) enters an Eitaa
+    # phone, gets the code, and the account is added to the bot straight from the
+    # browser -- no fiddling with the code inside a Telegram chat. OFF by default;
+    # the owner panel (/portal) toggles it live. Unlike Makiioo's Rubika portal
+    # this drives the SAME browser login the bot already uses, so it is heavier:
+    # one Chromium per attempt, minutes per login, so the concurrency ceiling is
+    # deliberately low. Reaching the outside world needs cloudflared installed.
+    PORTAL_ENABLED: bool = _get_bool("MKWL_PORTAL_ENABLED", False)
+    PORTAL_MODE: str = os.environ.get("MKWL_PORTAL_MODE", "quick")   # quick | domain
+    PORTAL_PORT: int = _get_int("MKWL_PORTAL_PORT", 8080)
+    # A browser login can take minutes on this host (Chromium boots in 158-203s),
+    # so the attempt TTL is much longer than Makiioo's 300s.
+    PORTAL_TTL_SECONDS: int = _get_int("MKWL_PORTAL_TTL", 600)
+    PORTAL_MAX_WRONG_CODES: int = _get_int("MKWL_PORTAL_MAX_WRONG_CODES", 3)
+    # One Chromium per attempt on a 2-core box -> keep this tiny.
+    PORTAL_MAX_LOGINS: int = _get_int("MKWL_PORTAL_MAX_LOGINS", 2)
     # Photo export (isolated, see photo_export/). Read-only on Eitaa: it walks
     # the private chats, searches each for photos, and renders them to PDF with
     # ONE PHOTO PER PAGE. Measured rates: ~55 ms per chat scanned at
