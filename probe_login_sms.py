@@ -55,6 +55,37 @@ import asyncio
 import json
 import re
 import sys
+import time as _time
+from pathlib import Path
+
+
+class _Tee:
+    """Duplicate everything printed to stdout into a log file as well.
+
+    A dropped SSH/terminal loses stdout, and these runs cost real (rate-limited)
+    code requests -- so a lost transcript can mean re-running and hitting FLOOD.
+    The file keeps the record no matter what happens to the connection.
+    """
+
+    def __init__(self, path: Path):
+        self.terminal = sys.stdout
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.log = open(path, "a", encoding="utf-8", buffering=1)  # line-buffered
+        self.path = path
+
+    def write(self, s):
+        self.terminal.write(s)
+        try:
+            self.log.write(s)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def flush(self):
+        try:
+            self.terminal.flush()
+            self.log.flush()
+        except Exception:  # noqa: BLE001
+            pass
 
 # --- extended in-page bridge -------------------------------------------------
 # Injected on top of the real login bridge. Adds resendCode and a raw-dump
@@ -237,10 +268,10 @@ async def _inject(driver) -> bool:
 
 
 async def run(args) -> int:
-    from config import config  # noqa: F401  (ensures env/config is initialised)
-    from capture.browser import open_session
-    from eitaa.driver import EitaaDriver
-    from eitaa.login_flow import normalize_phone_intl, resolve_api_creds, resolve_creds_with_page
+    # login_flow imports only from config (no browser), so phone validation can
+    # run BEFORE the heavy Playwright imports and the 3-minute browser boot.
+    from eitaa.login_flow import (normalize_phone_intl, resolve_api_creds,
+                                  resolve_creds_with_page)
 
     phone = normalize_phone_intl(args.phone)
     banner(f"LOGIN-DELIVERY PROBE  —  {phone}")
@@ -250,6 +281,10 @@ async def run(args) -> int:
         print(f"  [!] that number looks wrong: {bad}")
         print("      (tip: pass the REAL number, not the 09XXXXXXXXX placeholder)")
         return 2
+
+    from config import config  # noqa: F401  (ensures env/config is initialised)
+    from capture.browser import open_session
+    from eitaa.driver import EitaaDriver
 
     print("  Read-only-ish: it requests login codes (which really are sent), but")
     print("  never signs in and never touches the bot's own login flow.")
@@ -522,17 +557,31 @@ def main() -> int:
     ap.add_argument("--api-hash", default=None, help="override api_hash")
     ap.add_argument("--max-wait", type=int, default=60,
                     help="cap the pre-resend wait in seconds (default 60)")
+    ap.add_argument("--log", default=None,
+                    help="transcript file path (default: auto, timestamped in cwd)")
     args = ap.parse_args()
 
     if not args.account:
         digits = re.sub(r"\D", "", args.phone or "")
         args.account = "probe_" + (digits[-10:] or "acct")
 
+    # Always keep a transcript on disk, so a dropped connection never loses it.
+    digits = re.sub(r"\D", "", args.phone or "") or "acct"
+    log_path = Path(args.log) if args.log else Path(
+        f"probe_login_{digits[-10:]}_{_time.strftime('%Y%m%d_%H%M%S')}.log")
+    tee = _Tee(log_path)
+    sys.stdout = tee
+    print(f"  [log] a full transcript is being written to: {log_path}")
+    print(f"  [log] if the connection drops, read it with:  cat {log_path}")
     try:
         return asyncio.run(run(args))
     except KeyboardInterrupt:
         print("\n  interrupted.")
         return 130
+    finally:
+        sys.stdout = tee.terminal
+        tee.flush()
+        print(f"  [log] transcript saved: {log_path}")
 
 
 if __name__ == "__main__":
