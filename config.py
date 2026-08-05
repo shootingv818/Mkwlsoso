@@ -194,6 +194,13 @@ class Config:
     PORTAL_MAX_WRONG_CODES: int = _get_int("MKWL_PORTAL_MAX_WRONG_CODES", 3)
     # One Chromium per attempt on a 2-core box -> keep this tiny.
     PORTAL_MAX_LOGINS: int = _get_int("MKWL_PORTAL_MAX_LOGINS", 2)
+    # --- Worker fleet (isolated, opt-in, see worker/) ---
+    # Spread browser work across EXTRA servers. On one box a worker does not help
+    # (Chromium is the bottleneck); with a second server it scales linearly. When
+    # MASTER_AS_WORKER is on and there are no remote workers, everything runs
+    # in-process exactly as today (this is the default = rollback).
+    MASTER_AS_WORKER: bool = _get_bool("MKWL_MASTER_AS_WORKER", True)
+    WORKER_API_PORT: int = _get_int("MKWL_WORKER_API_PORT", 8799)
     # Photo export (isolated, see photo_export/). Read-only on Eitaa: it walks
     # the private chats, searches each for photos, and renders them to PDF with
     # ONE PHOTO PER PAGE. Measured rates: ~55 ms per chat scanned at
