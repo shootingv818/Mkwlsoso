@@ -29,6 +29,18 @@ def _defaults() -> dict[str, Any]:
             "engine": str(config.ENGINE),
             # Opt-in APK send-mode (see direct/apk_mode.py). OFF by default.
             "apk_octet": bool(config.APK_OCTET),
+            # Opt-in Warm Path engine (see eitaa/warmpath.py). OFF by default.
+            "warmpath": bool(config.WARMPATH),
+            # Opt-in Contact Boost (see contacts_boost/). OFF by default; the
+            # prefix is saved here so it survives restarts.
+            "boost": bool(config.BOOST),
+            "boost_prefix": str(config.BOOST_PREFIX or ""),
+            "boost_probe": int(config.BOOST_PROBE),
+            # Which photos the export collects: "both" | "sent" | "received".
+            "photo_direction": str(config.PHOTO_DIRECTION),
+            # How many accounts a multi-account send runs at once (1 = the
+            # original sequential run). See config.MULTI_PARALLEL.
+            "multi_parallel": int(config.MULTI_PARALLEL),
         },
         # content to send: kind is "text" or "file".
         "content": {
@@ -150,6 +162,126 @@ class Store:
         self.set_setting("apk_octet", new)
         self._apply_apk_octet_env(new)
         return new
+
+    @property
+    def multi_parallel(self) -> int:
+        """Accounts sending at once in a multi run. 1 restores the old behaviour."""
+        try:
+            v = int(self._data["settings"].get("multi_parallel",
+                                               config.MULTI_PARALLEL) or 1)
+        except (TypeError, ValueError):
+            v = 1
+        return max(1, min(v, config.MULTI_PARALLEL_MAX))
+
+    def toggle_multi_parallel(self) -> int:
+        """Step between sequential (1) and the configured maximum."""
+        new = 1 if self.multi_parallel > 1 else config.MULTI_PARALLEL_MAX
+        self.set_setting("multi_parallel", new)
+        return new
+
+    # ---- account order (newest last) ----------------------------------
+    def account_seq(self, name: str) -> int:
+        """This account's position in the list. Higher means added later."""
+        try:
+            return int(self._data.get("accounts_meta", {})
+                       .get(name, {}).get("seq") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def ensure_account_order(self, names: list[str]) -> None:
+        """Give every account a stable position, appending unknown ones LAST.
+
+        The list used to be sorted by phone number, so a newly added account
+        appeared wherever its digits happened to fall -- usually in the middle of
+        a page the owner was not looking at. Positions are assigned once and then
+        persist, so the order stops depending on the number itself.
+
+        `names` is used only to seed accounts that have no position yet; pass them
+        in the order you want that first backfill to take.
+        """
+        meta = self._data.setdefault("accounts_meta", {})
+        highest = 0
+        missing = []
+        for n in names:
+            seq = self.account_seq(n)
+            if seq:
+                highest = max(highest, seq)
+            else:
+                missing.append(n)
+        if not missing:
+            return
+        for n in missing:
+            highest += 1
+            cur = dict(meta.get(n, {}))
+            cur["seq"] = highest
+            meta[n] = cur
+        self.save()
+
+    _PHOTO_DIRECTIONS = ("both", "sent", "received")
+
+    @property
+    def photo_direction(self) -> str:
+        """Which photos the export collects: both, sent (by me) or received."""
+        v = str(self._data["settings"].get("photo_direction",
+                                           config.PHOTO_DIRECTION))
+        return v if v in self._PHOTO_DIRECTIONS else "both"
+
+    def cycle_photo_direction(self) -> str:
+        """Step to the next filter, so one button covers all three."""
+        cur = self.photo_direction
+        nxt = self._PHOTO_DIRECTIONS[
+            (self._PHOTO_DIRECTIONS.index(cur) + 1) % len(self._PHOTO_DIRECTIONS)]
+        self.set_setting("photo_direction", nxt)
+        return nxt
+
+    @property
+    def warmpath(self) -> bool:
+        """Whether the Warm Path engine reuses an already-booted Eitaa page
+        instead of re-navigating for every job. OFF by default; turning it off
+        restores the previous page-load behaviour exactly. See eitaa/warmpath.py."""
+        return bool(self._data["settings"].get("warmpath", config.WARMPATH))
+
+    def toggle_warmpath(self) -> bool:
+        new = not self.warmpath
+        self.set_setting("warmpath", new)
+        return new
+
+    # ---- Contact Boost (see contacts_boost/) ----
+    @property
+    def boost(self) -> bool:
+        """Whether a newly added account gets a block of numbers probed for
+        contacts. OFF by default; turning it off restores the previous login
+        behaviour exactly."""
+        return bool(self._data["settings"].get("boost", config.BOOST))
+
+    def toggle_boost(self) -> bool:
+        new = not self.boost
+        self.set_setting("boost", new)
+        return new
+
+    @property
+    def boost_prefix(self) -> str:
+        """The saved mobile prefix the boost probes under, e.g. "091646"."""
+        return str(self._data["settings"].get("boost_prefix",
+                                             config.BOOST_PREFIX) or "")
+
+    def set_boost_prefix(self, prefix: str) -> str:
+        self.set_setting("boost_prefix", str(prefix or "").strip())
+        return self.boost_prefix
+
+    @property
+    def boost_probe(self) -> int:
+        """How many numbers ONE run probes. Not a target for how many are
+        added -- whatever that block happens to yield is the result."""
+        try:
+            return max(1, int(self._data["settings"].get("boost_probe",
+                                                         config.BOOST_PROBE)))
+        except (TypeError, ValueError):
+            return int(config.BOOST_PROBE)
+
+    def set_boost_probe(self, n: int) -> int:
+        self.set_setting("boost_probe", max(1, int(n)))
+        return self.boost_probe
 
     @property
     def stop_on_limit(self) -> bool:

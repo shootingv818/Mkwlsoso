@@ -355,10 +355,16 @@ def _account_tally(accounts: list[dict]) -> str:
     return out
 
 
+#: How many finished accounts keep a detailed two-line block on the live card.
+#: Telegram caps a message near 4096 characters, and a 50-account run would blow
+#: through that; the rest are summarised in one tally row.
+_MULTI_DETAIL_ROWS = 6
+
+
 def live_send_multi(accounts: list[dict], current: str | None, sent: int,
                     failed: int, total: int, elapsed: float,
                     status: str = "🟢 Sending", engine: str | None = None,
-                    kind: str | None = None) -> str:
+                    kind: str | None = None, parallel: int = 1) -> str:
     """ONE live card for a simultaneous multi-account send.
 
     `sent`/`failed`/`total` are the COMBINED numbers across every selected
@@ -369,6 +375,9 @@ def live_send_multi(accounts: list[dict], current: str | None, sent: int,
     accounts: [{"phone": str, "sent": int, "failed": int, "total": int,
                 "state": "pending|running|done|stopped|failed|limited"}]
     """
+    running = [a for a in accounts
+               if str(a.get("state")) in ("running", "preparing")]
+    now_label = ", ".join(str(a.get("phone")) for a in running) or (current or "—")
     lines = [
         "🚀 MULTI SEND — Live",
         DIVIDER,
@@ -376,8 +385,12 @@ def live_send_multi(accounts: list[dict], current: str | None, sent: int,
         *_rows([
             ("Status  ", status),
             ("Type    ", kind),
+            ("Mode    ", (f"parallel · {parallel} at a time" if parallel > 1
+                          else "one account at a time")),
             ("Accounts", _account_tally(accounts)),
-            ("Now     ", current or "—"),
+            # With more than one account in flight this has to name them all;
+            # a single "Now" field was only ever true for a sequential run.
+            ("Now     ", now_label),
             ("Sent    ", f"{sent} of {total}"),
             ("Failed  ", failed or None),
             ("Elapsed ", fmt_duration(elapsed)),
@@ -386,16 +399,39 @@ def live_send_multi(accounts: list[dict], current: str | None, sent: int,
     ]
     if accounts:
         lines.append(DIVIDER)
-        # Numbered, because the run is sequential: 1 finishes, then 2, then 3.
-        width = max(len(str(a.get("phone", ""))) for a in accounts)
-        for i, a in enumerate(accounts, start=1):
+        # A bar per account: the eye reads a bar far faster than "120/500", and
+        # with several running at once the numbers alone were unreadable.
+        # Positions are NOT printed any more -- in a parallel run they would
+        # imply an execution order that does not exist.
+        active = [a for a in accounts
+                  if str(a.get("state")) in ("running", "preparing")]
+        finished = [a for a in accounts
+                    if str(a.get("state")) in ("done", "failed", "stopped",
+                                               "limited", "no_targets")]
+        waiting = [a for a in accounts if a not in active and a not in finished]
+        # Telegram caps a message at ~4096 chars, so only a window is detailed:
+        # everything in flight, then the most recent finishers, then a tally.
+        shown = active + finished[-_MULTI_DETAIL_ROWS:]
+        for a in shown:
             state = str(a.get("state", "pending"))
             mark = _STATE_MARK.get(state, "•")
-            phone = str(a.get("phone", "")).ljust(width)
-            row = f"{i}. {mark} {phone} · {a.get('sent', 0)}/{a.get('total', 0)}"
+            done = int(a.get("sent", 0) or 0)
+            tot = int(a.get("total", 0) or 0)
+            head = f"{mark} {a.get('phone', '')}"
             if a.get("failed"):
-                row += f" · ✗{a['failed']}"
-            lines.append(row)
+                head += f" · ✗{a['failed']}"
+            if state == "limited":
+                head += " · limited"
+            lines.append(head)
+            lines.append(f"   {bar(done, tot, width=10)}  {done:,}/{tot:,}")
+        hidden = len(finished) - len(finished[-_MULTI_DETAIL_ROWS:])
+        tail = []
+        if hidden > 0:
+            tail.append(f"{hidden} more finished")
+        if waiting:
+            tail.append(f"{len(waiting)} waiting")
+        if tail:
+            lines.append("• " + " · ".join(tail))
     lines.append(f"🕒 {now_hms()}")
     return "\n".join(lines)
 

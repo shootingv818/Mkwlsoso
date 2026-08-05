@@ -37,10 +37,23 @@ PAGE_SIZE = 10
 
 
 def list_accounts() -> list[str]:
+    """Accounts in the order they were ADDED, newest last.
+
+    Sorting by profile-directory name meant sorting by phone number, so a new
+    account landed wherever its digits fell -- typically mid-list, on a page the
+    owner was not on. Positions are assigned once (existing accounts keep their
+    current alphabetical order) and persist, so anything added later goes to the
+    end and shows up on the last page.
+    """
     d = config.PROFILES_DIR
     if not d.is_dir():
         return []
-    return sorted(p.name for p in d.iterdir() if p.is_dir())
+    names = sorted(p.name for p in d.iterdir() if p.is_dir())
+    try:
+        store.ensure_account_order(names)
+        return sorted(names, key=lambda n: (store.account_seq(n), n))
+    except Exception:  # noqa: BLE001 - never lose the list over an ordering issue
+        return names
 
 
 def account_name_for_phone(phone: str) -> str:
@@ -70,6 +83,21 @@ def _page_slice(items: list, page: int) -> tuple[list, int, int]:
     page = max(0, min(page, pages - 1))
     start = page * PAGE_SIZE
     return items[start:start + PAGE_SIZE], page, pages
+
+
+def page_of(account: str | None, items: list[str] | None = None) -> int:
+    """Which page `account` sits on, 0 when it is not in the list."""
+    if not account:
+        return 0
+    seq = items if items is not None else list_accounts()
+    try:
+        return seq.index(account) // PAGE_SIZE
+    except ValueError:
+        return 0
+
+
+def page_of_active() -> int:
+    return page_of(store.active_account)
 
 
 def _pager_row(prefix: str, page: int, pages: int) -> list:
@@ -106,6 +134,14 @@ def delete_account_files(account: str) -> list[str]:
 
     if progress_store.clear(account):
         removed.append("sent log")
+
+    # Which numbers the contact boost already probed for this account.
+    try:
+        from contacts_boost import numbers as boost_numbers
+        if boost_numbers.forget(account):
+            removed.append("boost history")
+    except Exception:  # noqa: BLE001 - contacts_boost/ is optional
+        pass
 
     # Saved peers live in the isolated direct/ store; ask it to clean up.
     try:
@@ -165,6 +201,17 @@ config.DATA_DIR.mkdir(parents=True, exist_ok=True)
 bot = TelegramClient(
     str(config.DATA_DIR / "panel_bot"), config.API_ID, config.API_HASH
 )
+
+
+async def send_document(path: str, caption: str = "") -> object:
+    """Deliver a file to the owner's chat.
+
+    The panel only ever sent text before this; the photo export needs to hand
+    over the PDFs it builds. Errors propagate so the job can report them on its
+    own card instead of failing silently.
+    """
+    return await bot.send_file(config.report_to(), path, caption=caption,
+                              force_document=True)
 
 
 async def report(text: str) -> None:
@@ -324,10 +371,21 @@ def kb_account_panel(acc: str):
         [Button.inline("📤 Send", b"pnl:send"),
          Button.inline("🧪 Test to Me", b"pnl:dryrun")],
         [Button.inline("➕ Build Contacts", b"pnl:contacts")],
+        # Probes a block of UNUSED numbers under the saved prefix and keeps
+        # whoever is on Eitaa. Never repeats a number for this account.
+        [Button.inline(f"👥 Boost Contacts: +{store.boost_probe} probes",
+                       b"pnl:boost")],
         # Contacts are saved automatically at login; this only re-reads them
         # when the account has gained new contacts since.
         [Button.inline("🔄 Update Contacts", b"pnl:save"),
          Button.inline("♻️ Refresh Panel", b"pnl:refresh")],
+        # Read-only: runs the same login gate every job starts with, so a dead
+        # session is found here instead of halfway through a campaign.
+        [Button.inline("🔎 Check Session", b"pnl:check")],
+        # Read-only: exports this account's photos to PDF, one photo per page.
+        [Button.inline(f"🖼 Export Photos: {store.photo_direction}",
+                       b"pnl:photos")],
+        [Button.inline("🔁 Photo Filter", b"pnl:photodir")],
     ]
     if busy:
         # The label escalates: a second press force-stops.
@@ -361,7 +419,8 @@ def kb_multi(page: int = 0):
     shown, page, pages = _page_slice(accounts, page)
     rows = []
     for acc in shown:
-        # Ticked accounts show their position, because the order is the send order.
+        # A ticked account shows its queue position. In a parallel run the
+        # position is only the order slots are HANDED OUT, not a strict sequence.
         if acc in selected:
             mark = f"{selected.index(acc) + 1}️⃣"
         else:
@@ -382,6 +441,10 @@ def kb_multi(page: int = 0):
                 f"🚀 Send · {len(selected)} acct · {reach:,} contacts", b"multi:go")])
         rows.append([Button.inline("☑ All", f"multi:all:{page}".encode()),
                      Button.inline("🧹 Clear", f"multi:clear:{page}".encode())])
+        width = store.multi_parallel
+        rows.append([Button.inline(
+            f"⚡ Mode: {'parallel ' + str(width) if width > 1 else 'one at a time'}",
+            f"multi:width:{page}".encode())])
     rows.append([Button.inline("⬅ Home", b"menu:home")])
     return rows
 
@@ -395,33 +458,92 @@ def kb_content():
     ]
 
 
+def _boost_prefix_label() -> str:
+    """A button label that fits: the prefix itself, or how many there are."""
+    raw = store.boost_prefix
+    if not raw:
+        return "— not set —"
+    try:
+        from contacts_boost import numbers as boost_numbers
+        good, _ = boost_numbers.parse_prefixes(raw)
+    except Exception:  # noqa: BLE001
+        return raw[:24]
+    if not good:
+        return "— invalid —"
+    if len(good) == 1:
+        return good[0]
+    return f"{len(good)} prefixes"
+
+
+_ENGINE_MARK = {"bridge": "🌉 bridge", "hybrid": "⚡ hybrid", "direct": "🚀 direct"}
+
+
 def kb_settings():
-    rows = []
-    # The engine switch is back, now with three choices: bridge (proven page),
-    # hybrid (browser-free sends with the page as a per-recipient safety net) and
-    # direct (browser-free only, MKWL_ENABLE_DIRECT=1, no safety net).
-    _ENGINE_MARK = {"bridge": "🌉 bridge", "hybrid": "⚡ hybrid", "direct": "🚀 direct"}
-    rows.append([Button.inline(
-        f"🔧 Engine: {_ENGINE_MARK.get(store.engine, store.engine)} — tap to change",
-        b"set:engine")])
-    rows += [
+    """Root settings: categories, not a wall of buttons.
+
+    The flat menu had grown to eleven rows; it is now split into Sending,
+    Engine and Contacts sub-menus so each screen stays short. Every individual
+    `set:*` action is unchanged -- only where they LIVE moved."""
+    return [
+        [Button.inline("🚀 Sending", b"set:cat:sending"),
+         Button.inline(f"🔧 Engine: {_ENGINE_MARK.get(store.engine, store.engine)}",
+                       b"set:cat:engine")],
+        [Button.inline("👥 Contacts & Boost", b"set:cat:contacts")],
+        [Button.inline("🏠 Browser Standby", b"set:pool")],
+        [Button.inline("⬅ Back", b"menu:home")],
+    ]
+
+
+def kb_set_sending():
+    return [
         [Button.inline("⏱ Send Delay", b"set:textdelay"),
          Button.inline("⚡ Concurrency", b"set:concurrency")],
         [Button.inline(
             f"🚫 Pause on limit: {'ON' if store.stop_on_limit else 'OFF'}",
             b"set:stoponlimit")],
-        [Button.inline("⏱ Contact Delay", b"set:contactdelay"),
-         Button.inline("🔢 Log Every N", b"set:logevery")],
-        [Button.inline("🏠 Browser Standby", b"set:pool"),
-         Button.inline(
-             f"🚀 No-browser sends: {'ON' if store.browserless else 'OFF'}",
-             b"set:browserless")],
+        [Button.inline("🔢 Log Every N", b"set:logevery")],
+        [Button.inline("⬅ Settings", b"menu:settings")],
+    ]
+
+
+def kb_set_engine():
+    return [
+        [Button.inline(
+            f"🔧 Engine: {_ENGINE_MARK.get(store.engine, store.engine)} — tap to change",
+            b"set:engine")],
+        [Button.inline(
+            f"🚀 No-browser sends: {'ON' if store.browserless else 'OFF'}",
+            b"set:browserless")],
         [Button.inline(
             f"📦 APK send mode: {'ON' if store.apk_octet else 'OFF'}",
             b"set:apkoctet")],
-        [Button.inline("⬅ Back", b"menu:home")],
+        [Button.inline(
+            f"🔥 Warm Path: {'ON' if store.warmpath else 'OFF'}",
+            b"set:warmpath")],
+        [Button.inline("⬅ Settings", b"menu:settings")],
     ]
-    return rows
+
+
+def kb_set_contacts():
+    return [
+        [Button.inline("⏱ Contact Delay", b"set:contactdelay")],
+        [Button.inline(
+            f"👥 Contact Boost: {'ON' if store.boost else 'OFF'}",
+            b"set:boost")],
+        [Button.inline(f"🔢 Prefixes: {_boost_prefix_label()}",
+                       b"set:boostprefix"),
+         Button.inline(f"🎯 Probe: {store.boost_probe}", b"set:boostprobe")],
+        [Button.inline("⬅ Settings", b"menu:settings")],
+    ]
+
+
+# Which sub-menu keyboard each category key opens. One place so the nav handler
+# and the toggle handlers agree on where a setting lives.
+_SETTINGS_CATS = {
+    "sending": kb_set_sending,
+    "engine": kb_set_engine,
+    "contacts": kb_set_contacts,
+}
 
 
 # ---- panel renderers ---------------------------------------------------
@@ -468,16 +590,28 @@ def multi_text() -> str:
     unsaved = [a for a in selected if not contacts_store.count(a)]
     running = manager.multi_jobs()
 
+    width = store.multi_parallel
+    # With the budget shared, each account waits width x the configured delay so
+    # the combined rate is unchanged; show the number the accounts will really use.
+    per_delay = (store.text_send_delay * width
+                 if width > 1 and config.MULTI_SHARE_BUDGET
+                 else store.text_send_delay)
     pairs = [
         ("Accounts", f"{len(selected)} of {len(accounts)} ticked"),
         ("Reach   ", f"{reach:,} contacts" if reach else "—"),
         ("Content ", store.content_summary()),
-        ("Delay   ", f"{store.text_send_delay:g}s between messages"),
+        ("Mode    ", (f"parallel · {width} at a time" if width > 1
+                      else "one account at a time")),
+        ("Delay   ", (f"{per_delay:g}s per account"
+                      + (f" (shared budget from {store.text_send_delay:g}s)"
+                         if per_delay != store.text_send_delay else "")
+                      + " between messages")),
     ]
-    # The tick order IS the send order, so show it.
     body = None
     if selected:
-        body = "Order:\n" + "\n".join(
+        label = ("Queue (slots are handed out in this order):" if width > 1
+                 else "Order:")
+        body = label + "\n" + "\n".join(
             f"{i}. {store.account_phone(a)} · "
             + (f"{contacts_store.count(a):,}" if contacts_store.count(a) else "reads first")
             for i, a in enumerate(selected, start=1))
@@ -544,7 +678,42 @@ def settings_text() -> str:
         ("Log every    ", f"{store.send_log_every} sends"),
         ("APK mode     ", "on — .apk sent as generic binary"
                           if store.apk_octet else "off — normal apk MIME"),
+        ("Warm Path    ", "on — reuse the booted page, skip redundant loads"
+                          if store.warmpath else "off — reload the web app per job"),
+        ("Contact Boost", (f"on — about {store.boost_probe} numbers per run"
+                           if store.boost_prefix
+                           else "on — but NO PREFIX IS SET, so it cannot run")
+                          if store.boost else "off — a new account gets no contacts"),
     ]
+    if store.boost and store.boost_prefix:
+        # Every number is remembered, so the useful figures are how productive
+        # each prefix has been and how much of it is still unused.
+        try:
+            from contacts_boost import numbers as boost_numbers
+            rows = boost_numbers.pool(store.active_account or "",
+                                      store.boost_prefix)
+            pairs.append(("Boost pool   ",
+                          f"{len(rows)} prefix(es), one picked at random per run"))
+            for st in rows:
+                if st["used"]:
+                    rate = (f"{st['hits_all'] * 100 / st['used']:.0f}%"
+                            if st["used"] else "--")
+                    txt = (f"{st['hits_all']:,} found in {st['used']:,} "
+                           f"({rate}) — {st['left']:,} left")
+                else:
+                    txt = f"{st['capacity']:,} numbers, not sampled yet"
+                if st["dead"]:
+                    txt += "  ⚠ skipped"
+                pairs.append((f"  {st['prefix']}", txt))
+            if rows:
+                pairs.append(("Boost picks  ",
+                              ("numbers at random across the prefix"
+                               if rows[0].get("random")
+                               else "numbers in order (sequential)")
+                              + (", shared memory" if rows[0].get("shared")
+                                 else ", per-account memory")))
+        except Exception:  # noqa: BLE001 - a settings screen must always render
+            pass
     eng = store.engine
     eng_txt = {
         "bridge": "🌉 bridge — every send goes through the browser page",
@@ -643,7 +812,11 @@ async def _handle_callback(event):
     if data == "noop":
         return await event.answer()
     if data == "menu:accounts":
-        return await event.edit(accounts_text(), buttons=kb_accounts(0))
+        # Land on the page holding the ACTIVE account. A freshly added account
+        # becomes active and now sorts last, so the owner opens the list already
+        # looking at it instead of hunting through pages.
+        return await event.edit(accounts_text(),
+                               buttons=kb_accounts(page_of_active()))
     if data.startswith("acc:page:"):
         page = int(data.rsplit(":", 1)[1] or 0)
         return await event.edit(accounts_text(), buttons=kb_accounts(page))
@@ -651,6 +824,12 @@ async def _handle_callback(event):
         return await event.edit(content_text(), buttons=kb_content())
     if data == "menu:settings":
         return await event.edit(settings_text(), buttons=kb_settings())
+    if data.startswith("set:cat:"):
+        cat = data.split(":", 2)[2]
+        kb = _SETTINGS_CATS.get(cat)
+        if kb is None:
+            return await event.edit(settings_text(), buttons=kb_settings())
+        return await event.edit(settings_text(), buttons=kb())
 
     # ---- accounts ----
     if data.startswith("acc:open:"):
@@ -705,6 +884,15 @@ async def _handle_callback(event):
         page = int(data.rsplit(":", 1)[1] or 0)
         store.set_selected(list_accounts())
         return await event.edit(multi_text(), buttons=kb_multi(page))
+    if data.startswith("multi:width:"):
+        page = int(data.rsplit(":", 1)[1] or 0)
+        if manager.multi_jobs():
+            return await event.answer("A multi run is going; stop it first.",
+                                      alert=True)
+        now = store.toggle_multi_parallel()
+        await event.answer("Mode: " + ("parallel " + str(now) if now > 1
+                                       else "one at a time"))
+        return await event.edit(multi_text(), buttons=kb_multi(page))
     if data == "multi:go":
         return await _start_multi_send(event)
     if data == "multi:stop":
@@ -723,6 +911,80 @@ async def _handle_callback(event):
         if not active:
             return await event.answer("No active account.", alert=True)
         return await _refresh_account(event, active)
+    if data == "pnl:check":
+        if not active:
+            return await event.answer("Select an account first.", alert=True)
+        if manager.is_busy(active):
+            return await event.answer("Account already has a running job.", alert=True)
+        await manager.run_session_check(active, report, store.account_phone(active),
+                                        live=LiveCard(config.report_to()))
+        await event.answer("Checking session…")
+        return await event.edit(
+            cards.card("🔎 SESSION CHECK",
+                       [("Phone ", store.account_phone(active)),
+                        ("Engine", store.engine)],
+                       footer="Opening this account's session and asking Eitaa whether "
+                              "it is still logged in. Nothing is sent to anybody and no "
+                              "contacts are collected. A live card follows with the "
+                              "result."),
+            buttons=kb_back())
+    if data == "pnl:boost":
+        if not active:
+            return await event.answer("Select an account first.", alert=True)
+        if manager.is_busy(active):
+            return await event.answer("Account already has a running job.", alert=True)
+        if not store.boost_prefix:
+            return await event.answer(
+                "No prefix set. Settings → 'Boost Prefix' first.", alert=True)
+        from contacts_boost import numbers as boost_numbers
+        rows = boost_numbers.pool(active, store.boost_prefix)
+        left = sum(st["left"] for st in rows)
+        if not left:
+            return await event.answer(
+                "Every number under these prefixes has already been used. "
+                "Add another prefix in Settings.", alert=True)
+        await manager.run_boost(active, report, store.account_phone(active),
+                                live=LiveCard(config.report_to()))
+        await event.answer("Boosting contacts…")
+        pairs = [("Phone  ", store.account_phone(active)),
+                 ("Pool   ", f"{len(rows)} prefix(es) — one picked at random"),
+                 ("Probing", f"about {store.boost_probe:,} numbers"),
+                 ("Picking", "at random from across the prefix"
+                             if rows and rows[0].get("random") else "in order"),
+                 ("Memory ", "shared — no two accounts get the same number"
+                             if rows and rows[0].get("shared") else
+                             "per account — accounts may overlap"),
+                 ("Left in pool", f"{left:,} numbers")]
+        return await event.edit(
+            cards.card("👥 CONTACT BOOST QUEUED", pairs,
+                       footer="These numbers have never been handed to ANY account, so "
+                              "these contacts are this account's alone. Most random "
+                              "numbers are not on Eitaa, so what gets added is whatever "
+                              "the draw yields — a live card follows with the real count."),
+            buttons=kb_back())
+    if data == "pnl:photodir":
+        if not active:
+            return await event.answer("Select an account first.", alert=True)
+        now = store.cycle_photo_direction()
+        await event.answer("Photo filter: " + now)
+        return await event.edit(account_panel_text(active),
+                               buttons=kb_account_panel(active))
+    if data == "pnl:photos":
+        if not active:
+            return await event.answer("Select an account first.", alert=True)
+        if manager.is_busy(active):
+            return await event.answer("Account already has a running job.", alert=True)
+        from photo_export import cards as px_cards
+        direction = store.photo_direction
+        await manager.run_photo_export(
+            active, report, store.account_phone(active),
+            live=LiveCard(config.report_to()), direction=direction,
+            send_document=send_document)
+        await event.answer("Exporting photos…")
+        return await event.edit(
+            px_cards.started(account=active, phone=store.account_phone(active),
+                             direction=direction),
+            buttons=kb_back())
     if data == "pnl:save":
         if not active:
             return await event.answer("Select an account first.", alert=True)
@@ -834,7 +1096,7 @@ async def _handle_callback(event):
     if data == "set:engine":
         new = store.cycle_engine()
         await event.answer(f"Engine: {new}")
-        return await event.edit(settings_text(), buttons=kb_settings())
+        return await event.edit(settings_text(), buttons=kb_set_engine())
     if data == "set:textdelay":
         pending[event.sender_id] = {"step": "await_textdelay"}
         return await event.edit(
@@ -848,15 +1110,64 @@ async def _handle_callback(event):
     if data == "set:stoponlimit":
         now = store.toggle_stop_on_limit()
         await event.answer("Pause on limit: " + ("ON" if now else "OFF"))
-        return await event.edit(settings_text(), buttons=kb_settings())
+        return await event.edit(settings_text(), buttons=kb_set_sending())
     if data == "set:browserless":
         now = store.toggle_browserless()
         await event.answer("No-browser sends: " + ("ON" if now else "OFF"))
-        return await event.edit(settings_text(), buttons=kb_settings())
+        return await event.edit(settings_text(), buttons=kb_set_engine())
     if data == "set:apkoctet":
         now = store.toggle_apk_octet()
         await event.answer("APK send mode: " + ("ON" if now else "OFF"))
-        return await event.edit(settings_text(), buttons=kb_settings())
+        return await event.edit(settings_text(), buttons=kb_set_engine())
+    if data == "set:warmpath":
+        now = store.toggle_warmpath()
+        await event.answer("Warm Path: " + ("ON" if now else "OFF"))
+        return await event.edit(settings_text(), buttons=kb_set_engine())
+    if data == "set:boost":
+        now = store.toggle_boost()
+        await event.answer("Contact Boost: " + ("ON" if now else "OFF"))
+        if now and not store.boost_prefix:
+            await report(cards.card(
+                "👥 CONTACT BOOST IS ON",
+                [("Prefix", "not set yet")],
+                footer="Set a mobile prefix in Settings → 'Boost Prefix' (e.g. "
+                       "0916), otherwise there are no numbers to probe and the "
+                       "boost will skip itself."))
+        return await event.edit(settings_text(), buttons=kb_set_contacts())
+    if data == "set:boostprefix":
+        pending[event.sender_id] = {"step": "await_boostprefix"}
+        from contacts_boost import numbers as boost_numbers
+        rows = [("Current", store.boost_prefix or "not set"),
+                ("Probe per run", f"about {store.boost_probe}")]
+        for st in boost_numbers.pool(store.active_account or "",
+                                     store.boost_prefix):
+            note = (f"{st['hits_all']:,} found in {st['used']:,} used"
+                    f", {st['left']:,} left" if st["used"]
+                    else f"{st['capacity']:,} numbers, untouched")
+            if st["dead"]:
+                note += "  ⚠ skipped: found nobody"
+            rows.append((f"  {st['prefix']}", note))
+        return await event.edit(
+            cards.card("🔢 BOOST PREFIXES", rows,
+                       footer="Send ONE or SEVERAL Iranian mobile prefixes, "
+                              "separated by commas or spaces:\n"
+                              "0913151, 0913152, 0913153\n\n"
+                              "One of them is picked AT RANDOM for each run. The "
+                              "shorter a prefix is the more numbers it covers, but "
+                              "7 digits keeps the statistics per block so you can "
+                              "see which ones are worth keeping."),
+            buttons=kb_back())
+    if data == "set:boostprobe":
+        pending[event.sender_id] = {"step": "await_boostprobe"}
+        return await event.edit(
+            cards.card("🎯 NUMBERS PER BOOST RUN",
+                       [("Current", store.boost_probe)],
+                       footer="How many numbers ONE run probes (e.g. 400). This is "
+                              "not a target for how many contacts are added — most "
+                              "random numbers are not on Eitaa, so whatever the "
+                              "block yields is the result. Bigger means more calls "
+                              "and more rate-limit risk on a new account."),
+            buttons=kb_back())
     if data == "set:pool":
         return await event.edit(
             cards.pool_card(session_pool.status()),
@@ -895,19 +1206,30 @@ async def _refresh_account(event, acc: str):
 
     async def _run():
         from capture.browser import open_session
+        from eitaa import warmpath
         from eitaa.driver import EitaaDriver
         try:
-            async with open_session(acc) as session:
+            # Warm Path borrows a standby session so this button stops launching a
+            # second Chromium outside the pool's max_open ceiling. With the engine
+            # off it opens its own session exactly as before.
+            async with (session_pool.lease(acc, headed=config.HEADED_JOBS)
+                        if warmpath.use_pool() else open_session(acc)) as session:
                 driver = EitaaDriver(session)
                 await driver.open()
                 if not await driver.is_logged_in():
                     await report(cards.error_card("stats", acc, code="not_logged_in",
                                                   detail="account is not logged in"))
                     return
-                s = await driver.bridge_stats()
+                s = await driver.bridge_stats(with_pvs=warmpath.stats_with_pvs())
                 if s is None:
                     s = await driver.get_stats()
-                store.set_account_meta(acc, contacts=s.get("contacts"), pvs=s.get("pvs"))
+                # bridge_stats reports pvs=-1 when the 98-second getDialogs paging
+                # was skipped. Storing that would erase the last real count, so
+                # only a measured value is written.
+                pvs_measured = s.get("pvs")
+                if not (isinstance(pvs_measured, int) and pvs_measured >= 0):
+                    pvs_measured = None
+                store.set_account_meta(acc, contacts=s.get("contacts"), pvs=pvs_measured)
                 await report(cards.account_panel(
                     acc, store.account_phone(acc), s.get("contacts"), s.get("pvs"),
                     store.engine, False, peers=peer_count(acc)))
@@ -963,8 +1285,18 @@ async def _start_multi_send(event):
     await manager.run_send_multi(pairs, dict(store.content),
                                  dict(store.settings), report, live=live)
     await event.answer(f"Queued {len(pairs)} account(s).")
-    notes = ["Accounts run ONE AT A TIME in the order below. When one finishes "
-             "(or stops, or its session fails) the next one starts."]
+    width = store.multi_parallel
+    if width > 1:
+        notes = [f"{width} accounts send AT THE SAME TIME. As soon as one "
+                 f"finishes the next takes its slot, so a small account does "
+                 f"not have to wait for a big one."]
+        if config.MULTI_SHARE_BUDGET:
+            notes.append("Each account's delay is scaled by the width, so the "
+                         "combined rate leaving this server is the same as a "
+                         "one-at-a-time run.")
+    else:
+        notes = ["Accounts run ONE AT A TIME in the order below. When one "
+                 "finishes (or stops, or its session fails) the next starts."]
     if busy:
         notes.append("Skipped (already busy): "
                      + ", ".join(store.account_phone(a) for a in busy))
@@ -1037,8 +1369,12 @@ async def _conversation(event):
             return await event.respond("That account already has a running job. Try again later.")
         # A live stage card, because opening Chromium alone takes minutes here
         # and the login used to be silent until the code arrived.
+        # card_factory lets the login job post the ACCOUNT ADDED card as an
+        # EDITABLE message, so the contact boost can keep growing inside it
+        # instead of arriving as a separate card afterwards.
         started = await manager.start_bridge_login(
-            name, phone, report, live=LiveCard(config.report_to()))
+            name, phone, report, live=LiveCard(config.report_to()),
+            card_factory=lambda: LiveCard(config.report_to()))
         if not started:
             pending.pop(event.sender_id, None)
             return await event.respond("That account is busy right now. Try again later.")
@@ -1078,7 +1414,9 @@ async def _conversation(event):
         key = "text_send_delay" if step == "await_textdelay" else "contact_create_delay"
         store.set_setting(key, val)
         pending.pop(event.sender_id, None)
-        return await event.respond(settings_text(), buttons=kb_settings())
+        # Send delay lives under Sending; contact delay under Contacts.
+        kb = kb_set_sending if step == "await_textdelay" else kb_set_contacts
+        return await event.respond(settings_text(), buttons=kb())
 
     if step == "await_concurrency":
         try:
@@ -1089,7 +1427,7 @@ async def _conversation(event):
             return await event.respond("Send a whole number between 1 and 10.")
         store.set_setting("send_concurrency", val)
         pending.pop(event.sender_id, None)
-        return await event.respond(settings_text(), buttons=kb_settings())
+        return await event.respond(settings_text(), buttons=kb_set_sending())
 
     if step == "await_logevery":
         try:
@@ -1100,7 +1438,51 @@ async def _conversation(event):
             return await event.respond("Send an integer >= 1 (e.g. 50).")
         store.set_setting("send_log_every", val)
         pending.pop(event.sender_id, None)
-        return await event.respond(settings_text(), buttons=kb_settings())
+        return await event.respond(settings_text(), buttons=kb_set_sending())
+
+    if step == "await_boostprefix":
+        from contacts_boost import numbers as boost_numbers
+        good, bad = boost_numbers.parse_prefixes(text)
+        if not good:
+            reason = bad[0][1] if bad else "no prefix found in that"
+            return await event.respond(f"Invalid: {reason}\n\nSend one or more "
+                                       f"prefixes, e.g. 0913151, 0913152, 0913153")
+        store.set_boost_prefix(", ".join(good))
+        pending.pop(event.sender_id, None)
+        rows = [("Prefixes", f"{len(good)} — one is picked at random per run")]
+        total = 0
+        for p in good:
+            cap = boost_numbers.capacity(p)
+            total += cap
+            st = boost_numbers.stats(store.active_account or "", p)
+            rows.append((f"  {p}", f"{cap:,} numbers"
+                                   + (f", {st['used']:,} already used"
+                                      if st.get("used") else "")))
+        rows.append(("Total pool", f"{total:,} numbers"))
+        rows.append(("Probe per run", f"about {store.boost_probe}"))
+        rows.append(("Boost", "ON" if store.boost
+                              else "OFF — turn it on to use this"))
+        if bad:
+            rows.append(("Ignored", ", ".join(f"{t} ({r})" for t, r in bad[:3])))
+        await event.respond(cards.card(
+            "🔢 BOOST PREFIXES SAVED", rows,
+            footer="One prefix is chosen at random for each run, so accounts do "
+                   "not all draw from the same corner of the number space. Every "
+                   "number handed out is remembered per prefix, so none is ever "
+                   "used twice."))
+        return await event.respond(settings_text(), buttons=kb_set_contacts())
+
+    if step == "await_boostprobe":
+        try:
+            val = int(re.sub(r"\D", "", text or ""))
+            if val < 1 or val > 5000:
+                raise ValueError
+        except ValueError:
+            return await event.respond("Send a whole number between 1 and 5000 "
+                                       "(400 is the tested default).")
+        store.set_boost_probe(val)
+        pending.pop(event.sender_id, None)
+        return await event.respond(settings_text(), buttons=kb_set_contacts())
 
     if step == "await_prefix":
         entries, err = expand_range(text, 1)

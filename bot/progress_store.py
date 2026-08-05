@@ -27,10 +27,18 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import time
 from pathlib import Path
 
 from config import config
+
+
+#: How many deliveries may sit in memory before the ledger is written. A send
+#: waits seconds between recipients, so the write is noise next to the pacing --
+#: but anything still in memory is lost if the process is killed, and those
+#: people get the message twice on the next run. Override with MKWL_LEDGER_FLUSH.
+FLUSH_EVERY = max(1, int(os.environ.get("MKWL_LEDGER_FLUSH", "5") or 5))
 
 
 def path_for(account: str) -> Path:
@@ -88,16 +96,21 @@ class Ledger:
                 return True
         return False
 
-    def mark(self, title: str, peer_id: str | None, flush_every: int = 25) -> None:
+    def mark(self, title: str, peer_id: str | None,
+             flush_every: int | None = None) -> None:
         self.done.add(target_key(title, peer_id))
         # Remember the name as an alias, so a later run that lost the peer_id
         # (or gained one) still recognises this person as already served.
         if peer_id and title:
             self.aliases.add("title:" + str(title))
         self._dirty += 1
-        # Batch the writes: one fsync per recipient would be pure overhead, and
-        # losing at most `flush_every` entries only costs a few duplicates.
-        if self._dirty >= flush_every:
+        # Batch the writes so one recipient does not cost one fsync. The batch
+        # used to be 25, which meant a hard stop (process kill, OOM, systemctl
+        # restart) silently forgot up to 24 people who HAD received the message,
+        # and the next run messaged them again. A send paces itself in seconds
+        # per recipient, so a much smaller batch is free in comparison.
+        every = FLUSH_EVERY if flush_every is None else flush_every
+        if self._dirty >= max(1, every):
             self.flush()
 
     def flush(self) -> None:

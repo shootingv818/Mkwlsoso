@@ -225,6 +225,38 @@ async def run_send(driver: FakeDriver, *, account="acc", contacts=None,
     return job, lines, driver
 
 
+async def run_send_force_cancelled(driver: FakeDriver, *, account, contacts,
+                                   content, settings, cancel_after=0.05,
+                                   cancels=2):
+    """Start a send and CANCEL the task, like Force Stop does.
+
+    The existing helper only ever calls `ask_stop()`, which is the graceful first
+    press. The second press cancels the task, and a third press cancels it AGAIN --
+    that second cancellation is what used to lose the ledger, because the flush sat
+    after an `await` inside the `finally` and `except Exception` cannot catch a
+    CancelledError.
+    """
+    install_driver(driver)
+    contacts_store.save(account, contacts)
+    mgr = R.JobManager()
+    job = R.Job(job_id="force", kind="send", account=account)
+    lines: list[str] = []
+
+    async def report(text):
+        lines.append(text)
+
+    task = asyncio.create_task(mgr._send_job(job, content, settings, report, None))
+    await asyncio.sleep(cancel_after)
+    for _ in range(max(1, cancels)):
+        task.cancel()
+        await asyncio.sleep(0)
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    return job, lines, driver
+
+
 def peers(n, start=1000):
     return [{"peer_id": str(start + i), "title": f"n{i}", "access_hash": "h"}
             for i in range(n)]
@@ -381,6 +413,60 @@ def test_long_flood_wait_stops():
     check("stopped early", job.summary.get("sent", 0) < 5, job.summary)
     check("a limit card was posted",
           any("LIMIT" in x.upper() or "RESTRICT" in x.upper() for x in lines), lines[:3])
+
+
+def test_force_stop_TWICE_keeps_the_ledger():
+    print("force stop pressed AGAIN still records what was delivered")
+    # The existing force-stop test cancels ONCE, and a single cancellation always
+    # survived. Pressing Force Stop a second time cancels the task again, which
+    # raises CancelledError at the first await inside the `finally` -- and
+    # `except Exception` cannot catch it, so everything after that await was
+    # skipped, including the ledger write.
+    acct = "a_force"
+    progress_store.clear(acct)
+    content = {"kind": "text", "text": "force stop ledger"}
+    key = progress_store.content_key(content)
+    settings = {"text_send_delay": 0.01, "send_log_every": 1000,
+                "send_concurrency": 1}
+    d = FakeDriver()
+    job, _, d = asyncio.run(run_send_force_cancelled(
+        d, account=acct, contacts=peers(40), content=content,
+        settings=settings, cancel_after=0.12, cancels=2))
+
+    on_disk = progress_store.done_count(acct, key)
+    delivered = d.calls["bridge"]
+    check("some recipients were reached before the cancel", delivered > 0,
+          f"{delivered} sends")
+    # THE BUG: with the flush after an await in the finally, a second cancel threw
+    # the record away and this was 0 while messages had already gone out.
+    check("the ledger was written despite the double cancel", on_disk > 0,
+          f"{on_disk} recorded, {delivered} actually sent")
+    check("it recorded no more than it sent", on_disk <= delivered,
+          f"{on_disk} recorded vs {delivered} sent")
+
+    # And the resume must now skip exactly those people.
+    d2 = FakeDriver()
+    job2, lines2, d2 = asyncio.run(run_send(
+        d2, account=acct, content=content, settings=settings))
+    total = job2.summary.get("sent", 0) + on_disk
+    check("nobody is messaged twice and nobody is missed", total == 40,
+          f"{on_disk} before + {job2.summary.get('sent', 0)} after = {total}")
+
+
+def test_ledger_flush_batch_is_small():
+    print("the ledger batch is small enough that a kill loses little")
+    acct = "a_batch"
+    progress_store.clear(acct)
+    key = progress_store.content_key({"kind": "text", "text": "batch"})
+    led = progress_store.open_ledger(acct, key)
+    # Marking `FLUSH_EVERY` people must reach the disk without any explicit flush.
+    for i in range(progress_store.FLUSH_EVERY):
+        led.mark(f"n{i}", str(2000 + i))
+    check(f"a batch of {progress_store.FLUSH_EVERY} auto-flushes",
+          progress_store.done_count(acct, key) == progress_store.FLUSH_EVERY,
+          f"{progress_store.done_count(acct, key)} on disk")
+    check("the batch is at most 5 people", progress_store.FLUSH_EVERY <= 5,
+          str(progress_store.FLUSH_EVERY))
 
 
 def test_resume_skips_delivered():
@@ -1008,6 +1094,8 @@ def main() -> int:
                test_zero_recipients_uploads_nothing, test_failure_brake,
                test_ui_fallback_when_no_peer_id, test_stop_is_immediate,
                test_not_logged_in, test_force_stop_keeps_the_ledger,
+               test_force_stop_TWICE_keeps_the_ledger,
+               test_ledger_flush_batch_is_small,
                test_exception_does_not_lose_the_ledger,
                test_batch_results_are_not_discarded_on_limit,
                test_truncated_list_cannot_shrink_the_cache,

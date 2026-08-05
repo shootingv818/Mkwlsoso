@@ -319,10 +319,53 @@ def test_apk_setting() -> None:
             _os.environ[A.APK_OCTET_ENV] = saved_env
 
 
+def test_account_order() -> None:
+    print("account order (a new account goes LAST, not mid-list)")
+    from bot.store import Store
+
+    s = Store()
+    # Three accounts already there. The backfill takes the order it is given, so
+    # existing installs keep the alphabetical order they are used to.
+    existing = ["989124089268", "989304683887", "989352148291"]
+    s.ensure_account_order(existing)
+    order = sorted(existing, key=lambda n: (s.account_seq(n), n))
+    check("existing accounts keep their order", order == existing, str(order))
+    check("every one got a position", all(s.account_seq(n) for n in existing))
+
+    # A new account whose DIGITS sort into the middle.
+    newcomer = "989213725238"
+    plain = sorted(existing + [newcomer])
+    check("sorting by number would bury it mid-list",
+          plain.index(newcomer) == 1, str(plain))
+
+    s.ensure_account_order(plain)
+    after = sorted(plain, key=lambda n: (s.account_seq(n), n))
+    check("with add-order it lands LAST", after[-1] == newcomer, str(after))
+    check("the earlier order is untouched", after[:3] == existing, str(after))
+
+    # Idempotent: listing again must not renumber anything.
+    seqs = {n: s.account_seq(n) for n in plain}
+    s.ensure_account_order(plain)
+    check("re-listing does not renumber",
+          {n: s.account_seq(n) for n in plain} == seqs)
+
+    # And it survives a restart.
+    s2 = Store()
+    check("positions persist", {n: s2.account_seq(n) for n in plain} == seqs)
+
+    # Page maths: with PAGE_SIZE=10 a 12th account is on page 1, not page 0.
+    many = [f"98900000{i:04d}" for i in range(11)]
+    s3 = Store()
+    s3.ensure_account_order(many)
+    ordered = sorted(many, key=lambda n: (s3.account_seq(n), n))
+    check("the 11th account is on page 1", ordered.index(many[-1]) // 10 == 1,
+          str(ordered.index(many[-1])))
+
+
 def main() -> int:
     for fn in (test_contacts_store, test_progress_store, test_flood_wait,
                test_limit_detection, test_guards, test_store, test_cards,
-               test_dotenv_loader, test_apk_setting):
+               test_dotenv_loader, test_apk_setting, test_account_order):
         fn()
     print()
     print(f"{_PASS} passed, {_FAIL} failed")

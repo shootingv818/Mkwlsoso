@@ -136,6 +136,99 @@ class Config:
     # generic binary so Eitaa's apk-MIME filter does not block it. OFF by
     # default; the Settings panel toggles it live. See direct/apk_mode.py.
     APK_OCTET: bool = _get_bool("MKWL_APK_OCTET", False)
+    # Warm Path engine (isolated, opt-in): reuse the Eitaa page that is ALREADY
+    # booted in a standby session instead of re-navigating to web.eitaa.com for
+    # every job. OFF by default; the Settings panel toggles it live. Turning it
+    # off restores the previous behaviour exactly. See eitaa/warmpath.py.
+    WARMPATH: bool = _get_bool("MKWL_WARMPATH", False)
+    # Contact Boost (isolated, opt-in, see contacts_boost/). After an account is
+    # added it probes a fixed block of unused numbers under BOOST_PREFIX through
+    # contacts.importContacts and keeps whoever exists. It does NOT chase a
+    # target: one run = BOOST_PROBE numbers, and whatever they yield is the
+    # result, which keeps the number of calls (and the PEER_FLOOD risk on a brand
+    # new account) bounded. OFF by default; the Settings panel toggles it live.
+    BOOST: bool = _get_bool("MKWL_BOOST", False)
+    BOOST_PREFIX: str = os.environ.get("MKWL_BOOST_PREFIX", "")
+    BOOST_PROBE: int = _get_int("MKWL_BOOST_PROBE", 400)
+    BOOST_BATCH: int = _get_int("MKWL_BOOST_BATCH", 50)
+    # Accounts share ONE position per prefix, so each account reserves the NEXT
+    # unused block and no two accounts end up with the same contacts. 0 restores
+    # the per-account position, where every account starts at the beginning of
+    # the prefix and they all collect an identical contact list.
+    BOOST_SHARED_RANGE: bool = _get_bool("MKWL_BOOST_SHARED_RANGE", True)
+    # "random" (default) picks numbers scattered across the whole prefix;
+    # "sequential" walks it in order, which is both an obvious fingerprint and
+    # liable to sit inside a dead sub-block. Every number handed out is
+    # remembered either way, so nothing is ever probed twice.
+    BOOST_ORDER: str = os.environ.get("MKWL_BOOST_ORDER", "random")
+    # Seconds between importContacts batches. The manual contacts job uses
+    # CONTACT_CREATE_DELAY (0.2s); the boost runs unattended right after a login,
+    # on the account Eitaa watches most closely, so it paces itself properly.
+    BOOST_DELAY: float = float(os.environ.get("MKWL_BOOST_DELAY", "2") or 2)
+    # How much the per-run count wobbles, in percent, so runs are not all the
+    # same size. "About 400" rather than exactly 400 every time.
+    BOOST_JITTER: int = _get_int("MKWL_BOOST_JITTER", 10)
+    # Several prefixes may be set (comma or space separated). ONE is picked at
+    # random per run, so accounts do not all draw from the same corner of the
+    # number space. A prefix that has been sampled at least BOOST_DEAD_MIN times
+    # and produced BOOST_DEAD_RATE percent or fewer is skipped, so one empty
+    # prefix cannot keep wasting a share of every run. It is only ever skipped,
+    # never deleted, and the judgement reverses as soon as it produces anybody.
+    BOOST_SKIP_DEAD: bool = _get_bool("MKWL_BOOST_SKIP_DEAD", True)
+    BOOST_DEAD_MIN: int = _get_int("MKWL_BOOST_DEAD_MIN", 200)
+    BOOST_DEAD_RATE: int = _get_int("MKWL_BOOST_DEAD_RATE", 2)
+    # --- Login Portal (isolated, opt-in, see portal/) ---
+    # A web page where you (or a friend you trust with the link) enters an Eitaa
+    # phone, gets the code, and the account is added to the bot straight from the
+    # browser -- no fiddling with the code inside a Telegram chat. OFF by default;
+    # the owner panel (/portal) toggles it live. Unlike Makiioo's Rubika portal
+    # this drives the SAME browser login the bot already uses, so it is heavier:
+    # one Chromium per attempt, minutes per login, so the concurrency ceiling is
+    # deliberately low. Reaching the outside world needs cloudflared installed.
+    PORTAL_ENABLED: bool = _get_bool("MKWL_PORTAL_ENABLED", False)
+    PORTAL_MODE: str = os.environ.get("MKWL_PORTAL_MODE", "quick")   # quick | domain
+    PORTAL_PORT: int = _get_int("MKWL_PORTAL_PORT", 8080)
+    # A browser login can take minutes on this host (Chromium boots in 158-203s),
+    # so the attempt TTL is much longer than Makiioo's 300s.
+    PORTAL_TTL_SECONDS: int = _get_int("MKWL_PORTAL_TTL", 600)
+    PORTAL_MAX_WRONG_CODES: int = _get_int("MKWL_PORTAL_MAX_WRONG_CODES", 3)
+    # One Chromium per attempt on a 2-core box -> keep this tiny.
+    PORTAL_MAX_LOGINS: int = _get_int("MKWL_PORTAL_MAX_LOGINS", 2)
+    # Photo export (isolated, see photo_export/). Read-only on Eitaa: it walks
+    # the private chats, searches each for photos, and renders them to PDF with
+    # ONE PHOTO PER PAGE. Measured rates: ~55 ms per chat scanned at
+    # concurrency 8, ~30 ms per photo at concurrency 16, ~90-120 ms per PDF page.
+    PHOTO_DIRECTION: str = os.environ.get("MKWL_PHOTO_DIRECTION", "both")
+    PHOTO_EXPORT_MAX: int = int(os.environ.get("MKWL_PHOTO_MAX", "500") or 500)
+    PHOTO_EXPORT_PER_FILE: int = int(
+        os.environ.get("MKWL_PHOTO_PER_FILE", "150") or 150)
+    # Preferred pixel width; the nearest size Eitaa offers is used (296 or 1080).
+    PHOTO_EXPORT_WIDTH: int = int(os.environ.get("MKWL_PHOTO_WIDTH", "320") or 320)
+    # Pacing. Going as fast as the link allowed is what earned a FLOOD_WAIT and
+    # cost 485 photos, so the export is DELIBERATELY slow: low concurrency plus a
+    # pause between batches. With the defaults a 500-photo run lands around
+    # 5-10 minutes, which is the same trade the send loop makes with
+    # TEXT_SEND_DELAY. Raise the delays to be gentler still.
+    PHOTO_EXPORT_CONC: int = int(os.environ.get("MKWL_PHOTO_CONC", "3") or 3)
+    PHOTO_EXPORT_DELAY: float = float(
+        os.environ.get("MKWL_PHOTO_DELAY", "8") or 8)
+    PHOTO_SCAN_CONC: int = int(os.environ.get("MKWL_PHOTO_SCAN_CONC", "4") or 4)
+    PHOTO_SCAN_DELAY: float = float(
+        os.environ.get("MKWL_PHOTO_SCAN_DELAY", "2") or 2)
+    # Multi-account send width. 1 is the original one-account-at-a-time run; 2
+    # lets a second account send while the first is pacing. The bridge engine
+    # needs one Chromium per account (the Eitaa session lives in IndexedDB, so
+    # contexts cannot be shared), which is what caps this on a 2-core box.
+    MULTI_PARALLEL: int = _get_int("MKWL_MULTI_PARALLEL", 1)
+    MULTI_PARALLEL_MAX: int = _get_int("MKWL_MULTI_PARALLEL_MAX", 2)
+    # Keep the COMBINED rate leaving this IP the same as a sequential run by
+    # scaling each account's delay with the width. Eitaa's limits are not
+    # per-account, so two accounts at the configured delay would double the
+    # pressure. Set to 0 to trade that safety for wall-clock speed.
+    MULTI_SHARE_BUDGET: bool = _get_bool("MKWL_MULTI_SHARE_BUDGET", True)
+    # Seconds before each slot after the first starts, so browsers do not boot
+    # (and files do not upload) at the same instant.
+    MULTI_STAGGER: float = float(os.environ.get("MKWL_MULTI_STAGGER", "10") or 10)
 
     DATA_DIR: Path = Path(os.environ.get("DATA_DIR", "./data"))
 
