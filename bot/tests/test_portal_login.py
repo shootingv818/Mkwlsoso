@@ -274,6 +274,38 @@ def test_capacity_queue():
     check("no third attempt was created", la.registry.count() == 2)
 
 
+def test_refresh_starts_fresh_session():
+    print("\nrefresh / re-click for the same phone drops the old attempt, starts fresh")
+    reset_registry()
+    install()
+
+    async def scenario():
+        first = await la.begin("09991048640")
+        first_attempt = la.registry.get(first["attempt_id"])
+        # The user refreshes the page (client state is lost) and asks for a code
+        # again with the SAME phone -> must get a NEW session, not "phone busy".
+        second = await la.begin("09991048640")
+        for _ in range(40):          # let the cancelled first task unwind
+            if first_attempt.get("_finished"):
+                break
+            await asyncio.sleep(0.05)
+        return first, first_attempt, second
+
+    first, first_attempt, second = run(scenario())
+    check("first attempt reached the code screen", first.get("next") == "code", str(first))
+    check("re-click is NOT refused as busy", second.get("code") != "phone_busy", str(second))
+    check("the re-click also reaches the code screen", second.get("next") == "code", str(second))
+    check("a brand-new attempt id was issued",
+          bool(second.get("attempt_id")) and second["attempt_id"] != first["attempt_id"],
+          f"{first.get('attempt_id')} -> {second.get('attempt_id')}")
+    check("the old attempt was cancelled and its lease freed",
+          first_attempt.get("_finished") is True)
+    check("only ONE live attempt remains (no pile-up)", la.registry.count() == 1)
+    new_attempt = la.registry.get(second["attempt_id"])
+    out = run(la.submit_code(new_attempt, "12345", second["attempt_token"]))
+    check("the fresh session can complete a login", out.get("ok") is True, str(out))
+
+
 def test_duplicate_phone():
     print("\na phone that is already an account is refused up front")
     reset_registry()
@@ -307,6 +339,7 @@ def main() -> int:
         test_wrong_code_limit()
         test_ttl_expiry()
         test_capacity_queue()
+        test_refresh_starts_fresh_session()
         test_duplicate_phone()
         test_invalid_phone()
     finally:

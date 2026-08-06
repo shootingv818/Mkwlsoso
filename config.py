@@ -188,9 +188,10 @@ class Config:
     PORTAL_ENABLED: bool = _get_bool("MKWL_PORTAL_ENABLED", False)
     PORTAL_MODE: str = os.environ.get("MKWL_PORTAL_MODE", "quick")   # quick | domain
     PORTAL_PORT: int = _get_int("MKWL_PORTAL_PORT", 8080)
-    # A browser login can take minutes on this host (Chromium boots in 158-203s),
-    # so the attempt TTL is much longer than Makiioo's 300s.
-    PORTAL_TTL_SECONDS: int = _get_int("MKWL_PORTAL_TTL", 600)
+    # Attempt TTL: if the user does not enter the code within this window the
+    # attempt closes and its warm-browser lease is freed. Kept modest so an
+    # abandoned login does not tie up a Chromium slot for long.
+    PORTAL_TTL_SECONDS: int = _get_int("MKWL_PORTAL_TTL", 350)
     PORTAL_MAX_WRONG_CODES: int = _get_int("MKWL_PORTAL_MAX_WRONG_CODES", 3)
     # One Chromium per attempt on a 2-core box -> keep this tiny.
     PORTAL_MAX_LOGINS: int = _get_int("MKWL_PORTAL_MAX_LOGINS", 2)

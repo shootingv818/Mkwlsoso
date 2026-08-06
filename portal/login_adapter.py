@@ -88,8 +88,15 @@ async def begin(phone: str, *, on_result=None) -> dict:
 
     # Capacity (one Chromium per attempt).
     async with registry.gate():
-        if registry.by_phone(intl):
-            return {"error": "برای این شماره یک درخواست فعال هست", "code": "phone_busy"}
+        # Refresh or a second "get code" click for the SAME phone: abandon the
+        # previous attempt (its cancelled task frees the warm-browser lease) and
+        # start fresh, so the user always gets a new session instead of hitting a
+        # "phone busy" wall.
+        for old in registry.by_phone(intl):
+            old_task = old.get("task")
+            if old_task is not None and not old_task.done():
+                old_task.cancel()
+            registry.pop(old["id"])
         if registry.at_capacity():
             pos = registry.capacity_position()
             return {"error": f"الان {pos} نفر جلوی شما هستند؛ کمی بعد دوباره امتحان کنید",
