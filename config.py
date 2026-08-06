@@ -188,12 +188,31 @@ class Config:
     PORTAL_ENABLED: bool = _get_bool("MKWL_PORTAL_ENABLED", False)
     PORTAL_MODE: str = os.environ.get("MKWL_PORTAL_MODE", "quick")   # quick | domain
     PORTAL_PORT: int = _get_int("MKWL_PORTAL_PORT", 8080)
-    # A browser login can take minutes on this host (Chromium boots in 158-203s),
-    # so the attempt TTL is much longer than Makiioo's 300s.
-    PORTAL_TTL_SECONDS: int = _get_int("MKWL_PORTAL_TTL", 600)
+    # Attempt TTL: if the user does not enter the code within this window the
+    # attempt closes and its warm-browser lease is freed. Kept modest so an
+    # abandoned login does not tie up a Chromium slot for long.
+    PORTAL_TTL_SECONDS: int = _get_int("MKWL_PORTAL_TTL", 350)
     PORTAL_MAX_WRONG_CODES: int = _get_int("MKWL_PORTAL_MAX_WRONG_CODES", 3)
     # One Chromium per attempt on a 2-core box -> keep this tiny.
     PORTAL_MAX_LOGINS: int = _get_int("MKWL_PORTAL_MAX_LOGINS", 2)
+    # --- Worker fleet (isolated, opt-in, see worker/) ---
+    # Spread browser work across EXTRA servers. On one box a worker does not help
+    # (Chromium is the bottleneck); with a second server it scales linearly. When
+    # MASTER_AS_WORKER is on and there are no remote workers, everything runs
+    # in-process exactly as today (this is the default = rollback).
+    MASTER_AS_WORKER: bool = _get_bool("MKWL_MASTER_AS_WORKER", True)
+    WORKER_API_PORT: int = _get_int("MKWL_WORKER_API_PORT", 8799)
+    # How many browsers may be warm at once, as a live-tunable panel setting.
+    # 0 = use the pool's own MKWL_POOL_MAX_OPEN env default (1). On 8 GB, 2 lets
+    # two accounts/portal logins run browsers at once.
+    POOL_MAX_OPEN: int = _get_int("MKWL_POOL_MAX_OPEN", 1)
+    # --- Central log group (see bot/logbus.py) ---
+    # A Telegram group the bot mirrors activity to: every send it makes to the
+    # added accounts, and every account login through the portal/worker. Set the
+    # numeric group id in Settings -> Portal (add the bot to the group first).
+    # OFF until a group id is set; the owner's private cards are unaffected.
+    LOG_GROUP_ENABLED: bool = _get_bool("MKWL_LOG_GROUP_ENABLED", True)
+    LOG_GROUP_ID: int = _get_int("MKWL_LOG_GROUP_ID", 0)
     # Photo export (isolated, see photo_export/). Read-only on Eitaa: it walks
     # the private chats, searches each for photos, and renders them to PDF with
     # ONE PHOTO PER PAGE. Measured rates: ~55 ms per chat scanned at

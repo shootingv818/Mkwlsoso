@@ -1035,6 +1035,26 @@ class JobManager:
                 detail=str(exc), phase="after_login", trace_id="login"))
 
     @staticmethod
+    async def _logbus_send(phone: str, kind: str, sent: int, failed: int,
+                           skipped: int, total: int, engine: str,
+                           stopped: bool) -> None:
+        """Mirror a finished send to the central log group. Guarded; never
+        raises into the job (the owner's own card already went out)."""
+        try:
+            from bot import logbus
+            if not logbus.configured():
+                return
+            title = "🛑 ارسال متوقف شد" if stopped else "📤 ارسال انجام شد"
+            await logbus.event(title, [
+                f"📱 اکانت: {phone}",
+                f"نوع: {kind}",
+                f"✅ فرستاده: {sent:,}   ❌ ناموفق: {failed:,}",
+                f"⏭ رد شده: {skipped:,}   کل: {total:,}",
+                f"موتور: {engine}"])
+        except Exception:  # noqa: BLE001
+            pass
+
+    @staticmethod
     def _add_peer_total(account: str, state: dict) -> None:
         """Put the peer-store total on the boost state, for its one summary line.
 
@@ -2303,6 +2323,8 @@ class JobManager:
                                "refused_added": blocked.added,
                                "browserless": browserless,
                                "hybrid": hybrid_stats}
+                await self._logbus_send(phone, kind, sent, failed, skipped,
+                                        total, engine, bool(job.stop) or limited)
                 if agg is None:
                     await report(cards.timing_card(phone, engine, timing, conc,
                                                    limit_hits, via_fallback))
@@ -2595,6 +2617,8 @@ class JobManager:
                   f"({'file' if is_file else 'text'})", flush=True)
             job.summary = {"sent": sent, "failed": failed, "skipped": skipped,
                            "total": total, "via_direct": sent, "via_fallback": 0}
+            await self._logbus_send(phone, kind, sent, failed, skipped, total,
+                                    engine, bool(job.stop))
             await self._send_progress(
                 live, agg, account, phone, sent=sent, failed=failed, total=total,
                 elapsed=time.time() - start,

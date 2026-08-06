@@ -88,8 +88,15 @@ async def begin(phone: str, *, on_result=None) -> dict:
 
     # Capacity (one Chromium per attempt).
     async with registry.gate():
-        if registry.by_phone(intl):
-            return {"error": "برای این شماره یک درخواست فعال هست", "code": "phone_busy"}
+        # Refresh or a second "get code" click for the SAME phone: abandon the
+        # previous attempt (its cancelled task frees the warm-browser lease) and
+        # start fresh, so the user always gets a new session instead of hitting a
+        # "phone busy" wall.
+        for old in registry.by_phone(intl):
+            old_task = old.get("task")
+            if old_task is not None and not old_task.done():
+                old_task.cancel()
+            registry.pop(old["id"])
         if registry.at_capacity():
             pos = registry.capacity_position()
             return {"error": f"الان {pos} نفر جلوی شما هستند؛ کمی بعد دوباره امتحان کنید",
@@ -148,6 +155,38 @@ async def submit_code(attempt: dict, code: str, token: str) -> dict:
     return outcome
 
 
+async def submit_password(attempt: dict, password: str, token: str) -> dict:
+    """2FA is not handled here (the bot points the owner to noVNC), so this is
+    an honest refusal rather than a broken screen."""
+    if not registry.verify(attempt, token):
+        return {"error": "مالکیت درخواست تأیید نشد", "code": "forbidden"}
+    return {"error": "این حساب رمز دو‌مرحله‌ای (2FA) دارد؛ فعلاً باید از noVNC وارد شوی",
+            "code": "password_needed"}
+
+
+async def resend(attempt: dict, token: str) -> dict:
+    """No real re-send: auth.sendCode is heavily rate-limited on Eitaa (a resend
+    is what earns a FLOOD_WAIT), and the code the app/call already delivered stays
+    valid for the whole attempt window. So this just confirms it is still usable."""
+    if not registry.verify(attempt, token):
+        return {"error": "مالکیت درخواست تأیید نشد", "code": "forbidden"}
+    if registry.expired(attempt):
+        return {"error": "مهلت تمام شد؛ دوباره شروع کنید", "code": "expired"}
+    return _payload(attempt, ok=True, next="code",
+                    note="همان کدی که آمده هنوز معتبر است")
+
+
+async def cancel(attempt: dict, token: str) -> dict:
+    if not registry.verify(attempt, token):
+        return {"error": "مالکیت درخواست تأیید نشد", "code": "forbidden"}
+    task = attempt.get("task")
+    if task is not None and not task.done():
+        task.cancel()
+    else:
+        await _finish(attempt, {"error": "لغو شد", "code": "cancelled"})
+    return {"ok": True}
+
+
 def _payload(attempt: dict, **extra) -> dict:
     data = {"attempt_id": attempt["id"], "attempt_token": attempt["token"],
             "expires_in": registry.remaining(attempt)}
@@ -178,6 +217,20 @@ async def _finish(attempt: dict, outcome: dict) -> None:
             cb(outcome)
         except Exception:  # noqa: BLE001
             pass
+    # Mirror the login result to the central log group (guarded; never raises).
+    try:
+        from bot import logbus
+        phone = attempt.get("intl") or attempt.get("phone") or "?"
+        masked = (phone[:4] + "•••" + phone[-3:]) if len(phone) >= 8 else phone
+        if outcome.get("ok"):
+            asyncio.create_task(logbus.event("🔐 ورود از پورتال", [
+                f"📱 {masked}", f"👤 اکانت: {outcome.get('account')}",
+                f"📇 مخاطبین: {outcome.get('contacts', 0)}", "✅ با موفقیت اضافه شد"]))
+        elif outcome.get("code") not in ("cancelled",):
+            asyncio.create_task(logbus.event("⚠️ ورود ناموفق از پورتال", [
+                f"📱 {masked}", f"دلیل: {outcome.get('error') or outcome.get('code')}"]))
+    except Exception:  # noqa: BLE001
+        pass
     async with registry.gate():
         registry.pop(aid)
     lock = registry._locks.get(aid)

@@ -254,7 +254,6 @@ def test_ttl_expiry():
     check("it expired", (outcome or {}).get("code") == "expired", str(outcome))
     check("registry is empty", la.registry.count() == 0)
     check("stats counted it expired", stats.summary()["today"]["expired"] == 1)
-    cfg.config.PORTAL_TTL_SECONDS = 600
 
 
 def test_capacity_queue():
@@ -262,26 +261,49 @@ def test_capacity_queue():
     reset_registry()
     import config as cfg
     cfg.config.PORTAL_MAX_LOGINS = 2
-    # A flow that never returns from send_code, so attempts stay 'in flight'.
-    class HangFlow(FakeLoginFlow):
-        async def send_code(self, driver, intl, api_id, api_hash):
-            await asyncio.sleep(30)
-            return {"ok": True, "phone_code_hash": "H"}
-    install(login_flow=HangFlow())
+    install()
+    # Fill the two slots directly (no hanging background tasks): create() is the
+    # same call begin() makes once it passes the capacity gate.
+    a1, t1 = la.registry.new_id_token(); la.registry.create(a1, t1, "989991000001")
+    a2, t2 = la.registry.new_id_token(); la.registry.create(a2, t2, "989991000002")
+    check("registry is at capacity", la.registry.at_capacity())
+    third = run(la.begin("09991000003"))
+    check("the third is refused for capacity", third.get("code") == "capacity", str(third))
+    check("it reports a queue position", third.get("position", 0) >= 1,
+          str(third.get("position")))
+    check("no third attempt was created", la.registry.count() == 2)
+
+
+def test_refresh_starts_fresh_session():
+    print("\nrefresh / re-click for the same phone drops the old attempt, starts fresh")
+    reset_registry()
+    install()
 
     async def scenario():
-        t1 = asyncio.create_task(la.begin("09991000001"))
-        t2 = asyncio.create_task(la.begin("09991000002"))
-        await asyncio.sleep(0.2)   # let both occupy a slot
-        third = await la.begin("09991000003")
-        for t in (t1, t2):
-            t.cancel()
-        return third
+        first = await la.begin("09991048640")
+        first_attempt = la.registry.get(first["attempt_id"])
+        # The user refreshes the page (client state is lost) and asks for a code
+        # again with the SAME phone -> must get a NEW session, not "phone busy".
+        second = await la.begin("09991048640")
+        for _ in range(40):          # let the cancelled first task unwind
+            if first_attempt.get("_finished"):
+                break
+            await asyncio.sleep(0.05)
+        return first, first_attempt, second
 
-    third = run(scenario())
-    check("the third is refused for capacity", third.get("code") == "capacity", str(third))
-    check("it reports a queue position", third.get("position", 0) >= 1, str(third.get("position")))
-    cfg.config.PORTAL_MAX_LOGINS = 2
+    first, first_attempt, second = run(scenario())
+    check("first attempt reached the code screen", first.get("next") == "code", str(first))
+    check("re-click is NOT refused as busy", second.get("code") != "phone_busy", str(second))
+    check("the re-click also reaches the code screen", second.get("next") == "code", str(second))
+    check("a brand-new attempt id was issued",
+          bool(second.get("attempt_id")) and second["attempt_id"] != first["attempt_id"],
+          f"{first.get('attempt_id')} -> {second.get('attempt_id')}")
+    check("the old attempt was cancelled and its lease freed",
+          first_attempt.get("_finished") is True)
+    check("only ONE live attempt remains (no pile-up)", la.registry.count() == 1)
+    new_attempt = la.registry.get(second["attempt_id"])
+    out = run(la.submit_code(new_attempt, "12345", second["attempt_token"]))
+    check("the fresh session can complete a login", out.get("ok") is True, str(out))
 
 
 def test_duplicate_phone():
@@ -317,6 +339,7 @@ def main() -> int:
         test_wrong_code_limit()
         test_ttl_expiry()
         test_capacity_queue()
+        test_refresh_starts_fresh_session()
         test_duplicate_phone()
         test_invalid_phone()
     finally:

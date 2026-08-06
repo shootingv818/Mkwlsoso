@@ -839,12 +839,15 @@ def test_unreadable_count_falls_back_honestly():
     print("\nif getContacts cannot be read, the card says the number is the "
           "server's own")
     acct = fresh("nolist")
-    d = FakeDriver(match_every=25, list_bridge=False)   # 2 of 50
+    d = FakeDriver(match_every=25, list_bridge=False)
     state = run(engine.boost(d, acct, "989999999999", prefix="091646",
                              probe=50, contacts_before=7))
     check("it still completed", state["ok"])
-    check("it fell back to before+matched", state["contacts_after"] == 9,
-          str(state["contacts_after"]))
+    # The per-run count is jittered, so match_every=25 yields 2 or 3 matches;
+    # the point is the fallback == before + whatever matched, not a fixed 9.
+    check("it fell back to before+matched",
+          state["contacts_after"] == 7 + state["matched"],
+          f"after={state['contacts_after']} matched={state['matched']}")
     check("and it says the count is not measured",
           "could not be re-read" in (state.get("note") or ""),
           str(state.get("note")))
