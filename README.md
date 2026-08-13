@@ -153,7 +153,20 @@ re-sends to anyone already marked `sent`.
 
 ## Roadmap
 
+**→ `docs/ROADMAP.md` is the canonical roadmap.** It lists what is done, what is
+built but not yet live-verified, what is only scaffolded, and what comes next.
+
+Phases delivered so far:
+
 - **Phase 1:** capture + analyze real operations. (done)
 - **Phase 2:** Browser-driver `send_text` + inspect. (done)
 - **Phase 3:** controlled, restart-safe broadcaster (collect/campaign). (done)
-- **Next:** send contact cards / media, multi-account rotation, a control panel.
+- **Phase 4:** Telegram control panel (`bot/`) — accounts, login, contact cache,
+  live cards, resume ledger. (done)
+- **Phase 5:** three send engines behind one interface (`bridge` / `hybrid` /
+  `direct`), including browser-free text and multi-part file send. (done)
+- **Phase 6:** feature packages — contact boost, photo export, session check,
+  warm path, APK send mode. (built; several still off by default)
+- **Phase 7:** web login portal, central log group, distributed worker fleet.
+  (in progress — the portal and log group are wired but off by default; the
+  worker fleet is a tested core plus unwired scaffolds)

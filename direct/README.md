@@ -206,32 +206,40 @@ browser bot fully working.
 - ✅ Browser-free **send text** to self AND to a contact — `updateShortSentMessage`.
 - ✅ Browser-free **import contact** — `contacts.importedContacts`.
 - ✅ Browser-free **learn a contact peer** (`direct-capture-peer`).
-- 🔧 Browser-free **send file** (saveFilePart+sendMedia) — byte-exact serializers done;
-  root cause found = media must go to the dedicated media host (`fateme.eitaa.com`),
-  not the API host. Fix built (`extract_media_url` + route file send there).
-  **Awaiting live re-test** (`direct-send-file`).
-- ⛔ **apk is blocked by Eitaa itself** (platform policy — the web app can't send .apk
-  either); the direct client returns Eitaa's `error 400: PEER_ID_INVALID` for apk. Not
-  our bug; nothing to fix. txt/zip/pdf/images/etc. work.
-- ⏳ TODO after file works: multi-part (>512 KiB) verification; source token/cookies
-  from the session export instead of the newest capture; optional direct login handshake.
+- ✅ Browser-free **send file** (saveFilePart+sendMedia) — root cause was that media must
+  go to the dedicated media host (`fateme.eitaa.com`), not the API host; `extract_media_url`
+  routes it there. Proven live, including **multi-part**: a 9,494,529 B zip went out as
+  19 parts, uploaded once.
+- ✅ **`.apk` sending** — Eitaa filters the *MIME*, not the name or the bytes.
+  `direct/apk_mode.py` sends `.apk` as `application/octet-stream` with the real name in
+  `documentAttributeFilename`. Toggle `📦 APK send mode`, OFF by default. Full story in
+  `docs/APK_SEND_STATUS.md`. (The old `error 400: PEER_ID_INVALID` on apk was this MIME
+  filter, not a peer problem.)
+- ⛔ Browser-free **`contacts.importContacts`** — settled dead end: Eitaa replies with a
+  4-byte payload-less `cid=0xdc252379`, identically for `+98…` and `98…`. Contact
+  building hands over to the bridge automatically. Do not re-investigate.
 
-## HANDOFF — continue from here (next account/session)
+## HANDOFF — continue from here (updated 2026-08-13)
+
+**→ For priorities, read `docs/ROADMAP.md`.** It is the canonical roadmap; this section
+is only the operating context for working on `direct/`.
+
 State of the world:
-- Text + contact import + peer-learning are DONE and browser-free.
-- The ONLY thing between us and full browser-free file send is Eitaa's load-balancer
-  node-affinity (see the section above). The cookie-jar fix is committed; the very next
-  step is: run `direct-capture-cookies`, then `direct-send-file`, and read the result:
-    - `🎉 SUCCESS` → file send works browser-free; wire it into the Telegram bot.
-    - `⚠ error 500 ... part key: 0 ..._<ip>` with a **changing** ip → cookie didn't pin;
-      work through fallbacks A→D above (Approach B, capturing the worker's real request
-      headers, is the definitive one).
+- Text send, file send (incl. multi-part), contact import via bridge handover, and
+  peer-learning are all DONE. There is no open blocker in `direct/`.
+- The engine is reachable from the panel as `hybrid` (direct HTTPS with the page as a
+  per-recipient fallback) and, behind `MKWL_ENABLE_DIRECT=1`, as pure `direct`.
+- The two remaining `direct/`-specific improvements, both optional:
+  1. Source token1/token2 from the session export (localStorage `token`) instead of the
+     newest capture, which would remove the staleness window `MKWL_CONTEXT_MAX_AGE_H`
+     currently papers over.
+  2. Reverse the Eitaa-specific `User` row in `contacts.importedContacts` — the last
+     thing forcing a browser pass for contacts.
 - Everything is ISOLATED in `direct/`; deleting the folder reverts the project. The
   browser bot still works and is untouched.
-- I (the assistant) cannot run live here (no Playwright/network/crypto libs in the
-  sandbox): I only compile + run `python -m direct.tests.test_direct` (ALL PASS). The
-  user runs on their server `~/Mkwlsoso` (venv `.venv`, `DISPLAY=:99`) and pastes output.
-- Push via the GitHub power, never raw `git push`. Branch: `feat/eitaa-web-capture` (PR #1).
+- The assistant cannot run live (no Playwright/network in the sandbox) — it compiles and
+  runs the offline suites (`python -m direct.tests.test_direct` and the 15 under
+  `bot/tests/`; all 16 pass). The user runs live on the server and pastes output back.
 - Secrets (tokens/cookies/peers) live ONLY in gitignored `artifacts/sessions/*.json` on
   the server, never in the repo or learnings.
 

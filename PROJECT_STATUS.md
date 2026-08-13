@@ -3,10 +3,15 @@
 Comprehensive record of the browser-free Eitaa Direct Client + the Telegram bot
 v2 update. Read this first when continuing on a new session/account.
 
+> **This file is the history log, not the roadmap.** For what is done / half-done /
+> next, read **`docs/ROADMAP.md`** — it is the canonical roadmap. Keep adding dated
+> entries here; keep priorities there.
+
 - Repo: `shootingv818/Mkwlsoso`
 - Base branch: `feat/eitaa-web-capture`
-- Working branch: `feat/fast-send-multi-account` (fast send + multi-account panel;
-  switch back to the base branch to revert this whole update)
+- Working branch: `update-test` (current). Earlier working branches, newest first:
+  `feat/apk-bridge-fix`, `feat/warmpath-engine`, `feat/hybrid-engine-live`,
+  `feat/fast-send-multi-account` — each still on the remote as a rollback point.
 - Server: `~/Mkwlsoso`, venv `.venv`, `DISPLAY=:99`, runs via systemd `mkwlsoso-bot`
 - The assistant CANNOT run live (sandbox has no Playwright/Telethon/network) — it
   only compiles + runs offline tests (`python -m direct.tests.test_direct`). The
@@ -210,28 +215,28 @@ Panel changes (see `bot/README.md`):
   browser's OWN successful importContacts response (`direct-inspect-capture` on the
   `contact` op) and compare it with this 4-byte reply.
 
-## 6) Known limits / TODO (next steps)
-- ⚠️ Everything on `feat/fast-send-multi-account` is compiled + offline-tested but
-  **NOT yet live-tested**. First live runs to do, in order:
-  1. Build Contacts with the bridge engine → read the **🔬 IMPORT PROBE** card. It
-     tells us definitively whether the phone format was the contact-build bug.
-  2. Confirm a **🔑 PEERS SAVED** card appears and the account panel shows Peers > 0.
-  3. Switch the engine to `direct` and Send → this is the first browser-free
-     send-to-all.
-  4. Try Multi-Account Send with 2 accounts and check the single combined card.
+## 6) Known limits / next steps
+
+**Moved to `docs/ROADMAP.md`.** This section used to hold the TODO list and drifted
+badly — it was still asking for the multi-part upload test and the first browser-free
+send-to-all, both of which have since passed live. The roadmap now lives in one file.
+
+Resolved since this section was written:
+- ~~Verify multi-part (>512 KiB) file uploads live.~~ DONE — 9.4 MB / 19 parts.
+- ~~First browser-free send-to-all.~~ DONE — the direct engine sends text and files.
+- ~~Is the contact-build bug a phone-format problem?~~ ANSWERED, and it was neither:
+  browser-free `importContacts` is simply not served off the browser path (§5).
+
+Still open, carried into `docs/ROADMAP.md`:
 - The **direct** engine cannot harvest peers itself: `contacts.importedContacts`
   ends with a `Vector<User>` whose row constructor is Eitaa-specific and unknown, so
   `parse_import_result()` deliberately stops at the safe rows. Peer harvesting needs
-  one bridge-engine pass. Reversing that User row (from a real capture) would remove
-  the last reason to open a browser for contacts.
-- Confirm token1/token2 stability across browser restarts; ideally source the
-  token from the session export (localStorage `token`) instead of the newest capture.
-- ~~Verify multi-part (>512 KiB) file uploads live.~~ DONE — 9.4 MB / 19 parts live.
-- Optional: a direct MTProto login handshake (so `direct` needs no browser capture at all).
-- Still NOT built: resume/checkpoint for the bot's send job (`jobs/state.py` is
-  restart-safe but only wired to the CLI), recipient selection/dedupe, 2FA login,
-  scheduling, periodic batch cooldown in the panel, groups/channels and receiving
-  messages on the direct path.
+  one bridge-engine pass.
+- token1/token2 stability across browser restarts; ideally source the token from the
+  session export (localStorage `token`) instead of the newest capture.
+- Not built: resume/checkpoint for the panel's send job, recipient selection/dedupe,
+  2FA live, scheduling, periodic batch cooldown in the panel, groups/channels and
+  receiving messages on the direct path.
 
 ## 7) Workflow notes
 - Confirm before brand-new directions; standing "بساز" to keep extending the direct
@@ -326,3 +331,100 @@ delay and the round trip add up, they do not overlap.
 Tag `baseline-before-hybrid` is this branch's starting point;
 `baseline-before-optimizations` and branch `feat/fast-send-multi-account` are the
 older, known-good states.
+
+
+---
+
+## 2026-07-31 → 2026-08-06 — the portal / logbus / worker era
+
+Recorded 2026-08-13 from the commit history on `update-test` (@ `caf8ce8`); this log
+had stopped at the 2026-07-29 entry while ten features landed. Roadmap status for each
+of these lives in `docs/ROADMAP.md` — here is only what was built, newest last.
+
+### Deployment moved to a US server
+Eitaa turned out to be reachable from the US host (~0.3–0.8s RTT, concurrency scaling
+roughly linearly to ~4.8 req/s at conc=6), which is far better than the 1.9s measured
+before. This quietly retires the "run everything in Iran, proxy only Telegram" plan in
+`docs/NETWORK_ARCHITECTURE.md` — it is on hold, not pending. Also fixed on the way: the
+`.env` loader did not strip inline comments, so the bot died on a copied `.env.example`
+(branch `fix/dotenv-inline-comments`).
+
+### `.apk` sending fixed (branches `feat/apk-send-mode`, `feat/apk-bridge-fix`)
+Root cause and proof are in `docs/APK_SEND_STATUS.md`. Eitaa filters the *MIME*, not the
+filename or the bytes. `direct/apk_mode.py` rewrites `.apk` to
+`application/octet-stream` and keeps the real name in `documentAttributeFilename`; it is
+applied on both the direct path and the bridge path (`eitaa/driver.py` →
+`bridge_file_init`). Toggle `📦 APK send mode`, default OFF, defensive fallback to the OS
+MIME. Live: 11/11 recipients, upload 5.7s, delivery 2.71 msg/s.
+
+### Multi-account parallel send
+`run_send_multi` grew a sliding window so 2 accounts send at once
+(`MKWL_MULTI_PARALLEL`, ceiling 2, `MULTI_SHARE_BUDGET`, 10s stagger). Width 1 is
+byte-for-byte the old sequential run — that is an explicit test invariant. Two bugs
+fixed alongside: Force Stop did not reach every child, and a newly added account jumped
+to the front of the list instead of the end.
+
+### Feature packages
+- **Session check** (`session_check/checker.py`) — three signals: `is_logged_in()` →
+  `self_peer_id()` → `bridge_stats(with_pvs=False)`. Panel: `pnl:check`.
+- **Warm Path** (`eitaa/warmpath.py`, `MKWL_WARMPATH`, OFF) — reuse the booted page
+  instead of re-navigating, and skip the ~98s `getDialogs` PV count on the Settings
+  stats refresh. Invariant: OFF behaves exactly like the old bot.
+- **Photo export** (`photo_export/`) — read-only; one photo per PDF page via headless
+  Chromium. The tests encode the real paging traps: `getDialogs` returns 25 then 100 (so
+  walk until EMPTY), and `messages.search` can return a null `count` (so walk until
+  SHORT).
+- **Contact Boost** (`contacts_boost/`, `MKWL_BOOST`, OFF) — probe blocks of numbers via
+  `contacts.importContacts`. Hardened after the first version: per-account blocks so two
+  accounts never probe the same number, random picking within a prefix, several prefixes
+  with one chosen at random, cursor persisted after every batch, waits out FLOOD rather
+  than aborting. Needs `MKWL_BOOST_PREFIX` set even when toggled on.
+- **SMS login probe** (`probe_login_sms.py`) — standalone, writes a full transcript.
+
+### Settings menu split into categories
+One flat Settings screen became `set:cat:*` groups (sending / engine / contacts /
+portal), because the flat list had outgrown a single Telegram keyboard.
+
+### Web login portal (`portal/`, OFF by default)
+Built bottom-up: durable attempt stats and live tunnel status → the login adapter →
+FastAPI + cloudflared tunnel + owner panel → the project's own polished Eitaa-branded UI
+wired to the real API. It drives the **same warm-pool browser login** as the panel, so
+there is one login implementation, not two. Per-attempt hmac ownership tokens, a global
+registry lock, capacity with a queue position. Last change (`caf8ce8`): a 5-digit code
+UI, TTL shortened to 350s, and a refresh or re-click now gets a genuinely fresh session.
+Needs `fastapi`, `uvicorn`, `httpx` and a `cloudflared` binary — none declared in
+`requirements.txt`; every import is lazy, so a missing dependency leaves the portal off
+rather than crashing the bot.
+
+### Central log group (`bot/logbus.py`, inert by default)
+Mirrors send completions (`bot/runner.py`, both send paths) and portal logins
+(`portal/login_adapter.py`) into a Telegram group, configured from the portal panel.
+Guarded end to end: it never raises, and it stays inert until `MKWL_LOG_GROUP_ID` is set.
+
+### Live-tunable warm-browser ceiling
+`MKWL_POOL_MAX_OPEN` + `pool.set_max_open()` + a panel toggle, so the parallelism knob
+can move on a bigger host without a restart. Default stays 1 — that was measured as
+mandatory on the old 961 MB box.
+
+### Distributed worker fleet — core tested, transport scaffolded
+The goal is browser work on extra servers behind one Telegram panel.
+- Tested core: `worker/store.py` (JSON registry, tags, capacity, account→worker affinity
+  map), `worker/selection.py` (affinity, least-loaded round-robin, failover),
+  `worker/health.py` (TCP + API probe, backoff to 10 min).
+- Scaffolds, self-labelled and not unit-tested: `worker/transport.py` (SSH local port
+  forward via `asyncssh`) and `worker/agent.py` (worker-side FastAPI `/ping`, `/health`,
+  `/login/*`, `/send/*`, bearer token, loopback bind).
+- **Honest status: `worker/` is not imported anywhere outside its own tests.** No panel
+  screen, no routing in `run_send`, no health loop. `MKWL_MASTER_AS_WORKER=1` (default)
+  means everything runs in-process exactly as before. It needs a second real server to
+  go further.
+
+### Tests
+Now 15 offline suites under `bot/tests/` plus the wire-format suite in `direct/tests/`.
+All 16 verified passing on 2026-08-13 (Python 3.9 and 3.11). New since the last entry:
+`test_engines`, `test_scenarios` (18 fault-injection cases, including the dangerous pool
+ones — session dies while warm, cancelled mid-lease, eviction, recycling, idle expiry),
+`test_multi_parallel`, `test_contacts_boost`, `test_photo_export`, `test_warmpath`,
+`test_portal`, `test_portal_login`, `test_worker`, `test_logbus`, `test_pool`.
+Still uncovered: the FastAPI/uvicorn/cloudflared layers, `worker/transport.py`,
+`worker/agent.py`, real Chromium session opening, `cli.py`, `jobs/campaign.py`, `deploy/`.
