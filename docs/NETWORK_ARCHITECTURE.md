@@ -140,8 +140,37 @@ Probed from the newly bought foreign server, 2026-07-30:
 Silently dropped, not refused: there is no connection to retry or tune. Eitaa
 traffic must originate from the Iranian host. This confirms the plan above.
 
-## Status
+## Status — ON HOLD, superseded in practice (updated 2026-08-13)
 
-Diagnosis confirmed. Plan not yet implemented; next step is to verify from the
-Iranian host that Eitaa is reachable, that Telegram is not, and that outbound
-443 to the foreign host works.
+**The plan below was never implemented, and currently does not need to be.**
+
+The diagnosis in this document is still correct: the *first* foreign server tested
+(`217.60.249.84`, US) was blackholed by Eitaa. But the server the project actually
+deployed to — a US host in Santa Clara — **can** reach Eitaa, at ~0.3–0.8s RTT with
+concurrency scaling roughly linearly (conc=6 ≈ 4.8 req/s). That is better than the
+~1.9s measured from the Iranian host that motivated this whole plan.
+
+So the shape is currently the opposite of what is described here, and it works:
+everything runs on one foreign host, Eitaa direct, Telegram direct, no proxy and no
+tunnel.
+
+What this means for the pieces below:
+
+| Piece | Status |
+|---|---|
+| Run everything on an Iranian host | Not needed while the current host reaches Eitaa |
+| Proxy Telegram via server B | Not needed — Telegram is reachable directly |
+| `bot/net.py` proxy-policy module | **Not built.** Still the right design if Eitaa ever blocks this host |
+| Panel `NETWORK` section on Home | Not built |
+| Real health probes (replacing the TCP-only `_ping_blocking`) | **Still worth doing regardless** — see below |
+| Reverse tunnel / rathole | Fallback only; unchanged |
+
+**The one item here that is still live work:** the health check. `bot/app.py`
+`_ping_blocking()` only opens a TCP socket to `PING_HOST`, so it stays green when the
+envelope token has expired or the balancer node changed. That is process liveness, not
+service health, and it is misleading on *any* host. The real probes described above
+(a `direct-replay`-style call for Eitaa, `bot.get_me()` for Telegram) are independent of
+where the bot runs. Tracked in `docs/ROADMAP.md`.
+
+Reopen this document if Eitaa starts refusing the current host — the measurements and
+the tool comparison are still valid.

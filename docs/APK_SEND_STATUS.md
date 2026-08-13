@@ -1,13 +1,25 @@
 # APK send — investigation, root cause, fix, and roadmap
 
-## Where we are (2026-07-31)
+## Where we are — RESOLVED (updated 2026-08-13)
 
-The bot is deployed and working on a US server (Santa Clara): online, connected
-to Telegram, logged in to Eitaa, text + normal files (zip/pdf/txt) send fine.
-The one broken case — **sending `.apk` files** — is now fully diagnosed and the
-fix is proven end-to-end. The fix itself is NOT yet wired into the product code
-(awaiting go-ahead); everything below the diagnostics line is confirmed by live
-tests to the owner's own account and contacts.
+**This investigation is closed. `.apk` sending works on both paths.**
+
+The bot is deployed and working on a US server (Santa Clara): online, connected to
+Telegram, logged in to Eitaa, text + normal files (zip/pdf/txt) send fine — and `.apk`
+now does too. Eitaa filters the *MIME*, not the filename or the bytes; sending as
+`application/octet-stream` with the real name in `documentAttributeFilename` delivers.
+
+The fix is wired into the product on **both** the direct and the bridge path (see
+"DONE" below), behind the `📦 APK send mode` toggle, which is **OFF by default** — OFF
+is byte-identical to the old behaviour. Everything below is confirmed by live tests to
+the owner's own account and contacts.
+
+> Note: the paragraph that used to sit here said the fix was "NOT yet wired into the
+> product code (awaiting go-ahead)". That was true when written on 2026-07-31 and was
+> superseded later the same week by the section below, which contradicted it. Corrected.
+
+The only remaining item is optional and unrelated to apk delivery: a retry on
+`locate_failed` during browser upload. Tracked in `docs/ROADMAP.md`.
 
 ## The problem, in one line
 
