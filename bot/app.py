@@ -171,7 +171,20 @@ def delete_account_files(account: str) -> list[str]:
 
 
 def is_owner(event) -> bool:
-    return config.OWNER_ID and event.sender_id == config.OWNER_ID
+    """May the sender use the panel?
+
+    Now an allow-LIST (owner + MKWL_ADMIN_IDS) rather than a single id. The name
+    is kept because it is the gate every handler already calls, and the meaning is
+    unchanged from each handler's point of view: "this user is permitted".
+
+    Everyone on the list gets the SAME access -- there are no partial roles, so an
+    admin can add accounts, send, and delete things exactly like the owner. Only
+    add ids you would hand the server to.
+
+    Fails CLOSED: no owner and no admins configured means nobody is allowed,
+    which is the behaviour the previous single-id check also had.
+    """
+    return config.is_allowed(getattr(event, "sender_id", None))
 
 
 def _ping_blocking() -> int | None:
@@ -1744,7 +1757,15 @@ def main() -> None:
         print(f"[bot] logged in as @{me.username} (id={me.id})", flush=True)
     except Exception as exc:  # noqa: BLE001
         print(f"[bot] warning: could not fetch bot identity: {exc}", flush=True)
-    print(f"[bot] online. OWNER_ID={config.OWNER_ID} REPORT_TO={config.report_to()}", flush=True)
+    for w in config.ADMIN_ID_WARNINGS:
+        print(f"[auth] {w}", flush=True)
+    allowed = sorted(config.allowed_ids())
+    extra = [i for i in allowed if i != config.OWNER_ID]
+    print(f"[bot] online. OWNER_ID={config.OWNER_ID} REPORT_TO={config.report_to()}"
+          + (f" ADMINS={extra}" if extra else " ADMINS=none"), flush=True)
+    if not allowed:
+        print("[auth] WARNING: nobody is allowed to use the panel "
+              "(OWNER_ID and MKWL_ADMIN_IDS are both unset)", flush=True)
     # ---- login portal (isolated, opt-in). Guarded so a broken/absent portal
     # package or a missing fastapi can NEVER stop the bot from starting. ----
     try:
