@@ -775,9 +775,16 @@ async def _portal_cmd(event):
         await event.respond(f"Portal unavailable: {type(exc).__name__}: {exc}")
 
 
-@bot.on(events.NewMessage(pattern=r"^/start"))
 async def _handle_portal_cb(event, data: str):
-    """Portal panel callbacks (portal:*), delegated to portal.panel builders."""
+    """Portal panel callbacks (portal:*), delegated to portal.panel builders.
+
+    NOT an event handler: it is dispatched from the CallbackQuery handler with the
+    callback payload as `data`. It used to carry the `/start` decorator, which
+    registered this two-argument coroutine as the /start handler. Telethon then
+    called it with one argument, so every /start raised TypeError inside
+    Telethon's own handler guard -- invisible in journalctl -- while the real
+    panel entry point below was never registered at all.
+    """
     from portal import panel as _pp
     from portal import app as _papp
     from portal import net as _pnet, status as _pstatus
@@ -880,7 +887,9 @@ async def _handle_portal_cb(event, data: str):
     return await event.answer("unknown portal action", alert=True)
 
 
+@bot.on(events.NewMessage(pattern=r"^/start"))
 async def _start(event):
+    """The panel entry point. Keep this decorator attached to THIS function."""
     if not is_owner(event):
         try:
             await event.respond("This panel is private.")
