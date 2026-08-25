@@ -319,6 +319,22 @@ class Config:
         return out
 
     @classmethod
+    def admin_warnings(cls) -> list[str]:
+        """Problems found parsing MKWL_ADMIN_IDS.
+
+        A method on Config rather than a bare module global because callers do
+        `from config import config` and get the INSTANCE -- reading a module-level
+        name off it raises AttributeError, which is exactly how the first version
+        of this crashed the bot at startup.
+
+        Calls allowed_ids() first so the list is actually populated: parsing is
+        lazy, so reading the warnings before anything has parsed returns nothing
+        and the misconfiguration stays invisible.
+        """
+        cls.allowed_ids()
+        return list(ADMIN_ID_WARNINGS)
+
+    @classmethod
     def is_allowed(cls, user_id: object) -> bool:
         """May this Telegram user id use the panel?
 

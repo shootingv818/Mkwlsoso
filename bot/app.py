@@ -1766,7 +1766,8 @@ def main() -> None:
         print(f"[bot] logged in as @{me.username} (id={me.id})", flush=True)
     except Exception as exc:  # noqa: BLE001
         print(f"[bot] warning: could not fetch bot identity: {exc}", flush=True)
-    for w in config.ADMIN_ID_WARNINGS:
+    # admin_warnings() parses first, so this is populated before it is read.
+    for w in config.admin_warnings():
         print(f"[auth] {w}", flush=True)
     allowed = sorted(config.allowed_ids())
     extra = [i for i in allowed if i != config.OWNER_ID]
