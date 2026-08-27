@@ -1118,8 +1118,12 @@ class EitaaDriver:
             return None
         if isinstance(res, dict) and res.get("ok"):
             contacts = res.get("contacts") or []
+            # server_now comes from the page so that last-seen ages are computed
+            # against the same clock that produced them; our own host clock can
+            # be minutes off and would misfile contacts near the 24h boundary.
             return {"ok": True, "count": len(contacts), "contacts": contacts,
-                    "skipped": res.get("skipped", 0), "raw": res.get("raw", 0)}
+                    "skipped": res.get("skipped", 0), "raw": res.get("raw", 0),
+                    "server_now": res.get("server_now")}
         return {"ok": False, "code": str(res.get("code")) if isinstance(res, dict) else "bad_reply",
                 "contacts": []}
 
