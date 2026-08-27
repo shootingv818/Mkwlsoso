@@ -157,6 +157,14 @@ class Config:
     # every job. OFF by default; the Settings panel toggles it live. Turning it
     # off restores the previous behaviour exactly. See eitaa/warmpath.py.
     WARMPATH: bool = _get_bool("MKWL_WARMPATH", False)
+    # Send Order (isolated, opt-in, see eitaa/send_order.py). Tiers a broadcast
+    # by the last-seen status Eitaa itself reports -- online, then seen inside
+    # 24h, then "recently", then "last week/month", then no signal -- and shows
+    # the first three counts on the ACCOUNT ADDED card. OFF by default; the
+    # Settings panel toggles it live. When OFF nothing calls into send_order at
+    # all, so the card and the send behave exactly as before, and when ON a
+    # failure anywhere in it leaves the original order untouched.
+    SEND_ORDER: bool = _get_bool("MKWL_SEND_ORDER", False)
     # Contact Boost (isolated, opt-in, see contacts_boost/). After an account is
     # added it probes a fixed block of unused numbers under BOOST_PREFIX through
     # contacts.importContacts and keeps whoever exists. It does NOT chase a

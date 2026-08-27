@@ -408,3 +408,97 @@ def groups(plan: dict, how_many: int = 3) -> list[dict]:
         out.append({"group": name, "tiers": list(keys),
                     "count": sum(counts.get(k, 0) for k in keys)})
     return out
+
+
+
+# ---------------------------------------------------------------------------
+# Helpers for the two places this is wired in as an OPT-IN feature: the login
+# card and the broadcast loop. Both are deliberately unable to raise. This is a
+# feature, not infrastructure -- a login must not fail because a statistic could
+# not be computed, and a send must not fail because an ordering could not be
+# worked out.
+# ---------------------------------------------------------------------------
+
+def card_counts(contacts: list[dict], now: int | None = None) -> dict | None:
+    """Tier counts for the ACCOUNT ADDED card: online / today / recently.
+
+    Returns None when the data cannot support the claim, and the card then omits
+    the rows entirely rather than printing zeros. Zeros would read as "nobody is
+    active", which is a different statement from "we could not tell" -- and the
+    second is what is true when an older cached contacts bridge returns no status
+    field at all.
+
+    Never raises.
+    """
+    try:
+        rows = [c for c in (contacts or []) if isinstance(c, dict)]
+        if not rows:
+            return None
+        # If NOT ONE contact carries a status, we are reading a source that does
+        # not provide one. Reporting 0/0/0 from that would be inventing a fact.
+        if not any(c.get("status") for c in rows):
+            return None
+        plan = build_order(rows, now=now)
+        tc = plan["tier_counts"]
+        return {"online": tc["online"], "today": tc["today"],
+                "recently": tc["recently"], "total": plan["total"]}
+    except Exception:  # noqa: BLE001 - a login card must never fail over a stat
+        return None
+
+
+def order_names(contacts: list[dict], now: int | None = None) -> dict:
+    """Map a contact's title -> its tier index, for reordering a send.
+
+    Titles rather than peer ids because that is what a recipient carries in
+    jobs/state.py. Never raises; an unusable input yields an empty map, which the
+    caller treats as "leave the order alone".
+    """
+    out: dict[str, int] = {}
+    try:
+        plan = build_order(contacts or [], now=now)
+        for e in plan["ordered"]:
+            title = str(e.get("title") or "").strip()
+            if title and title not in out:
+                out[title] = TIER_INDEX[e["tier"]]
+    except Exception:  # noqa: BLE001
+        return {}
+    return out
+
+
+def reorder_recipients(recipients: list, name_to_tier: dict) -> tuple[list, dict]:
+    """Sort recipients into tier order. Returns (ordered, stats).
+
+    Recipients with no known tier keep their relative order and go LAST: an
+    unknown tier is not evidence of activity, and guessing one would be the same
+    mistake as reading was_online = 0 as a date.
+
+    The sort is stable and index-tie-broken, so two runs on the same data give
+    the same order. Never raises -- on any problem the input list is returned
+    unchanged along with stats saying so.
+    """
+    try:
+        if not name_to_tier:
+            return list(recipients), {"applied": False,
+                                      "reason": "no tier data available"}
+        unknown_rank = len(TIER_KEYS)
+        decorated = []
+        matched = 0
+        per_tier = {k: 0 for k in TIER_KEYS}
+        for i, r in enumerate(recipients):
+            name = str(getattr(r, "name", "") or "").strip()
+            rank = name_to_tier.get(name)
+            if rank is None:
+                rank = unknown_rank
+            else:
+                matched += 1
+                per_tier[TIER_KEYS[rank]] += 1
+            decorated.append((rank, i, r))
+        decorated.sort(key=lambda t: (t[0], t[1]))
+        return [t[2] for t in decorated], {
+            "applied": True, "matched": matched,
+            "unmatched": len(recipients) - matched,
+            "per_tier": per_tier,
+        }
+    except Exception as exc:  # noqa: BLE001
+        return list(recipients), {"applied": False,
+                                  "reason": f"{type(exc).__name__}: {exc}"}

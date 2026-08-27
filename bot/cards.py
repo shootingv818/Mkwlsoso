@@ -562,16 +562,36 @@ def panel_home(accounts: int, ready: int, active: str | None,
 
 
 def account_added(account: str, phone: str, contacts: int | None, pvs: int | None,
-                  engine: str | None = None, saved: int | None = None) -> str:
+                  engine: str | None = None, saved: int | None = None,
+                  tiers: dict | None = None) -> str:
+    """The card posted after a successful login.
+
+    `tiers` is the optional Send Order summary ({online, today, recently}). It is
+    None whenever that feature is off, or whenever the status data could not
+    support the counts -- and then these rows are simply absent. They are never
+    shown as zeros, because 0/0/0 reads as "nobody is active" while the truth in
+    that case is "we could not tell", and those are different statements.
+    """
+    rows: list[tuple[str, object]] = [
+        ("Phone   ", phone),
+        ("Contacts", f"{contacts:,}" if isinstance(contacts, int) and contacts >= 0 else "—"),
+        ("Chats   ", pvs if isinstance(pvs, int) and pvs >= 0 else "—"),
+        ("Saved   ", f"{saved:,}" if saved else None),
+    ]
+    if tiers:
+        total = tiers.get("total") or 0
+        def _row(n):
+            n = int(n or 0)
+            return f"{n:,}" + (f"  ({n * 100.0 / total:.1f}%)" if total else "")
+        rows += [
+            ("Online  ", _row(tiers.get("online"))),
+            ("Today   ", _row(tiers.get("today"))),
+            ("Recently", _row(tiers.get("recently"))),
+        ]
+    rows.append(("Time    ", now_hms()))
     return card(
         "✅ ACCOUNT ADDED",
-        [
-            ("Phone   ", phone),
-            ("Contacts", f"{contacts:,}" if isinstance(contacts, int) and contacts >= 0 else "—"),
-            ("Chats   ", pvs if isinstance(pvs, int) and pvs >= 0 else "—"),
-            ("Saved   ", f"{saved:,}" if saved else None),
-            ("Time    ", now_hms()),
-        ],
+        rows,
         footer=("Contacts saved — this account is ready to send." if saved else
                 "Logged in, but no contacts came back. Add contacts in Eitaa, then tap "
                 "🔄 Update Contacts on this account."),

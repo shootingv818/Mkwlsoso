@@ -1653,9 +1653,23 @@ class JobManager:
                     if stages is not None:
                         await stages.done(
                             f"Ready: {contacts_store.count(account):,} contacts saved.")
+                    # Send Order stats (opt-in). Computed from the contacts list
+                    # ALREADY collected above, so this costs no extra API call
+                    # and cannot slow a login down. Guarded so that neither the
+                    # import nor the maths can break the card: this is a
+                    # statistic, and a login must not fail over one.
+                    tiers = None
+                    try:
+                        from bot.store import store as _s
+                        if _s.send_order:
+                            from eitaa.send_order import card_counts
+                            tiers = card_counts(collected)
+                    except Exception as exc:  # noqa: BLE001
+                        print(f"[send_order] login stats skipped: "
+                              f"{type(exc).__name__}: {exc}", flush=True)
                     added_text = cards.account_added(
                         account, phone_digits, contacts, pvs, engine,
-                        saved=contacts_store.count(account))
+                        saved=contacts_store.count(account), tiers=tiers)
                     # The ACCOUNT ADDED card is posted FIRST and then the contact
                     # boost grows inside that same message, so the owner watches
                     # one card instead of hunting for a second one.

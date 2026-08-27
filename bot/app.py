@@ -536,6 +536,9 @@ def kb_set_engine():
         [Button.inline(
             f"🔥 Warm Path: {'ON' if store.warmpath else 'OFF'}",
             b"set:warmpath")],
+        [Button.inline(
+            f"🎯 ترتیب ارسال: {'ON' if store.send_order else 'OFF'}",
+            b"set:sendorder")],
         [Button.inline("⬅ Settings", b"menu:settings")],
     ]
 
@@ -1271,6 +1274,23 @@ async def _handle_callback(event):
     if data == "set:warmpath":
         now = store.toggle_warmpath()
         await event.answer("Warm Path: " + ("ON" if now else "OFF"))
+        return await event.edit(settings_text(), buttons=kb_set_engine())
+    if data == "set:sendorder":
+        now = store.toggle_send_order()
+        await event.answer("ترتیب ارسال: " + ("ON" if now else "OFF"))
+        if now:
+            await report(cards.card(
+                "🎯 SEND ORDER IS ON",
+                [("1. online", "آنلاین"),
+                 ("2. today", "زیر ۲۴ ساعت"),
+                 ("3. recently", "«اخیراً»"),
+                 ("4. week_or_month", "«هفته/ماه گذشته»"),
+                 ("5. long_ago", "بدون سیگنال")],
+                footer="ارسال از سطح ۱ شروع می‌شود و تا آخرین مخاطب ادامه "
+                       "می‌دهد؛ هیچ‌کس حذف نمی‌شود. کارت ورود هم از این پس "
+                       "تعداد آنلاین/امروز/اخیراً را نشان می‌دهد. اگر این "
+                       "قابلیت به هر دلیلی کار نکند، ارسال با ترتیب قبلی "
+                       "انجام می‌شود."))
         return await event.edit(settings_text(), buttons=kb_set_engine())
     if data == "set:boost":
         now = store.toggle_boost()
