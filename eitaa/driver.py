@@ -63,6 +63,13 @@ try:
 except Exception:  # noqa: BLE001
     _SESSION_EXPORT_SRC = ""
 
+# Source of the LIVE presence bridge (window.__MKWL_livePresence).
+try:
+    _PRESENCE_SRC = (
+        Path(__file__).with_name("presence.js")).read_text(encoding="utf-8")
+except Exception:  # noqa: BLE001
+    _PRESENCE_SRC = ""
+
 # Source of the in-page transport probe (window.__MKWL_txDump).
 try:
     _TRANSPORT_PROBE_SRC = (Path(__file__).with_name("transport_probe.js")).read_text(encoding="utf-8")
@@ -1129,6 +1136,54 @@ class EitaaDriver:
                     "server_now": res.get("server_now")}
         return {"ok": False, "code": str(res.get("code")) if isinstance(res, dict) else "bad_reply",
                 "contacts": []}
+
+    _PRESENCE_PROBE = "() => typeof window.__MKWL_livePresence === 'function'"
+
+    async def ensure_presence_bridge(self) -> bool:
+        """Make sure window.__MKWL_livePresence is defined."""
+        try:
+            if await self.page.evaluate(self._PRESENCE_PROBE):
+                return True
+        except Exception:  # noqa: BLE001
+            pass
+        if not _PRESENCE_SRC:
+            return False
+        try:
+            await self.page.evaluate(_PRESENCE_SRC)
+            return await self.page.evaluate(self._PRESENCE_PROBE)
+        except Exception:  # noqa: BLE001
+            return False
+
+    async def bridge_live_presence(self, batch: int = 100) -> dict:
+        """Contacts with CURRENT last-seen statuses, plus proof of freshness.
+
+        Unlike bridge_contacts_list, this does not trust contacts.getContacts --
+        that call was measured returning a snapshot frozen at session start for
+        105 minutes, through a wait and a reload. It verifies the socket with
+        updates.getState, un-hides the page so tweb resumes its update loop
+        (under xvfb the document is hidden forever, which is why no updates ever
+        arrived), then pulls fresh user objects via users.getUsers.
+
+        Returns the bridge's own dict including `presence_age_sec`,
+        `server_date`, `clock_offset` and a non-empty `errors` list when any
+        batch failed. Errors are propagated rather than reduced to a bool,
+        because a partial roster and a complete one are not the same result and
+        must not look alike to the caller.
+        """
+        if not await self.ensure_presence_bridge():
+            return {"ok": False, "code": "presence bridge unavailable",
+                    "errors": ["could not install window.__MKWL_livePresence"]}
+        try:
+            res = await self.page.evaluate(
+                "(b) => window.__MKWL_livePresence({ batch: b })", batch)
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False,
+                    "code": f"{type(exc).__name__}: {exc}",
+                    "errors": [f"evaluate failed: {type(exc).__name__}: {exc}"]}
+        if not isinstance(res, dict):
+            return {"ok": False, "code": "bad reply from presence bridge",
+                    "errors": ["bridge returned a non-dict"]}
+        return res
 
     _CONTACTS_BRIDGE_PROBE = (
         "() => typeof window.__MKWL_importContacts === 'function'"

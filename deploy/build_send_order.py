@@ -82,7 +82,12 @@ def report(plan: dict, timings: dict, raw: int, skipped: int) -> None:
     say("  " + "-" * 62)
     width = max(len(k) for k, _ in TIERS)
     cum = 0
+    pres = plan.get("presence") or {}
     for key, label in TIERS:
+        # Tier 1's label is earned, not fixed. If freshness was not proven, the
+        # report must say so on the line itself, where it cannot be missed.
+        if key == "online" and pres.get("tier1_label"):
+            label = pres["tier1_label"]
         n = plan["tier_counts"].get(key, 0)
         cum += n
         pct = (n * 100.0 / total) if total else 0.0
@@ -177,40 +182,92 @@ async def run(args) -> int:
                 return 2
             timings["login check"] = time.time() - t0
 
+            # LIVE presence first. contacts.getContacts was measured returning a
+            # snapshot frozen at session start for 105 minutes, so it is the
+            # fallback, not the default.
             t0 = time.time()
-            res = await drv.bridge_contacts_list()
-            timings["getContacts"] = time.time() - t0
+            live = await drv.bridge_live_presence(batch=args.batch)
+            timings["live presence"] = time.time() - t0
+
+            res, source = live, "live"
+            if not live.get("ok"):
+                print("")
+                print("  live presence bridge FAILED — falling back to the frozen")
+                print("  contacts.getContacts path. Tier 1 will be labelled stale.")
+                print(f"    code: {live.get('code')}")
+                for e in (live.get("errors") or [])[:5]:
+                    print(f"    error: {e}")
+                t0 = time.time()
+                res, source = await drv.bridge_contacts_list(), "snapshot"
+                timings["getContacts fallback"] = time.time() - t0
     except Exception as exc:  # noqa: BLE001
         print(f"  FAILED: {type(exc).__name__}: {exc}")
         print("  Check DISPLAY=:99, xvfb, and that the account session is live.")
         return 1
 
     if res is None:
-        print("  FAILED: the contacts bridge could not be installed in the page.")
+        print("  FAILED: no contacts source worked at all.")
         return 1
     if not res.get("ok"):
-        print(f"  FAILED: getContacts returned: {res.get('code')}")
+        print(f"  FAILED: {res.get('code')}")
+        for e in (res.get("errors") or [])[:5]:
+            print(f"    error: {e}")
         return 1
 
-    contacts = res.get("contacts") or []
-    if contacts and "status" not in contacts[0]:
-        print("  ABORT: the page returned contacts WITHOUT a status field.")
-        print("  That means an older contacts_list.js is cached in the browser")
-        print("  session. Restart the browser session so the updated bridge")
-        print("  loads, otherwise every contact would be filed as long_ago.")
-        return 1
-
-    # The page's clock at the moment of the fetch. This is the HOST's clock, not
-    # Eitaa's -- see send_order.py on why `expires` is therefore not trusted.
-    now = res.get("server_now") or int(time.time())
+    if source == "live":
+        contacts = res.get("roster") or []
+        now = int(res.get("server_now") or time.time())
+        presence_age = res.get("presence_age_sec")
+        presence_source = "users.getUsers (live)"
+        raw, skipped = int(res.get("store_ids") or 0), 0
+        print("")
+        print("  LIVE PRESENCE — the evidence, before any tiering")
+        print("  " + "-" * 62)
+        print(f"    socket verified     : "
+              f"{'yes' if res.get('connected') else 'NO'}"
+              f"   (updates.getState in {res.get('getstate_ms', '?')}ms)")
+        off = res.get("clock_offset")
+        print(f"    host vs server clock: "
+              + (f"{off:+d}s (measured, not assumed)" if off is not None
+                 else "unknown"))
+        un = res.get("unhide") or {}
+        was = (un.get("before") or {}).get("state")
+        print(f"    page visibility     : was {was!r} -> "
+              f"{(un.get('after') or {}).get('state', '?')!r}"
+              f"   (hidden pages get no updates from tweb)")
+        print(f"    marked self online  : {res.get('marked_online')}")
+        print(f"    fresh user objects  : {res.get('count', 0):,} in "
+              f"{res.get('batches', 0)} batches ({res.get('fetch_ms', 0)}ms)")
+        if res.get("failed_batches"):
+            print(f"    FAILED batches      : {res['failed_batches']} — the roster "
+                  f"is INCOMPLETE")
+        if res.get("unbuildable_ids"):
+            print(f"    unbuildable ids     : {res['unbuildable_ids']}")
+        print(f"    newest last-seen    : "
+              f"{time.strftime('%H:%M:%S', time.localtime(res['newest_was_online'])) if res.get('newest_was_online') else '-'}"
+              f"   age {presence_age if presence_age is not None else '?'}s")
+        for e in (res.get("errors") or [])[:5]:
+            print(f"    error: {e}")
+    else:
+        contacts = res.get("contacts") or []
+        now = int(res.get("server_now") or time.time())
+        presence_age, presence_source = None, "contacts.getContacts (snapshot)"
+        raw = int(res.get("raw") or 0)
+        skipped = int(res.get("skipped") or 0)
+        if contacts and "status" not in contacts[0]:
+            print("  ABORT: the page returned contacts WITHOUT a status field.")
+            print("  That means an older contacts_list.js is cached in the browser")
+            print("  session. Restart the browser session so the updated bridge")
+            print("  loads, otherwise every contact would be filed as long_ago.")
+            return 1
 
     t0 = time.time()
-    plan = build_order(contacts, now=now)
+    plan = build_order(contacts, now=now, presence_age=presence_age,
+                       presence_source=presence_source)
     timings["tiering"] = time.time() - t0
     timings["total"] = time.time() - t_start
 
-    report(plan, timings, raw=int(res.get("raw") or 0),
-           skipped=int(res.get("skipped") or 0))
+    report(plan, timings, raw=raw, skipped=skipped)
     preview(plan, args.limit, args.show_titles)
 
     if not args.no_save:
@@ -219,6 +276,12 @@ async def run(args) -> int:
         out.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "account": args.account, "built_at": time.time(), "server_now": now,
+            "source": source, "presence": plan.get("presence", {}),
+            "live_evidence": {k: res.get(k) for k in (
+                "connected", "clock_offset", "getstate_ms", "batches",
+                "failed_batches", "unbuildable_ids", "marked_online",
+                "newest_was_online", "presence_age_sec", "errors")}
+            if source == "live" else {},
             "tier_counts": plan["tier_counts"],
             "reason_counts": plan["reason_counts"],
             "warnings": plan["warnings"],
@@ -255,6 +318,8 @@ def main() -> int:
                     help="print contact names instead of peer ids")
     ap.add_argument("--no-save", action="store_true",
                     help="report only, write no file")
+    ap.add_argument("--batch", type=int, default=100,
+                    help="users.getUsers batch size (default 100)")
     args = ap.parse_args()
     try:
         return asyncio.run(run(args))

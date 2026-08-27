@@ -97,6 +97,11 @@ TIER_KEYS: list[str] = [k for k, _ in TIERS]
 TIER_INDEX: dict[str, int] = {k: i for i, k in enumerate(TIER_KEYS)}
 TIER_LABEL: dict[str, str] = dict(TIERS)
 
+#: How old presence data may be before tier 1 stops being allowed to call itself
+#: "online right now". Telegram's own online window is ~5 minutes, so beyond this
+#: the claim is simply untrue.
+LIVE_PRESENCE_MAX_SEC = 300
+
 #: Reasons that mean the premise of this design no longer holds. Surfaced as
 #: warnings instead of being absorbed silently.
 #:
@@ -197,7 +202,32 @@ def _sort_rank(tier: str, was_online) -> int:
     return 0
 
 
-def build_order(contacts: list[dict], now: int | None = None) -> dict:
+def presence_verdict(presence_age: int | None, source: str | None = None) -> dict:
+    """Decide whether tier 1 has EARNED the name "online right now".
+
+    Tier 1 is the only tier that claims a moment. The others claim a day or a
+    week and survive being minutes old, but "online right now" is false the
+    instant the data is an hour stale -- and it was false for a long time
+    without anything looking wrong, which is the part worth engineering against.
+
+    contacts.getContacts was measured returning presence frozen at session start
+    for 105 minutes straight. So freshness is never assumed here: a caller that
+    cannot prove an age gets the degraded label, not the benefit of the doubt.
+    """
+    live = presence_age is not None and presence_age <= LIVE_PRESENCE_MAX_SEC
+    if live:
+        label = "online right now (verified live)"
+    elif presence_age is None:
+        label = "online as of the last sync (freshness UNKNOWN)"
+    else:
+        label = f"online as of {_dur(presence_age)} ago (stale)"
+    return {"live": live, "age_sec": presence_age, "source": source,
+            "tier1_label": label}
+
+
+def build_order(contacts: list[dict], now: int | None = None,
+                presence_age: int | None = None,
+                presence_source: str | None = None) -> dict:
     """Order contacts for a broadcast. Returns the plan plus why it looks so.
 
     Each entry keeps its original fields and gains `tier` and `reason`. Input is
@@ -258,6 +288,20 @@ def build_order(contacts: list[dict], now: int | None = None) -> dict:
     warnings: list[str] = []
     observations: list[str] = []
 
+    presence = presence_verdict(presence_age, presence_source)
+    if tier_counts["online"] and not presence["live"]:
+        # A WARNING, not an observation. Tier 1 exists to reach people who are
+        # online, and unverifiable presence means it may be reaching whoever
+        # happened to be online whenever the data froze.
+        warnings.append(
+            "tier 1 cannot be called 'online right now': presence age is "
+            + (f"{_dur(presence_age)}" if presence_age is not None else "UNKNOWN")
+            + f", past the {_dur(LIVE_PRESENCE_MAX_SEC)} limit. It is labelled "
+            f"'{presence['tier1_label']}' instead. Build the order from the live "
+            f"presence bridge (eitaa/presence.js) rather than "
+            f"contacts.getContacts, which was measured frozen at session start "
+            f"for 105 minutes.")
+
     if expiry_past:
         observations.append(
             f"{expiry_past} online contact(s) reported an `expires` already in "
@@ -303,6 +347,7 @@ def build_order(contacts: list[dict], now: int | None = None) -> dict:
         "observations": observations,
         "clock": {"online_expires_in_past": expiry_past,
                   "online_expires_behind_max_sec": expiry_past_max},
+        "presence": presence,
     }
 
 

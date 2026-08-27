@@ -187,7 +187,7 @@ def test_reproduces_the_live_census() -> None:
     check("the fixture is the same size as the real account", len(rows) == 1006,
           len(rows))
 
-    plan = build_order(rows, now=NOW)
+    plan = build_order(rows, now=NOW, presence_age=30)
     tc = plan["tier_counts"]
     expect = {"online": 9, "today": 209, "recently": 76,
               "week_or_month": 416, "long_ago": 296}
@@ -273,7 +273,8 @@ def test_online_is_never_demoted_by_our_clock() -> None:
 
     # Reproduce the live shape: 9 online, every expires in the past.
     plan = build_order([c(i, "userStatusOnline", expires=NOW - 300 - i)
-                        for i in range(9)], now=NOW)
+                        for i in range(9)], now=NOW, presence_age=30,
+                       presence_source="users.getUsers (live)")
     check("all 9 land in tier 1", plan["tier_counts"]["online"] == 9,
           plan["tier_counts"])
     check("tier 2 stays empty", plan["tier_counts"]["today"] == 0)
@@ -350,7 +351,7 @@ def test_reproduces_the_live_build_run() -> None:
     add(260, "userStatusEmpty")
     check("same size as the real account", len(rows) == 1006, len(rows))
 
-    plan = build_order(rows, now=NOW)
+    plan = build_order(rows, now=NOW, presence_age=30)
     tc = plan["tier_counts"]
     expect = {"online": 9, "today": 208, "recently": 76,
               "week_or_month": 417, "long_ago": 296}
@@ -360,6 +361,61 @@ def test_reproduces_the_live_build_run() -> None:
     check("no warnings on this data", plan["warnings"] == [], plan["warnings"])
     check("two observations: clock skew and boundary drift",
           len(plan["observations"]) == 2, plan["observations"])
+
+
+def test_tier1_must_earn_its_name() -> None:
+    """Tier 1 is the only tier that claims a MOMENT, so it must prove freshness.
+
+    contacts.getContacts was measured returning presence frozen at session start
+    for 105 minutes while every report looked healthy. The label is therefore
+    derived from a measured age, and an unproven age gets the degraded label
+    rather than the benefit of the doubt.
+    """
+    print("\n[tier1] the name 'online right now' has to be earned")
+    rows = [c(i, "userStatusOnline", expires=NOW + 300) for i in range(9)]
+
+    fresh = build_order(rows, now=NOW, presence_age=30,
+                        presence_source="users.getUsers (live)")
+    check("30s old -> verified live", fresh["presence"]["live"] is True,
+          fresh["presence"])
+    check("label says verified",
+          "verified live" in fresh["presence"]["tier1_label"],
+          fresh["presence"]["tier1_label"])
+    check("and no warning", fresh["warnings"] == [], fresh["warnings"])
+    check("the source is recorded",
+          fresh["presence"]["source"] == "users.getUsers (live)")
+
+    stale = build_order(rows, now=NOW, presence_age=105 * 60)
+    check("105m old -> NOT live", stale["presence"]["live"] is False,
+          stale["presence"])
+    check("label states the actual age",
+          "1h 45m" in stale["presence"]["tier1_label"],
+          stale["presence"]["tier1_label"])
+    check("does NOT claim 'right now'",
+          "right now" not in stale["presence"]["tier1_label"],
+          stale["presence"]["tier1_label"])
+    check("and it WARNS, not merely observes",
+          any("cannot be called" in w for w in stale["warnings"]),
+          stale["warnings"])
+    check("the warning names the live bridge",
+          any("presence.js" in w for w in stale["warnings"]), stale["warnings"])
+
+    unknown = build_order(rows, now=NOW)
+    check("no age given -> not live (no benefit of the doubt)",
+          unknown["presence"]["live"] is False, unknown["presence"])
+    check("label says freshness is UNKNOWN",
+          "UNKNOWN" in unknown["presence"]["tier1_label"],
+          unknown["presence"]["tier1_label"])
+    check("and it warns", unknown["warnings"] != [], unknown["warnings"])
+
+    # The boundary, and the case where the warning would be noise.
+    check("exactly 5m old still counts as live",
+          build_order(rows, now=NOW, presence_age=300)["presence"]["live"] is True)
+    check("5m and one second does not",
+          build_order(rows, now=NOW, presence_age=301)["presence"]["live"] is False)
+    empty = build_order([c(1, "userStatusRecently")], now=NOW)
+    check("with an EMPTY tier 1 there is nothing to warn about",
+          empty["warnings"] == [], empty["warnings"])
 
 
 def test_edge_inputs() -> None:
@@ -405,6 +461,7 @@ def main() -> int:
     test_online_is_never_demoted_by_our_clock()
     test_boundary_drift_is_not_an_alarm()
     test_reproduces_the_live_build_run()
+    test_tier1_must_earn_its_name()
     test_unknown_status_is_reported_not_swallowed()
     test_edge_inputs()
 
