@@ -283,7 +283,8 @@ def test_online_is_never_demoted_by_our_clock() -> None:
     check("the clock skew is counted",
           plan["clock"]["online_expires_in_past"] == 9, plan["clock"])
     check("and reported as an observation, not a warning",
-          any("ntp" in o for o in plan["observations"]) and plan["warnings"] == [],
+          any("stale" in o.lower() for o in plan["observations"])
+          and plan["warnings"] == [],
           (plan["observations"], plan["warnings"]))
 
 

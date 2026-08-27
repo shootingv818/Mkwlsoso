@@ -261,10 +261,13 @@ def build_order(contacts: list[dict], now: int | None = None) -> dict:
     if expiry_past:
         observations.append(
             f"{expiry_past} online contact(s) reported an `expires` already in "
-            f"the past, by up to {_dur(expiry_past_max)}. `expires` is compared "
-            f"against THIS host's clock, so the likely cause is the host clock "
-            f"running ahead of Eitaa's (check ntp). They are still placed in "
-            f"tier 1, because Eitaa saying userStatusOnline outranks our clock.")
+            f"the past, by up to {_dur(expiry_past_max)}. This measures how STALE "
+            f"the status data is, not clock skew: across three runs the amount "
+            f"grew from 6m to 1h9m while the newest last-seen stayed frozen at "
+            f"19:54, and a clock offset cannot grow. Run "
+            f"deploy/status_freshness.py to see whether fresher data is "
+            f"reachable. They stay in tier 1 either way, because Eitaa's own "
+            f"category is all we have.")
     if reason_counts.get("exact_over_24h"):
         observations.append(
             f"{reason_counts['exact_over_24h']} contact(s) sit just past the 24h "
