@@ -179,23 +179,27 @@ async () => {
 #: Attach to whatever this build exposes for presence updates. Several candidates
 #: are tried and the one that took is REPORTED, because "0 updates seen" and
 #: "never managed to listen" are different answers and must not look alike.
+#: ONE COUNTER PER HOOK. Run 2 printed "9 updateUserStatus, 0 updates of any
+#: kind", which is impossible -- a subset cannot exceed the whole. The cause was
+#: that one counter was fed by BOTH hooks and the other by only one, so they were
+#: never comparable, and the script then concluded "no live stream at all" while
+#: holding proof of the opposite. Counters are now per-hook and are only ever
+#: compared against a counter from the same hook.
 WATCH_START_JS = r"""
 () => {
-  window.__mkwlSeen = 0;
-  window.__mkwlHook = null;
-  window.__mkwlAny = 0;
+  window.__mkwlBus = 0;          // rootScope.user_update
+  window.__mkwlPump = 0;         // processUpdateMessage, all updates
+  window.__mkwlPumpStatus = 0;   // processUpdateMessage, presence only
+  window.__mkwlHooks = [];
 
-  // 1. tweb's event bus.
   try {
     const rs = window.rootScope;
     if (rs && typeof rs.addEventListener === "function") {
-      rs.addEventListener("user_update", () => { window.__mkwlSeen++; });
-      window.__mkwlHook = "rootScope.user_update";
+      rs.addEventListener("user_update", () => { window.__mkwlBus++; });
+      window.__mkwlHooks.push("rootScope.user_update");
     }
   } catch (e) { /* try the next one */ }
 
-  // 2. Wrap the raw update pump. Also counts updates of ANY kind, which
-  //    distinguishes "presence is not flowing" from "nothing is flowing".
   try {
     const AUM = window.apiUpdatesManager;
     if (AUM && typeof AUM.processUpdateMessage === "function"
@@ -203,26 +207,71 @@ WATCH_START_JS = r"""
       const orig = AUM.processUpdateMessage.bind(AUM);
       AUM.processUpdateMessage = function (u) {
         try {
-          window.__mkwlAny++;
+          window.__mkwlPump++;
           const s = JSON.stringify(u) || "";
-          if (s.indexOf("updateUserStatus") !== -1) window.__mkwlSeen++;
+          if (s.indexOf("updateUserStatus") !== -1) window.__mkwlPumpStatus++;
         } catch (e) { /* counting must never break the client */ }
         return orig(u);
       };
       AUM.__mkwlWrapped = true;
-      window.__mkwlHook = (window.__mkwlHook ? window.__mkwlHook + " + " : "")
-                          + "apiUpdatesManager.processUpdateMessage";
+      window.__mkwlHooks.push("apiUpdatesManager.processUpdateMessage");
     }
   } catch (e) { /* nothing to attach to */ }
 
-  return { hook: window.__mkwlHook };
+  return { hooks: window.__mkwlHooks };
 }
 """
 
 WATCH_READ_JS = r"""
-() => ({ hook: window.__mkwlHook || null,
-         status_updates: window.__mkwlSeen || 0,
-         any_updates: window.__mkwlAny || 0 })
+() => ({ hooks: window.__mkwlHooks || [],
+         bus_status: window.__mkwlBus || 0,
+         pump_total: window.__mkwlPump || 0,
+         pump_status: window.__mkwlPumpStatus || 0 })
+"""
+
+#: THE ROUND THAT MATTERS. Read statuses out of Eitaa's OWN user store instead of
+#: out of a getContacts reply.
+#:
+#: Run 2 proved presence is live: 9 updateUserStatus events arrived in 45 seconds
+#: via rootScope.user_update, while getContacts kept returning a blob frozen at
+#: 19:54:12 through a wait AND a full reload. Those updates have to be landing
+#: somewhere, and appUsersManager is where tweb keeps users. So the live data was
+#: in the page the whole time -- every round so far asked the one source that is
+#: stale.
+#:
+#: Ids come from the store's own contacts list where available, so this can run
+#: BEFORE any getContacts call and cannot be contaminated by it: getContacts
+#: feeds saveApiUsers, which would overwrite fresh statuses with the snapshot's.
+READ_STORE_JS = r"""
+async (fallbackIds) => {
+  const AUM = window.appUsersManager;
+  if (!AUM) return { ok: false, code: "no appUsersManager" };
+  const getUser = AUM.getUser || AUM.getUserById;
+  if (typeof getUser !== "function")
+    return { ok: false, code: "appUsersManager has no getUser" };
+
+  let ids = [], src = "";
+  try {
+    const cl = AUM.contactsList || AUM.contacts;
+    if (cl && typeof cl.forEach === "function" && (cl.size || cl.length)) {
+      cl.forEach((v) => ids.push(v));
+      src = "store contactsList";
+    }
+  } catch (e) { /* fall through */ }
+  if (!ids.length) { ids = fallbackIds || []; src = "ids passed in"; }
+  if (!ids.length) return { ok: false, code: "no contact ids available" };
+
+  const users = [];
+  let missing = 0;
+  for (let i = 0; i < ids.length; i++) {
+    let u = null;
+    try { u = getUser.call(AUM, ids[i]); } catch (e) { u = null; }
+    if (u && u.status) users.push(u); else missing++;
+  }
+  const r = window.__mkwlSummarise(users, 0);
+  r.id_source = src; r.asked = ids.length; r.missing = missing;
+  return r;
+}
 """
 
 
@@ -264,9 +313,24 @@ class Rounds:
               f"{r.get('seen', 0):>5} rows  {r.get('ms', 0):>5}ms  "
               f"expires {hhmm(exp)}{delta}")
 
+    #: A server saying it does not implement a method has ANSWERED us. That path
+    #: does not exist, which is a finding, not an unresolved round. Lumping it in
+    #: with our own broken calls would leave the probe permanently inconclusive
+    #: over something no amount of fixing can change.
+    UNSUPPORTED = ("INVALID_CONSTRUCTOR", "METHOD_NOT_FOUND", "METHOD_INVALID",
+                   "no invokeApi", "has no getUser")
+
+    def _kind(self, r: dict) -> str:
+        if r.get("ok"):
+            return "ok"
+        code = str(r.get("code") or "")
+        return "unsupported" if any(m in code for m in self.UNSUPPORTED) else "broken"
+
     def verdict(self) -> None:
-        ok = [(t, r) for t, r in self.rows if r.get("ok")]
-        failed = [(t, r) for t, r in self.rows if not r.get("ok")]
+        kinds = [(t, r, self._kind(r)) for t, r in self.rows]
+        ok = [(t, r) for t, r, k in kinds if k == "ok"]
+        unsupported = [(t, r) for t, r, k in kinds if k == "unsupported"]
+        broken = [(t, r) for t, r, k in kinds if k == "broken"]
         newer = [(t, r) for t, r in ok
                  if self.base and int(r.get("newest") or 0) > self.base]
 
@@ -274,10 +338,13 @@ class Rounds:
         print("  " + "=" * 70)
         print("  VERDICT")
         print("  " + "=" * 70)
-        print(f"  rounds run: {len(self.rows)}    succeeded: {len(ok)}    "
-              f"failed/skipped: {len(failed)}")
-        for t, r in failed:
-            print(f"    unresolved: {t} -> {r.get('code')}")
+        print(f"  rounds: {len(self.rows)}    answered: {len(ok)}    "
+              f"unsupported by Eitaa: {len(unsupported)}    unresolved: {len(broken)}")
+        for t, r in unsupported:
+            print(f"    unsupported (a real answer): {t} -> {r.get('code')}")
+        for t, r in broken:
+            print(f"    unresolved (our problem):    {t} -> {r.get('code')}")
+        failed = broken
 
         if newer:
             t, r = max(newer, key=lambda x: int(x[1]["newest"]))
@@ -341,18 +408,20 @@ async def run(args) -> int:
             print("")
             print("  " + "-" * 70)
 
-            # E first: it is the method built for this question.
+            # E: the purpose-built method. Kept even though run 2 rejected it, so
+            # a future Eitaa build gaining support is noticed rather than assumed.
             R.add("E contacts.getStatuses",
                   await drv.page.evaluate(GET_STATUSES_JS))
 
-            # B with the input built by Eitaa itself.
+            store_ids: list[int] = []
             if not await drv.ensure_contacts_list_bridge():
                 R.skip("B users.getUsers", "contacts bridge unavailable")
             else:
                 lst = await drv.bridge_contacts_list()
-                ids = [int(c["peer_id"])
-                       for c in (lst or {}).get("contacts", [])[:args.sample]
-                       if str(c.get("peer_id") or "").isdigit()]
+                store_ids = [int(c["peer_id"])
+                             for c in (lst or {}).get("contacts", [])
+                             if str(c.get("peer_id") or "").isdigit()]
+                ids = store_ids[:args.sample]
                 if ids:
                     R.add(f"B users.getUsers ({len(ids)})",
                           await drv.page.evaluate(GET_USERS_JS, ids))
@@ -360,31 +429,44 @@ async def run(args) -> int:
                     R.skip("B users.getUsers", "no usable contact ids")
 
             # F + C: watch the update stream across the wait.
-            hook = await drv.page.evaluate(WATCH_START_JS)
+            hooks = (await drv.page.evaluate(WATCH_START_JS)).get("hooks") or []
             print("")
-            print(f"  watching for presence updates via: "
-                  f"{hook.get('hook') or 'NOTHING — could not attach'}")
+            print(f"  watching presence via: {', '.join(hooks) or 'NOTHING attached'}")
             print(f"  waiting {args.wait}s on the SAME page ...")
             await asyncio.sleep(args.wait)
             watch = await drv.page.evaluate(WATCH_READ_JS)
             R.add(f"C getContacts +{args.wait}s",
                   await drv.page.evaluate(GET_CONTACTS_JS))
 
+            # G: the live store, read AFTER the wait so the pushed updates are in.
+            R.add("G live store (appUsersManager)",
+                  await drv.page.evaluate(READ_STORE_JS, store_ids))
+
             print("")
-            if not watch.get("hook"):
-                print("  F update stream: COULD NOT OBSERVE. No hook attached, so")
-                print("     this says nothing about whether presence flows.")
+            print(f"  F update stream over {args.wait}s — one line per hook, since")
+            print("     counters from different hooks are not comparable:")
+            attached = set(hooks)
+            if "rootScope.user_update" in attached:
+                print(f"       rootScope.user_update            "
+                      f"{watch.get('bus_status', 0):>5} presence events")
             else:
-                print(f"  F update stream: {watch.get('status_updates', 0)} "
-                      f"updateUserStatus, {watch.get('any_updates', 0)} updates of "
-                      f"any kind in {args.wait}s")
-                if not watch.get("any_updates"):
-                    print("     No updates of ANY kind arrived, so the client is not")
-                    print("     receiving a live stream here at all -- presence could")
-                    print("     not reach us even if Eitaa were sending it.")
-                elif not watch.get("status_updates"):
-                    print("     Updates ARE flowing but none carried presence, so Eitaa")
-                    print("     is not pushing contact statuses to this client.")
+                print("       rootScope.user_update            not attached")
+            if "apiUpdatesManager.processUpdateMessage" in attached:
+                print(f"       processUpdateMessage (all)       "
+                      f"{watch.get('pump_total', 0):>5}")
+                print(f"       processUpdateMessage (presence)  "
+                      f"{watch.get('pump_status', 0):>5}")
+            else:
+                print("       processUpdateMessage             not attached "
+                      "(not the update pump in this build)")
+            if not attached:
+                print("     COULD NOT OBSERVE — this says nothing either way.")
+            elif watch.get("bus_status") or watch.get("pump_status"):
+                print("     PRESENCE IS LIVE. Status changes are reaching this client,")
+                print("     so the staleness is in the getContacts REPLY, not in the")
+                print("     account's presence data. Round G is the one to trust.")
+            else:
+                print("     Hooks attached but no presence arrived in this window.")
 
             print("")
             print("  reloading the page ...")

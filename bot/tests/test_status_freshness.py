@@ -92,8 +92,10 @@ def test_failure_is_never_reported_as_agreement() -> None:
     check("names the unresolved round", "PEER_ID_INVALID" in out, out[-260:])
     check("does not declare a server snapshot",
           "really is" not in out, out[-260:])
-    check("counts it as failed, not succeeded", "failed/skipped: 1" in out,
+    check("counts it as unresolved, not answered", "unresolved: 1" in out,
           out[-400:])
+    check("and blames us, not Eitaa, for a PEER_ID_INVALID",
+          "unresolved (our problem)" in out, out[-400:])
 
 
 def test_clean_consensus_is_allowed() -> None:
@@ -107,8 +109,44 @@ def test_clean_consensus_is_allowed() -> None:
     ])
     check("declares the snapshot finding", "server-side snapshot" in out, out[-300:])
     check("tells us to relabel tier 1", "relabelled honestly" in out, out[-300:])
-    check("reports zero failures", "failed/skipped: 0" in out, out[-400:])
+    check("reports zero unresolved", "unresolved: 0" in out, out[-400:])
     check("no false 'no conclusion'", "NO CONCLUSION YET" not in out)
+
+
+def test_unsupported_method_is_an_answer_not_a_failure() -> None:
+    """INVALID_CONSTRUCTOR means Eitaa does not have the method. That is a result.
+
+    Lumping it in with our own broken calls would leave the probe permanently
+    inconclusive over something no amount of fixing can change -- run 2 hit
+    exactly this with contacts.getStatuses.
+    """
+    print("\n[verdict] 'Eitaa has no such method' must not block a conclusion")
+    out = verdict_text([
+        ("A warm getContacts", good(BASE)),
+        ("E contacts.getStatuses",
+         {"ok": False, "code": "contacts.getStatuses:INVALID_CONSTRUCTOR"}),
+        ("C getContacts +45s", good(BASE)),
+        ("G live store", good(BASE)),
+    ])
+    check("counted as unsupported", "unsupported by Eitaa: 1" in out, out[-400:])
+    check("zero unresolved", "unresolved: 0" in out, out[-400:])
+    check("labelled a real answer", "unsupported (a real answer)" in out,
+          out[-400:])
+    check("so a conclusion IS reached", "server-side snapshot" in out, out[-400:])
+    check("and no false 'no conclusion'", "NO CONCLUSION YET" not in out)
+
+    # But our own broken call still blocks it, even alongside an unsupported one.
+    out = verdict_text([
+        ("A warm getContacts", good(BASE)),
+        ("E contacts.getStatuses",
+         {"ok": False, "code": "contacts.getStatuses:INVALID_CONSTRUCTOR"}),
+        ("B users.getUsers", {"ok": False, "code": "PEER_ID_INVALID"}),
+        ("G live store", good(BASE)),
+    ])
+    check("a broken round still blocks the conclusion",
+          "NO CONCLUSION YET" in out, out[-400:])
+    check("and the two kinds are reported separately",
+          "unsupported by Eitaa: 1" in out and "unresolved: 1" in out, out[-400:])
 
 
 def test_a_newer_round_wins_even_with_a_failure() -> None:
@@ -170,6 +208,7 @@ def main() -> int:
     print("=" * 66)
     test_failure_is_never_reported_as_agreement()
     test_clean_consensus_is_allowed()
+    test_unsupported_method_is_an_answer_not_a_failure()
     test_a_newer_round_wins_even_with_a_failure()
     test_skipped_counts_as_unresolved()
     test_baseline_comes_from_the_first_successful_round()
