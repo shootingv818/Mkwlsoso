@@ -243,6 +243,7 @@ async def run(args) -> int:
         contacts = res.get("roster") or []
         now = int(res.get("server_now") or time.time())
         presence_age = res.get("presence_age_sec")
+        presence_coverage = res.get("coverage_pct")
         presence_source = "users.getUsers (live)"
         raw, skipped = int(res.get("store_ids") or 0), 0
         print("")
@@ -261,11 +262,19 @@ async def run(args) -> int:
               f"{(un.get('after') or {}).get('state', '?')!r}"
               f"   (hidden pages get no updates from tweb)")
         print(f"    marked self online  : {res.get('marked_online')}")
-        print(f"    fresh user objects  : {res.get('count', 0):,} in "
-              f"{res.get('batches', 0)} batches ({res.get('fetch_ms', 0)}ms)")
+        print(f"    roster              : {res.get('count', 0):,} contacts"
+              f"   (ids from: {res.get('id_source')})")
+        print(f"    statuses REFRESHED  : {res.get('fresh_count', 0):,} of "
+              f"{res.get('count', 0):,}  = {res.get('coverage_pct', 0)}%"
+              f"   in {res.get('batches', 0)} batches ({res.get('fetch_ms', 0)}ms)")
+        if res.get("reply_shape"):
+            print(f"    reply shape         : {res['reply_shape']}")
         if res.get("failed_batches"):
-            print(f"    FAILED batches      : {res['failed_batches']} — the roster "
-                  f"is INCOMPLETE")
+            print(f"    FAILED batches      : {res['failed_batches']} — those "
+                  f"contacts keep their SNAPSHOT status, not a fresh one")
+        if res.get("empty_replies"):
+            print(f"    empty replies       : {res['empty_replies']} "
+                  f"(shape: {res.get('empty_reply_shape')})")
         if res.get("unbuildable_ids"):
             print(f"    unbuildable ids     : {res['unbuildable_ids']}")
         print(f"    newest last-seen    : "
@@ -276,7 +285,8 @@ async def run(args) -> int:
     else:
         contacts = res.get("contacts") or []
         now = int(res.get("server_now") or time.time())
-        presence_age, presence_source = None, "contacts.getContacts (snapshot)"
+        presence_age, presence_coverage = None, None
+        presence_source = "contacts.getContacts (snapshot)"
         raw = int(res.get("raw") or 0)
         skipped = int(res.get("skipped") or 0)
         if contacts and "status" not in contacts[0]:
@@ -288,7 +298,8 @@ async def run(args) -> int:
 
     t0 = time.time()
     plan = build_order(contacts, now=now, presence_age=presence_age,
-                       presence_source=presence_source)
+                       presence_source=presence_source,
+                       presence_coverage_pct=presence_coverage)
     timings["tiering"] = time.time() - t0
     timings["total"] = time.time() - t_start
 

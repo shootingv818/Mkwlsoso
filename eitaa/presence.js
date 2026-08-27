@@ -111,6 +111,33 @@
     };
   }
 
+  //: users.getUsers is declared as Vector<User>, but 10 of 11 batches came back
+  //: "successful" and yielded ZERO usable contacts, which means the reply was not
+  //: the bare array assumed. Rather than guess again, every plausible shape is
+  //: accepted and the shape actually seen is REPORTED, so a third wrong guess is
+  //: impossible.
+  function asUserArray(x) {
+    if (Array.isArray(x)) return x;
+    if (x && Array.isArray(x.users)) return x.users;
+    if (x && typeof x === "object") {
+      const vals = [];
+      const keys = Object.keys(x);
+      for (let i = 0; i < keys.length; i++) {
+        const v = x[keys[i]];
+        if (v && typeof v === "object" && v.id != null) vals.push(v);
+      }
+      if (vals.length) return vals;
+    }
+    return [];
+  }
+
+  function shapeOf(x) {
+    if (x == null) return String(x);
+    if (Array.isArray(x)) return "array[" + x.length + "]";
+    if (typeof x !== "object") return typeof x;
+    return "object{" + Object.keys(x).slice(0, 10).join(",") + "}";
+  }
+
   window.__MKWL_livePresence = async function (opts) {
     opts = opts || {};
     const batchSize = Math.max(1, Math.min(200, opts.batch || 100));
@@ -162,6 +189,7 @@
     // useless for PRESENCE, which is what it was measured being frozen on, but
     // it is perfectly good for the ROSTER: ids and access_hashes do not go
     // stale. The statuses are then re-read fresh via users.getUsers below.
+    const base = {};                 // peer_id -> identity + last known status
     let ids = storeContactIds(AUM);
     out.id_source = "store contactsList";
     if (!ids.length) {
@@ -171,6 +199,24 @@
         const seeded = (c && c.users) || [];
         out.seed_ms = Date.now() - t0;
         out.seeded_users = seeded.length;
+        // Keep the seed as the IDENTITY base. Ids, access_hashes and names do
+        // not go stale, so only the STATUS needs refreshing on top -- and this
+        // means one failed batch costs 6 statuses, not the whole run.
+        for (let s = 0; s < seeded.length; s++) {
+          const u = seeded[s];
+          if (!u || u.id == null) continue;
+          const f = u.pFlags || {};
+          if (f.self || f.deleted || f.bot) continue;
+          if (!u.access_hash) continue;
+          const st = readStatus(u);
+          base[String(u.id)] = {
+            peer_id: String(u.id), access_hash: String(u.access_hash),
+            title: titleOf(u), username: u.username ? String(u.username) : "",
+            phone: u.phone ? String(u.phone) : "",
+            status: st.status, was_online: st.was_online, expires: st.expires,
+            fresh: false
+          };
+        }
         try {
           if (AUM.saveApiUsers) AUM.saveApiUsers(seeded);
         } catch (e) { out.errors.push("saveApiUsers:" + errStr(e)); }
@@ -201,8 +247,8 @@
       return out;
     }
 
-    const roster = [];
     let batches = 0, failedBatches = 0, unbuildable = 0;
+    let refreshed = 0, emptyReplies = 0;
     const t1 = Date.now();
     for (let i = 0; i < ids.length; i += batchSize) {
       const slice = ids.slice(i, i + batchSize);
@@ -216,56 +262,105 @@
       }
       if (!input.length) { failedBatches++; continue; }
       batches++;
-      let users = null;
+      let reply = null;
       try {
-        users = await AM.invokeApi("users.getUsers", { id: input });
+        reply = await AM.invokeApi("users.getUsers", { id: input });
       } catch (e) {
         failedBatches++;
-        // Never swallow: the batch index and the real error are both recorded so
-        // a partial roster can be told apart from a complete one.
+        // Never swallow: the batch range and the real error are both recorded, so
+        // a partial refresh can never be mistaken for a complete one.
         out.errors.push("users.getUsers[" + i + ".." + (i + input.length) + "]:"
                         + errStr(e));
         continue;
       }
-      for (let k = 0; k < (users || []).length; k++) {
+      if (!out.reply_shape) out.reply_shape = shapeOf(reply);
+      const users = asUserArray(reply);
+      if (!users.length) {
+        emptyReplies++;
+        if (!out.empty_reply_shape) out.empty_reply_shape = shapeOf(reply);
+        continue;
+      }
+      // STATUS ONLY. Identity stays as seeded, so a user arriving here without
+      // an access_hash is still addressable instead of being silently dropped --
+      // which is how ten successful batches produced an empty roster.
+      for (let k = 0; k < users.length; k++) {
         const u = users[k];
         if (!u || u.id == null) continue;
-        const f = u.pFlags || {};
-        if (f.self || f.deleted || f.bot) continue;
-        if (!u.access_hash) continue;
+        const key = String(u.id);
         const s = readStatus(u);
-        roster.push({
-          peer_id: String(u.id), access_hash: String(u.access_hash),
-          title: titleOf(u), username: u.username ? String(u.username) : "",
-          phone: u.phone ? String(u.phone) : "",
-          status: s.status, was_online: s.was_online, expires: s.expires
-        });
+        if (!s.status) continue;
+        if (base[key]) {
+          base[key].status = s.status;
+          base[key].was_online = s.was_online;
+          base[key].expires = s.expires;
+          base[key].fresh = true;
+          refreshed++;
+        } else {
+          const f = u.pFlags || {};
+          if (f.self || f.deleted || f.bot) continue;
+          if (!u.access_hash) continue;
+          base[key] = {
+            peer_id: key, access_hash: String(u.access_hash), title: titleOf(u),
+            username: u.username ? String(u.username) : "",
+            phone: u.phone ? String(u.phone) : "",
+            status: s.status, was_online: s.was_online, expires: s.expires,
+            fresh: true
+          };
+          refreshed++;
+        }
       }
     }
     out.fetch_ms = Date.now() - t1;
     out.batches = batches;
     out.failed_batches = failedBatches;
     out.unbuildable_ids = unbuildable;
+    out.empty_replies = emptyReplies;
+    out.refreshed = refreshed;
     out.source = "users.getUsers";
 
-    // 5. Freshness evidence, measured against the SERVER's clock where we have it.
-    let newest = 0, online = 0;
+    const roster = [];
+    const keys = Object.keys(base);
+    for (let i = 0; i < keys.length; i++) roster.push(base[keys[i]]);
+
+    // 5. Freshness measured ONLY on the statuses actually refreshed. Deriving it
+    //    from the seeded ones would read the frozen snapshot's age back as proof
+    //    of freshness, which is circular.
+    let newest = 0, online = 0, freshCount = 0;
     for (let i = 0; i < roster.length; i++) {
       const r = roster[i];
       if (r.status === "userStatusOnline") online++;
+      if (!r.fresh) continue;
+      freshCount++;
       if (typeof r.was_online === "number" && r.was_online > newest)
         newest = r.was_online;
+      if (typeof r.expires === "number" && r.expires > newest) newest = r.expires;
     }
     out.roster = roster;
     out.count = roster.length;
+    out.fresh_count = freshCount;
+    out.coverage_pct = roster.length
+      ? Math.round(freshCount * 1000 / roster.length) / 10 : 0;
     out.newest_was_online = newest || null;
-    out.presence_age_sec = newest ? Math.max(0, now - newest) : null;
+    out.presence_age_sec = (freshCount && newest) ? Math.max(0, now - newest) : null;
     out.online_count = online;
     out.server_now = now;
 
+    // A partial refresh is a USABLE result: 1,000 of 1,006 fresh statuses is not
+    // a failure, and the previous version threw exactly that away over one bad
+    // batch of six. Only a roster with nothing in it is fatal; low coverage is
+    // reported and left to the freshness gate to judge.
     if (!roster.length) {
       out.ok = false;
-      out.code = "users.getUsers returned no usable contacts"
+      out.code = "no usable contacts at all"
+                 + (out.errors.length ? " (" + out.errors.join("; ") + ")" : "")
+                 + (out.reply_shape ? " [reply shape: " + out.reply_shape + "]" : "");
+    } else if (!freshCount) {
+      out.ok = false;
+      out.code = "roster built (" + roster.length + ") but NOT ONE status was "
+                 + "refreshed, so it is only the frozen snapshot"
+                 + (out.empty_reply_shape
+                    ? " [replies yielded no users; shape: "
+                      + out.empty_reply_shape + "]" : "")
                  + (out.errors.length ? " (" + out.errors[0] + ")" : "");
     }
     return out;

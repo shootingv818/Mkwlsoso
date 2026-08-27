@@ -414,6 +414,27 @@ def test_tier1_must_earn_its_name() -> None:
           build_order(rows, now=NOW, presence_age=300)["presence"]["live"] is True)
     check("5m and one second does not",
           build_order(rows, now=NOW, presence_age=301)["presence"]["live"] is False)
+
+    # Coverage: a fresh age proves only that SOMETHING was refreshed.
+    thin = build_order(rows, now=NOW, presence_age=30, presence_coverage_pct=10.0)
+    check("fresh age but 10% coverage is NOT live", thin["presence"]["live"] is False,
+          thin["presence"])
+    check("the label says why", "10.0% of statuses" in thin["presence"]["tier1_label"],
+          thin["presence"]["tier1_label"])
+    check("and the warning names coverage",
+          any("refreshed" in w for w in thin["warnings"]), thin["warnings"])
+    check("99.4% coverage IS live",
+          build_order(rows, now=NOW, presence_age=30,
+                      presence_coverage_pct=99.4)["presence"]["live"] is True)
+    check("exactly 90% is live",
+          build_order(rows, now=NOW, presence_age=30,
+                      presence_coverage_pct=90.0)["presence"]["live"] is True)
+    check("89.9% is not",
+          build_order(rows, now=NOW, presence_age=30,
+                      presence_coverage_pct=89.9)["presence"]["live"] is False)
+    check("unknown coverage does not block a fresh age",
+          build_order(rows, now=NOW, presence_age=30,
+                      presence_coverage_pct=None)["presence"]["live"] is True)
     empty = build_order([c(1, "userStatusRecently")], now=NOW)
     check("with an EMPTY tier 1 there is nothing to warn about",
           empty["warnings"] == [], empty["warnings"])

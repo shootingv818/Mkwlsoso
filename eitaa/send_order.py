@@ -202,7 +202,16 @@ def _sort_rank(tier: str, was_online) -> int:
     return 0
 
 
-def presence_verdict(presence_age: int | None, source: str | None = None) -> dict:
+#: How much of the roster must have had its status genuinely refreshed before
+#: tier 1 may claim to be live. A fresh age proves only that SOMETHING was
+#: refreshed; if most contacts still carry the frozen snapshot, an "online" among
+#: them is snapshot-online, and the claim would be true of a minority and false
+#: of the rest.
+MIN_PRESENCE_COVERAGE_PCT = 90.0
+
+
+def presence_verdict(presence_age: int | None, source: str | None = None,
+                     coverage_pct: float | None = None) -> dict:
     """Decide whether tier 1 has EARNED the name "online right now".
 
     Tier 1 is the only tier that claims a moment. The others claim a day or a
@@ -214,20 +223,29 @@ def presence_verdict(presence_age: int | None, source: str | None = None) -> dic
     for 105 minutes straight. So freshness is never assumed here: a caller that
     cannot prove an age gets the degraded label, not the benefit of the doubt.
     """
-    live = presence_age is not None and presence_age <= LIVE_PRESENCE_MAX_SEC
+    fresh_enough = (presence_age is not None
+                    and presence_age <= LIVE_PRESENCE_MAX_SEC)
+    covered = coverage_pct is None or coverage_pct >= MIN_PRESENCE_COVERAGE_PCT
+    live = fresh_enough and covered
+
     if live:
         label = "online right now (verified live)"
     elif presence_age is None:
         label = "online as of the last sync (freshness UNKNOWN)"
+    elif not covered:
+        label = (f"online, but only {coverage_pct}% of statuses were refreshed "
+                 f"(mostly snapshot)")
     else:
         label = f"online as of {_dur(presence_age)} ago (stale)"
     return {"live": live, "age_sec": presence_age, "source": source,
-            "tier1_label": label}
+            "coverage_pct": coverage_pct, "fresh_enough": fresh_enough,
+            "covered": covered, "tier1_label": label}
 
 
 def build_order(contacts: list[dict], now: int | None = None,
                 presence_age: int | None = None,
-                presence_source: str | None = None) -> dict:
+                presence_source: str | None = None,
+                presence_coverage_pct: float | None = None) -> dict:
     """Order contacts for a broadcast. Returns the plan plus why it looks so.
 
     Each entry keeps its original fields and gains `tier` and `reason`. Input is
@@ -288,15 +306,20 @@ def build_order(contacts: list[dict], now: int | None = None,
     warnings: list[str] = []
     observations: list[str] = []
 
-    presence = presence_verdict(presence_age, presence_source)
+    presence = presence_verdict(presence_age, presence_source,
+                                presence_coverage_pct)
     if tier_counts["online"] and not presence["live"]:
         # A WARNING, not an observation. Tier 1 exists to reach people who are
         # online, and unverifiable presence means it may be reaching whoever
         # happened to be online whenever the data froze.
+        why = ("age is "
+               + (_dur(presence_age) if presence_age is not None else "UNKNOWN")
+               + f" (limit {_dur(LIVE_PRESENCE_MAX_SEC)})")
+        if not presence["covered"]:
+            why += (f", and only {presence_coverage_pct}% of statuses were "
+                    f"refreshed (need {MIN_PRESENCE_COVERAGE_PCT}%)")
         warnings.append(
-            "tier 1 cannot be called 'online right now': presence age is "
-            + (f"{_dur(presence_age)}" if presence_age is not None else "UNKNOWN")
-            + f", past the {_dur(LIVE_PRESENCE_MAX_SEC)} limit. It is labelled "
+            f"tier 1 cannot be called 'online right now': {why}. It is labelled "
             f"'{presence['tier1_label']}' instead. Build the order from the live "
             f"presence bridge (eitaa/presence.js) rather than "
             f"contacts.getContacts, which was measured frozen at session start "
