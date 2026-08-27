@@ -14,6 +14,7 @@ was verified by reverting the fix and confirming the test goes red.
 """
 from __future__ import annotations
 
+import io
 import os
 import sys
 import tempfile
@@ -447,6 +448,69 @@ def test_edge_inputs() -> None:
           any("peer_id" in w for w in plan["warnings"]), plan["warnings"])
 
 
+def test_fallback_reason_reaches_the_report() -> None:
+    """A tier-1 warning with no stated cause is not actionable.
+
+    The first fallback run printed why the live bridge failed BEFORE the report,
+    where it scrolled out of view. What survived was a warning saying tier 1
+    could not be trusted, with nothing saying why -- so the report now repeats
+    the reason inside itself.
+    """
+    print("\n[report] the live-bridge failure must survive into the report")
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "bso", os.path.join(_ROOT, "deploy", "build_send_order.py"))
+    bso = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(bso)
+
+    rows = [c(i, "userStatusOnline", expires=NOW - 6000) for i in range(9)]
+    plan = build_order(rows, now=NOW)
+
+    buf, old = io.StringIO(), sys.stdout
+    sys.stdout = buf
+    try:
+        bso.report(plan, {"total": 6.9}, raw=1006, skipped=0, source="snapshot",
+                   live_error={"code": "no contact ids: store is empty",
+                               "errors": ["seed:CONNECTION_NOT_INITED"],
+                               "connected": False, "store_ids": 0})
+    finally:
+        sys.stdout = old
+    out = buf.getvalue()
+    check("names the source used", "SOURCE: snapshot" in out, out[:300])
+    check("states the reason", "store is empty" in out, out[:300])
+    check("includes the underlying error", "CONNECTION_NOT_INITED" in out,
+          out[:300])
+    check("includes the evidence fields", "connected" in out and "store_ids" in out,
+          out[:400])
+    check("and still warns about tier 1",
+          any("cannot be called" in w for w in plan["warnings"]))
+
+    # A missing reason must be called out, not left blank.
+    buf, old = io.StringIO(), sys.stdout
+    sys.stdout = buf
+    try:
+        bso.report(plan, {"total": 1.0}, raw=9, skipped=0, source="snapshot",
+                   live_error=None)
+    finally:
+        sys.stdout = old
+    check("an unrecorded reason is flagged as a bug, not left silent",
+          "not recorded" in buf.getvalue(), buf.getvalue()[:300])
+
+    # The live path says so plainly, so the two cannot be confused.
+    buf, old = io.StringIO(), sys.stdout
+    sys.stdout = buf
+    try:
+        bso.report(build_order(rows, now=NOW, presence_age=30),
+                   {"total": 1.0}, raw=9, skipped=0, source="live")
+    finally:
+        sys.stdout = old
+    out = buf.getvalue()
+    check("the live path is labelled as such",
+          "SOURCE: live presence bridge" in out, out[:300])
+    check("and carries no failure text", "did not run" not in out, out[:300])
+
+
 def main() -> int:
     print("=" * 66)
     print("SEND ORDER — built on Eitaa's own reported behaviour")
@@ -462,6 +526,7 @@ def main() -> int:
     test_boundary_drift_is_not_an_alarm()
     test_reproduces_the_live_build_run()
     test_tier1_must_earn_its_name()
+    test_fallback_reason_reaches_the_report()
     test_unknown_status_is_reported_not_swallowed()
     test_edge_inputs()
 

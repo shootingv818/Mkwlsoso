@@ -65,13 +65,34 @@ def artifacts_dir() -> Path:
     return d.resolve()
 
 
-def report(plan: dict, timings: dict, raw: int, skipped: int) -> None:
+def report(plan: dict, timings: dict, raw: int, skipped: int,
+           source: str = "live", live_error: dict | None = None) -> None:
     say = print
     total = plan["total"]
     say("")
     say("=" * 66)
     say("SEND ORDER")
     say("=" * 66)
+
+    # The live-bridge failure is repeated HERE, inside the report, because the
+    # first fallback run printed it before the report and it scrolled away -- the
+    # single most important line was lost, leaving a tier-1 warning with no
+    # stated cause. A diagnosis has to travel with the result it explains.
+    if source != "live":
+        say(f"  SOURCE: {source} — the LIVE presence bridge did not run.")
+        if live_error:
+            say(f"    reason: {live_error.get('code')}")
+            for e in (live_error.get("errors") or [])[:6]:
+                say(f"    error : {e}")
+            for k in ("connected", "store_ids", "seeded_users", "id_source",
+                      "batches", "failed_batches", "unbuildable_ids"):
+                if live_error.get(k) is not None:
+                    say(f"    {k:<16}: {live_error[k]}")
+        else:
+            say("    reason: not recorded — this is itself a bug, report it")
+        say("")
+    else:
+        say("  SOURCE: live presence bridge (users.getUsers)")
     say(f"  contacts returned  : {raw:,}")
     say(f"  addressable        : {total:,}"
         + (f"   ({skipped:,} skipped: deleted/bot/self/no access_hash)"
@@ -160,6 +181,7 @@ async def run(args) -> int:
     from eitaa.driver import EitaaDriver
 
     timings: dict[str, float] = {}
+    live_error: dict | None = None
     t_start = time.time()
 
     print(f"build send order — account {args.account}")
@@ -191,12 +213,15 @@ async def run(args) -> int:
 
             res, source = live, "live"
             if not live.get("ok"):
+                # Kept for the streaming view, but the report repeats it so it
+                # cannot be lost to scrolling.
+                live_error = {k: live.get(k) for k in (
+                    "code", "errors", "connected", "store_ids", "seeded_users",
+                    "id_source", "batches", "failed_batches",
+                    "unbuildable_ids")}
                 print("")
                 print("  live presence bridge FAILED — falling back to the frozen")
-                print("  contacts.getContacts path. Tier 1 will be labelled stale.")
-                print(f"    code: {live.get('code')}")
-                for e in (live.get("errors") or [])[:5]:
-                    print(f"    error: {e}")
+                print(f"  contacts.getContacts path. reason: {live.get('code')}")
                 t0 = time.time()
                 res, source = await drv.bridge_contacts_list(), "snapshot"
                 timings["getContacts fallback"] = time.time() - t0
@@ -267,7 +292,8 @@ async def run(args) -> int:
     timings["tiering"] = time.time() - t0
     timings["total"] = time.time() - t_start
 
-    report(plan, timings, raw=raw, skipped=skipped)
+    report(plan, timings, raw=raw, skipped=skipped, source=source,
+           live_error=live_error)
     preview(plan, args.limit, args.show_titles)
 
     if not args.no_save:
@@ -280,8 +306,12 @@ async def run(args) -> int:
             "live_evidence": {k: res.get(k) for k in (
                 "connected", "clock_offset", "getstate_ms", "batches",
                 "failed_batches", "unbuildable_ids", "marked_online",
-                "newest_was_online", "presence_age_sec", "errors")}
+                "newest_was_online", "presence_age_sec", "id_source",
+                "store_ids", "errors")}
             if source == "live" else {},
+            # Saved even on fallback. The first fallback run left NO record of
+            # why, which made the tier-1 warning unexplainable after the fact.
+            "live_failure": live_error or {},
             "tier_counts": plan["tier_counts"],
             "reason_counts": plan["reason_counts"],
             "warnings": plan["warnings"],

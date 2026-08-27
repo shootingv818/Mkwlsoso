@@ -123,6 +123,11 @@
       ok: true, errors: [], page_now: Math.floor(Date.now() / 1000)
     };
 
+    // 0. Un-hide FIRST. Every call below wants tweb's update loop already
+    //    running; doing this after the API calls would leave the first ones
+    //    served from cache exactly as before.
+    out.unhide = unhide();
+
     // 1. Prove the connection, and get the server's clock.
     try {
       const t0 = Date.now();
@@ -138,8 +143,7 @@
     const now = out.server_date || out.page_now;
     out.clock_offset = out.server_date ? (out.page_now - out.server_date) : null;
 
-    // 2 + 3. Wake the page up so the update loop can run.
-    out.unhide = unhide();
+    // 2 + 3. Tell the server we are here, so it starts sending updates.
     try {
       await AM.invokeApi("account.updateStatus", { offline: false });
       out.marked_online = true;
@@ -149,11 +153,44 @@
     }
 
     // 4. Fresh user objects, batched, ids from the store.
-    const ids = storeContactIds(AUM);
+    //
+    // The store is EMPTY until something loads contacts, and this bridge runs
+    // before anything else does -- which is why the first live run failed
+    // immediately in 0.39s. So seed it with one contacts.getContacts.
+    //
+    // That is not a contradiction of this file's whole premise. getContacts is
+    // useless for PRESENCE, which is what it was measured being frozen on, but
+    // it is perfectly good for the ROSTER: ids and access_hashes do not go
+    // stale. The statuses are then re-read fresh via users.getUsers below.
+    let ids = storeContactIds(AUM);
+    out.id_source = "store contactsList";
+    if (!ids.length) {
+      try {
+        const t0 = Date.now();
+        const c = await AM.invokeApi("contacts.getContacts", { hash: 0 });
+        const seeded = (c && c.users) || [];
+        out.seed_ms = Date.now() - t0;
+        out.seeded_users = seeded.length;
+        try {
+          if (AUM.saveApiUsers) AUM.saveApiUsers(seeded);
+        } catch (e) { out.errors.push("saveApiUsers:" + errStr(e)); }
+        ids = storeContactIds(AUM);
+        out.id_source = "store after seeding";
+        if (!ids.length) {
+          // Last resort: the ids straight out of the seed reply. Less reliable
+          // than the store's own keys, so it is recorded when used.
+          ids = seeded.filter((u) => u && u.id != null).map((u) => u.id);
+          out.id_source = "seed reply (store still empty)";
+        }
+      } catch (e) {
+        out.errors.push("seed contacts.getContacts:" + errStr(e));
+      }
+    }
     out.store_ids = ids.length;
     if (!ids.length) {
       out.ok = false;
-      out.code = "appUsersManager holds no contact ids";
+      out.code = "no contact ids: store is empty and seeding failed"
+                 + (out.errors.length ? " (" + out.errors.join("; ") + ")" : "");
       return out;
     }
 
