@@ -27,6 +27,7 @@ if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
 from eitaa.send_order import (  # noqa: E402
+    COARSE_WINDOW_SEC,
     EXACT_WINDOW_SEC,
     TIER_KEYS,
     build_order,
@@ -222,21 +223,21 @@ def test_exact_window_boundary() -> None:
     print("\n[boundary] the 24h edge")
     check("exactly 24h old is still 'today'",
           classify("userStatusOffline", was_online=NOW - DAY, now=NOW)[0] == "today")
-    check("one second past 24h is not",
-          classify("userStatusOffline", was_online=NOW - DAY - 1, now=NOW)[0] == "long_ago")
+    check("one second past 24h leaves 'today'",
+          classify("userStatusOffline", was_online=NOW - DAY - 1, now=NOW)[0]
+          == "week_or_month")
+    check("one second past 24h does NOT fall to long_ago",
+          classify("userStatusOffline", was_online=NOW - DAY - 1, now=NOW)[0]
+          != "long_ago")
     check("the window constant is 24h", EXACT_WINDOW_SEC == DAY, EXACT_WINDOW_SEC)
-
-
-def test_stale_exact_timestamp_raises_a_warning() -> None:
-    print("\n[premise] a real timestamp older than 24h must NOT pass quietly")
-    tier, reason = classify("userStatusOffline", was_online=NOW - 40 * DAY, now=NOW)
-    check("it is filed last", tier == "long_ago", tier)
-    check("and flagged as exact_stale", reason == "exact_stale", reason)
-
-    plan = build_order([c(1, "userStatusOffline", was_online=NOW - 40 * DAY)], now=NOW)
-    check("build_order warns that Eitaa's 24h cutoff changed",
-          any("24h" in w and "premise" in w for w in plan["warnings"]),
-          plan["warnings"])
+    check("the coarse band ends at 30d", COARSE_WINDOW_SEC == 30 * DAY,
+          COARSE_WINDOW_SEC)
+    check("30d exactly is still week_or_month",
+          classify("userStatusOffline", was_online=NOW - 30 * DAY, now=NOW)[0]
+          == "week_or_month")
+    check("past 30d falls to long_ago",
+          classify("userStatusOffline", was_online=NOW - 30 * DAY - 1, now=NOW)[0]
+          == "long_ago")
 
 
 def test_unknown_status_is_reported_not_swallowed() -> None:
@@ -248,6 +249,116 @@ def test_unknown_status_is_reported_not_swallowed() -> None:
     plan = build_order([c(1, "userStatusSomethingNew")], now=NOW)
     check("and it warns", any("unrecognised" in w for w in plan["warnings"]),
           plan["warnings"])
+
+
+def test_online_is_never_demoted_by_our_clock() -> None:
+    """The live run emptied tier 1 completely. This is why.
+
+    All 9 online contacts came back with an `expires` already in the past
+    according to THIS host's clock, and an earlier version demoted every one of
+    them to tier 2. The tier the whole feature exists for had zero members while
+    the report looked healthy. Eitaa saying userStatusOnline is the statement
+    that they are online; our clock does not get to overrule it.
+    """
+    print("\n[online] a past `expires` must NOT empty tier 1")
+    tier, reason = classify("userStatusOnline", expires=NOW - 600, now=NOW)
+    check("expires 10m in the past still means online",
+          (tier, reason) == ("online", "online"), (tier, reason))
+    check("and it is NOT relabelled online_expired", reason != "online_expired",
+          reason)
+    check("no expires at all still means online",
+          classify("userStatusOnline", now=NOW)[0] == "online")
+    check("future expires means online",
+          classify("userStatusOnline", expires=NOW + 300, now=NOW)[0] == "online")
+
+    # Reproduce the live shape: 9 online, every expires in the past.
+    plan = build_order([c(i, "userStatusOnline", expires=NOW - 300 - i)
+                        for i in range(9)], now=NOW)
+    check("all 9 land in tier 1", plan["tier_counts"]["online"] == 9,
+          plan["tier_counts"])
+    check("tier 2 stays empty", plan["tier_counts"]["today"] == 0)
+
+    # Silently trusting the server is not the same as not noticing. The skew is
+    # real information about the host and has to be surfaced.
+    check("the clock skew is counted",
+          plan["clock"]["online_expires_in_past"] == 9, plan["clock"])
+    check("and reported as an observation, not a warning",
+          any("ntp" in o for o in plan["observations"]) and plan["warnings"] == [],
+          (plan["observations"], plan["warnings"]))
+
+
+def test_boundary_drift_is_not_an_alarm() -> None:
+    """One contact aged past 24h between two runs 65 minutes apart.
+
+    That is ordinary drift, but it was originally reported as a premise-breaking
+    WARNING and filed under long_ago, whose label reads "no usable last-seen
+    signal" -- false for a contact whose exact last-seen time we know.
+    """
+    print("\n[drift] just past 24h is normal, and is not 'no signal'")
+    tier, reason = classify("userStatusOffline", was_online=NOW - DAY - 300,
+                            now=NOW)
+    check("25h ago is not long_ago", tier == "week_or_month", tier)
+    check("labelled exact_over_24h", reason == "exact_over_24h", reason)
+
+    plan = build_order([c(1, "userStatusOffline", was_online=NOW - DAY - 300)],
+                       now=NOW)
+    check("it raises NO warning", plan["warnings"] == [], plan["warnings"])
+    check("but it IS reported as an observation",
+          any("24h edge" in o for o in plan["observations"]), plan["observations"])
+
+    # It must never outrank someone with fresher proof.
+    plan = build_order([c("drift", "userStatusOffline", was_online=NOW - DAY - 300),
+                        c("fresh", "userStatusOffline", was_online=NOW - 60),
+                        c("recent", "userStatusRecently")], now=NOW)
+    check("ranked below both 'today' and 'recently'",
+          [e["peer_id"] for e in plan["ordered"]] == ["fresh", "recent", "drift"],
+          [e["peer_id"] for e in plan["ordered"]])
+
+    # Far past the window is the reading that WOULD mean the premise broke.
+    tier, reason = classify("userStatusOffline", was_online=NOW - 200 * DAY,
+                            now=NOW)
+    check("200 days with an exact time -> long_ago", tier == "long_ago", tier)
+    check("and labelled exact_very_old", reason == "exact_very_old", reason)
+    plan = build_order([c(1, "userStatusOffline", was_online=NOW - 200 * DAY)],
+                       now=NOW)
+    check("THAT one warns",
+          any("premise" in w for w in plan["warnings"]), plan["warnings"])
+
+
+def test_reproduces_the_live_build_run() -> None:
+    """The second live run, exactly: online expired, one boundary drifter."""
+    print("\n[live] the real build_send_order run, tier for tier")
+    rows: list[dict] = []
+    n = 0
+
+    def add(k, status, **kw):
+        nonlocal n
+        for _ in range(k):
+            n += 1
+            rows.append(c(n, status, **kw))
+
+    add(9, "userStatusOnline", expires=NOW - 400)        # expires in the past
+    for i in range(208):
+        n += 1
+        rows.append(c(n, "userStatusOffline", was_online=NOW - 600 - i * 300))
+    add(1, "userStatusOffline", was_online=NOW - DAY - 900)   # the drifter
+    add(36, "userStatusOffline", was_online=0)
+    add(76, "userStatusRecently")
+    add(163, "userStatusLastWeek")
+    add(253, "userStatusLastMonth")
+    add(260, "userStatusEmpty")
+    check("same size as the real account", len(rows) == 1006, len(rows))
+
+    plan = build_order(rows, now=NOW)
+    tc = plan["tier_counts"]
+    expect = {"online": 9, "today": 208, "recently": 76,
+              "week_or_month": 417, "long_ago": 296}
+    for key, want in expect.items():
+        check(f"{key} == {want}", tc[key] == want, tc[key])
+    check("every contact placed exactly once", sum(tc.values()) == 1006)
+    check("no warnings on this data", plan["warnings"] == [], plan["warnings"])
+    check("two observations: clock skew and boundary drift",
+          len(plan["observations"]) == 2, plan["observations"])
 
 
 def test_edge_inputs() -> None:
@@ -265,16 +376,9 @@ def test_edge_inputs() -> None:
     check("future timestamp -> today (clock skew)",
           (tier, reason) == ("today", "clock_skew"), (tier, reason))
 
-    # An online record whose expiry has passed: not online NOW, but seen moments
-    # ago, so tier 2 rather than tier 1.
-    tier, reason = classify("userStatusOnline", expires=NOW - 60, now=NOW)
-    check("expired online -> today, not online",
-          (tier, reason) == ("today", "online_expired"), (tier, reason))
-    check("online with no expires stays online",
-          classify("userStatusOnline", now=NOW)[0] == "online")
-
     plan = build_order([], now=NOW)
-    check("empty input is fine", plan["total"] == 0 and plan["warnings"] == [])
+    check("empty input is fine", plan["total"] == 0 and plan["warnings"] == []
+          and plan["observations"] == [])
 
     plan = build_order([{"title": "no peer id", "status": "userStatusRecently"},
                         None, c(7, "userStatusRecently")], now=NOW)
@@ -297,7 +401,9 @@ def main() -> int:
     test_order_is_deterministic()
     test_reproduces_the_live_census()
     test_exact_window_boundary()
-    test_stale_exact_timestamp_raises_a_warning()
+    test_online_is_never_demoted_by_our_clock()
+    test_boundary_drift_is_not_an_alarm()
+    test_reproduces_the_live_build_run()
     test_unknown_status_is_reported_not_swallowed()
     test_edge_inputs()
 

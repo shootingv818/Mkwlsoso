@@ -72,6 +72,11 @@ import time
 #: assumed: the oldest genuine timestamp in a 1,006-contact census was 23.1h.
 EXACT_WINDOW_SEC = 86_400
 
+#: Grace band above EXACT_WINDOW_SEC. A timestamp landing here is a contact that
+#: drifted over the 24h edge since the list was fetched -- expected, not a fault.
+#: Only a timestamp beyond this band contradicts the measurement.
+COARSE_WINDOW_SEC = 30 * 86_400
+
 #: was_online below this is a sentinel meaning "no time given", not a date. No
 #: real account was last seen on 1970-01-02, and the observed values were all
 #: exactly 0. Kept as a window rather than `== 0` so a near-epoch variant is
@@ -94,7 +99,11 @@ TIER_LABEL: dict[str, str] = dict(TIERS)
 
 #: Reasons that mean the premise of this design no longer holds. Surfaced as
 #: warnings instead of being absorbed silently.
-ALARMING_REASONS = ("exact_stale",)
+#:
+#: `exact_over_24h` is deliberately NOT here. It fires on ordinary boundary
+#: drift, and a warning that cries wolf on every run trains you to ignore the
+#: one that matters.
+ALARMING_REASONS = ("exact_very_old",)
 
 
 def classify(status: str | None, was_online=None, expires=None,
@@ -116,11 +125,18 @@ def classify(status: str | None, was_online=None, expires=None,
         return "long_ago", "no_status"
 
     if name == "userStatusOnline":
-        # `expires` is when the online flag lapses, normally ~5 minutes out. If
-        # it has already passed, the object is stale and the person is NOT
-        # online now -- but they were moments ago, which is precisely tier 2.
-        if isinstance(expires, (int, float)) and int(expires) < now:
-            return "today", "online_expired"
+        # Eitaa saying userStatusOnline IS the statement that they are online.
+        # `expires` is NOT used to second-guess it.
+        #
+        # An earlier version demoted a contact to tier 2 when `expires` had
+        # already passed, reasoning that the record was stale. On the live
+        # account that emptied tier 1 completely: all 9 online contacts came
+        # back with an expires in the past and were demoted, so the tier the
+        # whole feature exists for had zero members. `expires` is compared
+        # against OUR host clock, and comparing a server's assertion against a
+        # clock we do not control is exactly the "chase the timestamp" mistake
+        # this module was written to avoid. The count of past-expiry records is
+        # reported by build_order as a clock observation instead.
         return "online", "online"
 
     if name == "userStatusOffline":
@@ -136,9 +152,24 @@ def classify(status: str | None, was_online=None, expires=None,
             return "today", "clock_skew"
         if age <= EXACT_WINDOW_SEC:
             return "today", "exact_within_24h"
-        # Eitaa is not supposed to produce this. If it does, the 24h premise
-        # this design rests on has changed and we need to know.
-        return "long_ago", "exact_stale"
+        if age <= COARSE_WINDOW_SEC:
+            # Just past the 24h edge. This is NORMAL and was originally
+            # mishandled twice over: first it was treated as an alarm, and
+            # second it was filed under long_ago, whose label is "no usable
+            # last-seen signal" -- which is plainly false for a contact whose
+            # exact last-seen time we know.
+            #
+            # It appears because contacts drift across the boundary between
+            # runs: a census at 19:59 showed 209 contacts inside 24h, and a
+            # rerun 65 minutes later showed 208 plus exactly one past the edge.
+            # Nothing about Eitaa changed; one person's timestamp simply aged
+            # out. The tier below is where Eitaa's own days-to-weeks contacts
+            # sit, so that is where this belongs.
+            return "week_or_month", "exact_over_24h"
+        # Weeks or months old WITH an exact timestamp. Eitaa is not supposed to
+        # give times this old at all, so this is the reading that would mean the
+        # 24-hour premise genuinely changed.
+        return "long_ago", "exact_very_old"
 
     if name == "userStatusRecently":
         return "recently", "recently"
@@ -182,6 +213,14 @@ def build_order(contacts: list[dict], now: int | None = None) -> dict:
     tier_counts = {k: 0 for k in TIER_KEYS}
     reason_counts: dict[str, int] = {}
     dropped_no_peer = 0
+    # Clock evidence. `now` is the browser's Date.now(), i.e. THIS host's clock,
+    # not Eitaa's. Eitaa sets an online contact's `expires` a few minutes into
+    # its own future, so an expires that looks past to us means our clock is
+    # ahead. Collected because it is real information about the box, and because
+    # it is the evidence for why `expires` is not used to place anyone.
+    expiry_past = 0
+    expiry_past_max = 0
+    stale_max_age = 0
 
     for seq, raw in enumerate(contacts or []):
         if not isinstance(raw, dict):
@@ -193,8 +232,17 @@ def build_order(contacts: list[dict], now: int | None = None) -> dict:
             continue
 
         was_online = raw.get("was_online")
+        expires = raw.get("expires")
         tier, reason = classify(raw.get("status"), was_online=was_online,
-                                expires=raw.get("expires"), now=now)
+                                expires=expires, now=now)
+
+        if reason == "online" and isinstance(expires, (int, float)):
+            behind = now - int(expires)
+            if behind > 0:
+                expiry_past += 1
+                expiry_past_max = max(expiry_past_max, behind)
+        if reason in ("exact_over_24h", "exact_very_old"):
+            stale_max_age = max(stale_max_age, now - int(was_online))
         entry = dict(raw)
         entry["tier"] = tier
         entry["reason"] = reason
@@ -208,13 +256,29 @@ def build_order(contacts: list[dict], now: int | None = None) -> dict:
     ordered = [t[3] for t in decorated]
 
     warnings: list[str] = []
+    observations: list[str] = []
+
+    if expiry_past:
+        observations.append(
+            f"{expiry_past} online contact(s) reported an `expires` already in "
+            f"the past, by up to {_dur(expiry_past_max)}. `expires` is compared "
+            f"against THIS host's clock, so the likely cause is the host clock "
+            f"running ahead of Eitaa's (check ntp). They are still placed in "
+            f"tier 1, because Eitaa saying userStatusOnline outranks our clock.")
+    if reason_counts.get("exact_over_24h"):
+        observations.append(
+            f"{reason_counts['exact_over_24h']} contact(s) sit just past the 24h "
+            f"edge (oldest {_dur(stale_max_age)}). Expected: contacts age across "
+            f"the boundary between runs. Filed under week_or_month, not long_ago, "
+            f"since their last-seen time IS known.")
+
     for reason, n in sorted(reason_counts.items()):
         if reason in ALARMING_REASONS:
             warnings.append(
-                f"{n} contact(s) have a genuine was_online OLDER than 24h "
-                f"({reason}). Eitaa's 24-hour cutoff is the premise these tiers "
-                f"are built on, so this means the premise changed -- revisit "
-                f"EXACT_WINDOW_SEC and the tier list.")
+                f"{n} contact(s) have an exact was_online far past the 24-hour "
+                f"window (oldest {_dur(stale_max_age)}). Eitaa is not supposed "
+                f"to give times that old at all, so the premise these tiers rest "
+                f"on has changed -- revisit EXACT_WINDOW_SEC and the tier list.")
         elif reason.startswith("unknown:"):
             warnings.append(
                 f"{n} contact(s) reported an unrecognised status "
@@ -233,7 +297,21 @@ def build_order(contacts: list[dict], now: int | None = None) -> dict:
         "reason_counts": reason_counts,
         "dropped_no_peer": dropped_no_peer,
         "warnings": warnings,
+        "observations": observations,
+        "clock": {"online_expires_in_past": expiry_past,
+                  "online_expires_behind_max_sec": expiry_past_max},
     }
+
+
+def _dur(seconds: int) -> str:
+    s = int(max(0, seconds))
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s // 60}m"
+    if s < 86400:
+        return f"{s // 3600}h {(s % 3600) // 60}m"
+    return f"{s // 86400}d {(s % 86400) // 3600}h"
 
 
 def groups(plan: dict, how_many: int = 3) -> list[dict]:

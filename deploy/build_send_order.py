@@ -107,16 +107,23 @@ def report(plan: dict, timings: dict, raw: int, skipped: int) -> None:
                           for g in groups(plan, how_many))
         say(f"    {how_many} groups: {parts}")
 
+    if plan.get("observations"):
+        say("")
+        say("  OBSERVATIONS — expected, but worth knowing")
+        say("  " + "-" * 62)
+        for o in plan["observations"]:
+            say(f"    - {o}")
+
     if plan["warnings"]:
         say("")
-        say("  WARNINGS")
+        say("  WARNINGS — something the design depends on may have changed")
         say("  " + "-" * 62)
         for w in plan["warnings"]:
             say(f"    ! {w}")
     else:
         say("")
-        say("  no warnings: every status was one Eitaa is known to send, and")
-        say("  no exact timestamp older than 24h appeared, so the 24-hour")
+        say("  no warnings: every status was one Eitaa is known to send, and no")
+        say("  exact timestamp appeared far past the 24-hour window, so the")
         say("  premise these tiers are built on still holds.")
 
     say("")
@@ -193,7 +200,8 @@ async def run(args) -> int:
         print("  loads, otherwise every contact would be filed as long_ago.")
         return 1
 
-    # Eitaa's own clock, so ages match the timestamps that produced them.
+    # The page's clock at the moment of the fetch. This is the HOST's clock, not
+    # Eitaa's -- see send_order.py on why `expires` is therefore not trusted.
     now = res.get("server_now") or int(time.time())
 
     t0 = time.time()
@@ -214,10 +222,18 @@ async def run(args) -> int:
             "tier_counts": plan["tier_counts"],
             "reason_counts": plan["reason_counts"],
             "warnings": plan["warnings"],
+            "observations": plan.get("observations", []),
+            "clock": plan.get("clock", {}),
             "groups": {"2": groups(plan, 2), "3": groups(plan, 3)},
+            # was_online and expires are kept deliberately. The first run of
+            # this script raised a question about one boundary contact that
+            # could not be answered from the saved file because only the tier
+            # was stored, forcing a rerun. Storing the raw values makes the
+            # same question answerable offline next time.
             "order": [
                 {"peer_id": e.get("peer_id"), "access_hash": e.get("access_hash"),
-                 "title": e.get("title"), "tier": e["tier"], "reason": e["reason"]}
+                 "title": e.get("title"), "tier": e["tier"], "reason": e["reason"],
+                 "was_online": e.get("was_online"), "expires": e.get("expires")}
                 for e in plan["ordered"]
             ],
         }

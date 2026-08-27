@@ -1118,9 +1118,12 @@ class EitaaDriver:
             return None
         if isinstance(res, dict) and res.get("ok"):
             contacts = res.get("contacts") or []
-            # server_now comes from the page so that last-seen ages are computed
-            # against the same clock that produced them; our own host clock can
-            # be minutes off and would misfile contacts near the 24h boundary.
+            # server_now is the PAGE's Date.now(), which is this host's clock,
+            # NOT Eitaa's. It is forwarded so that ages are measured at the
+            # instant the list was fetched rather than whenever the caller got
+            # around to tiering. It does not correct for host clock drift --
+            # live data showed this box running ahead of Eitaa, which is why
+            # send_order.py refuses to place anyone using `expires`.
             return {"ok": True, "count": len(contacts), "contacts": contacts,
                     "skipped": res.get("skipped", 0), "raw": res.get("raw", 0),
                     "server_now": res.get("server_now")}
