@@ -269,6 +269,13 @@ async def run(args) -> int:
               f"   in {res.get('batches', 0)} batches ({res.get('fetch_ms', 0)}ms)")
         if res.get("reply_shape"):
             print(f"    reply shape         : {res['reply_shape']}")
+        if res.get("probe"):
+            print("    input style probe   : (which way of addressing a user works)")
+            for k, v in (res["probe"] or {}).items():
+                print(f"       {k:<22} {v}")
+            print(f"    input style USED    : {res.get('input_style')}")
+        if res.get("saved_to_store") is not None:
+            print(f"    seeded into store   : {res['saved_to_store']}")
         if res.get("failed_batches"):
             print(f"    FAILED batches      : {res['failed_batches']} — those "
                   f"contacts keep their SNAPSHOT status, not a fresh one")

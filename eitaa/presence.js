@@ -190,6 +190,7 @@
     // it is perfectly good for the ROSTER: ids and access_hashes do not go
     // stale. The statuses are then re-read fresh via users.getUsers below.
     const base = {};                 // peer_id -> identity + last known status
+    const rawInput = {};             // peer_id -> inputUser, unmodified values
     let ids = storeContactIds(AUM);
     out.id_source = "store contactsList";
     if (!ids.length) {
@@ -209,6 +210,14 @@
           if (f.self || f.deleted || f.bot) continue;
           if (!u.access_hash) continue;
           const st = readStatus(u);
+          // The inputUser is built from the access_hash EXACTLY as the API
+          // handed it over -- same object, no String() and no round trip
+          // through Python. access_hash is a 64-bit value; stringifying it and
+          // handing the string back is what produced PEER_ID_INVALID on the
+          // first attempt, and relying on getUserInput instead only moved the
+          // problem to a store that was never populated.
+          rawInput[String(u.id)] = { _: "inputUser", user_id: u.id,
+                                     access_hash: u.access_hash };
           base[String(u.id)] = {
             peer_id: String(u.id), access_hash: String(u.access_hash),
             title: titleOf(u), username: u.username ? String(u.username) : "",
@@ -217,9 +226,24 @@
             fresh: false
           };
         }
-        try {
-          if (AUM.saveApiUsers) AUM.saveApiUsers(seeded);
-        } catch (e) { out.errors.push("saveApiUsers:" + errStr(e)); }
+        // NOT `if (AUM.saveApiUsers)` with nothing in the else. That silently
+        // skipped the whole step when the method is absent under a different
+        // name, and the absence then showed up far away as an empty
+        // users.getUsers reply -- a swallowed failure diagnosed as an API
+        // problem. Whether it ran is now recorded either way.
+        const save = AUM.saveApiUsers || AUM.saveApiUsersUnsafe;
+        if (typeof save === "function") {
+          try { save.call(AUM, seeded); out.saved_to_store = true; }
+          catch (e) {
+            out.saved_to_store = false;
+            out.errors.push("saveApiUsers:" + errStr(e));
+          }
+        } else {
+          out.saved_to_store = false;
+          out.errors.push("appUsersManager has no saveApiUsers — the store was "
+                          + "never populated, so getUserInput cannot build a "
+                          + "valid inputUser");
+        }
         ids = storeContactIds(AUM);
         out.id_source = "store after seeding";
         if (!ids.length) {
@@ -247,6 +271,47 @@
       return out;
     }
 
+    // A ONE-USER PROBE, before spending eleven round trips. The previous run
+    // made 11 calls, got ten empty arrays and one PEER_ID_INVALID, and still
+    // could not say WHICH way of building the input was wrong. This tries both
+    // on a single contact and reports each outcome separately, so one run is
+    // enough to know.
+    const probeKeys = Object.keys(rawInput);
+    if (probeKeys.length) {
+      const k0 = probeKeys[0];
+      out.probe = {};
+      try {
+        const r = await AM.invokeApi("users.getUsers", { id: [rawInput[k0]] });
+        const arr = asUserArray(r);
+        out.probe.raw_access_hash = arr.length
+          ? "OK (" + arr.length + " user, status="
+            + ((arr[0] && arr[0].status && arr[0].status._) || "none") + ")"
+          : "EMPTY reply, shape " + shapeOf(r);
+      } catch (e) {
+        out.probe.raw_access_hash = "ERROR " + errStr(e);
+      }
+      if (typeof getInput === "function") {
+        try {
+          const inp = getInput.call(AUM, ids[0]);
+          const r = await AM.invokeApi("users.getUsers", { id: [inp] });
+          const arr = asUserArray(r);
+          out.probe.getUserInput = arr.length
+            ? "OK (" + arr.length + " user)"
+            : "EMPTY reply, shape " + shapeOf(r);
+          out.probe.getUserInput_shape = shapeOf(inp);
+        } catch (e) {
+          out.probe.getUserInput = "ERROR " + errStr(e);
+        }
+      }
+    }
+
+    // Whichever input style the probe proved, use it. Preferring the raw
+    // access_hash because it needs no populated store to be correct.
+    const useRaw = !!(out.probe && String(out.probe.raw_access_hash || "")
+                                     .indexOf("OK") === 0);
+    out.input_style = useRaw ? "raw access_hash from the seed reply"
+                             : "appUsersManager.getUserInput";
+
     let batches = 0, failedBatches = 0, unbuildable = 0;
     let refreshed = 0, emptyReplies = 0;
     const t1 = Date.now();
@@ -254,11 +319,16 @@
       const slice = ids.slice(i, i + batchSize);
       const input = [];
       for (let j = 0; j < slice.length; j++) {
-        try {
-          const inp = getInput.call(AUM, slice[j]);
-          if (inp && inp._ && inp._ !== "inputUserEmpty") input.push(inp);
-          else unbuildable++;
-        } catch (e) { unbuildable++; }
+        const key = String(slice[j]);
+        let inp = null;
+        if (useRaw && rawInput[key]) {
+          inp = rawInput[key];
+        } else {
+          try { inp = getInput.call(AUM, slice[j]); } catch (e) { inp = null; }
+          if (!inp && rawInput[key]) inp = rawInput[key];
+        }
+        if (inp && inp._ && inp._ !== "inputUserEmpty") input.push(inp);
+        else unbuildable++;
       }
       if (!input.length) { failedBatches++; continue; }
       batches++;
