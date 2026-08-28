@@ -32,6 +32,85 @@ def create_campaign(account: str, text: str, names: list[str], limit: int | None
     return job
 
 
+async def _apply_send_order(driver, pending: list) -> list:
+    """Reorder pending recipients by Eitaa's own last-seen status. OPT-IN.
+
+    Order: online, then seen inside 24h, then "recently", then "last week/month",
+    then no signal -- running straight through to the last contact. NOBODY is
+    dropped; this only changes who goes first, so the worst case of it being
+    wrong is a send in a different order, never a shorter one.
+
+    Deliberately impossible to break a send:
+      * OFF (the default) returns the list untouched without importing anything
+        from send_order, so the previous behaviour is not merely restored, it is
+        never left.
+      * ON but anything at all failing -- the setting unreadable, the bridge
+        missing, statuses absent, an exception in the tiering -- returns the
+        ORIGINAL list and prints why. A broadcast must not be lost over the
+        order it goes out in.
+
+    The reason is always printed, never swallowed, so an ordering that quietly
+    did nothing can be told apart from one that worked.
+    """
+    try:
+        from bot.store import store as _s
+        if not _s.send_order:
+            return pending
+    except Exception as exc:  # noqa: BLE001
+        print(f"[send_order] setting unreadable, keeping the original order: "
+              f"{type(exc).__name__}: {exc}", flush=True)
+        return pending
+
+    try:
+        from eitaa.send_order import order_names, reorder_recipients
+
+        res = await driver.bridge_contacts_list()
+        if not isinstance(res, dict):
+            # Checked explicitly rather than left to res.get() raising, so the
+            # log says what was wrong instead of showing an AttributeError.
+            print(f"[send_order] SKIPPED, original order kept: contacts bridge "
+                  f"returned {type(res).__name__}, not a dict", flush=True)
+            return pending
+        if not res.get("ok"):
+            print(f"[send_order] SKIPPED, original order kept: contacts bridge "
+                  f"said {res.get('code', 'nothing')}", flush=True)
+            return pending
+
+        contacts = [c for c in (res.get("contacts") or []) if isinstance(c, dict)]
+        if not contacts:
+            print("[send_order] SKIPPED, original order kept: the contacts "
+                  "bridge returned no usable contact rows", flush=True)
+            return pending
+        if not any(c.get("status") for c in contacts):
+            # An older contacts_list.js is cached in this browser session, so no
+            # contact carries a status. Tiering that would put EVERYONE in the
+            # bottom tier and look like it had worked.
+            print("[send_order] SKIPPED, original order kept: the contacts "
+                  "bridge returned no status field (stale cached bridge in this "
+                  "browser session)", flush=True)
+            return pending
+
+        ordered, stats = reorder_recipients(
+            pending, order_names(contacts, now=res.get("server_now")))
+        if not stats.get("applied"):
+            print(f"[send_order] SKIPPED, original order kept: "
+                  f"{stats.get('reason')}", flush=True)
+            return pending
+
+        per = stats.get("per_tier") or {}
+        print("[send_order] applied: "
+              + "  ".join(f"{k}={per.get(k, 0)}" for k in
+                          ("online", "today", "recently", "week_or_month",
+                           "long_ago"))
+              + f"  matched={stats.get('matched')}"
+              + f"  no-status={stats.get('unmatched')} (sent last)", flush=True)
+        return ordered
+    except Exception as exc:  # noqa: BLE001 - ordering is never worth a failed send
+        print(f"[send_order] FAILED, original order kept: "
+              f"{type(exc).__name__}: {exc}", flush=True)
+        return pending
+
+
 async def _sleep_between(index: int) -> None:
     delay = random.uniform(config.SEND_MIN_DELAY, config.SEND_MAX_DELAY)
     await asyncio.sleep(delay)
@@ -64,6 +143,7 @@ async def run_campaign(job: JobState) -> JobState:
             return job
 
         pending = [r for r in job.recipients if r.status == st.PENDING]
+        pending = await _apply_send_order(driver, pending)
         total_pending = len(pending)
         print(f"[campaign] {job.job_id}: {total_pending} pending of {len(job.recipients)} total")
 

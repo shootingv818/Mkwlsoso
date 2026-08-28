@@ -31,6 +31,8 @@ def _defaults() -> dict[str, Any]:
             "apk_octet": bool(config.APK_OCTET),
             # Opt-in Warm Path engine (see eitaa/warmpath.py). OFF by default.
             "warmpath": bool(config.WARMPATH),
+            # Opt-in tiered send order (see eitaa/send_order.py). OFF by default.
+            "send_order": bool(config.SEND_ORDER),
             # Opt-in Contact Boost (see contacts_boost/). OFF by default; the
             # prefix is saved here so it survives restarts.
             "boost": bool(config.BOOST),
@@ -256,6 +258,20 @@ class Store:
     def toggle_warmpath(self) -> bool:
         new = not self.warmpath
         self.set_setting("warmpath", new)
+        return new
+
+    # ---- Send Order (see eitaa/send_order.py) ----
+    @property
+    def send_order(self) -> bool:
+        """Whether a broadcast is tiered by Eitaa's own last-seen status, and the
+        login card shows the online/today/recently counts. OFF by default;
+        turning it off restores the previous behaviour exactly, because nothing
+        calls into send_order while it is off."""
+        return bool(self._data["settings"].get("send_order", config.SEND_ORDER))
+
+    def toggle_send_order(self) -> bool:
+        new = not self.send_order
+        self.set_setting("send_order", new)
         return new
 
     # ---- Contact Boost (see contacts_boost/) ----

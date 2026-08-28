@@ -171,7 +171,20 @@ def delete_account_files(account: str) -> list[str]:
 
 
 def is_owner(event) -> bool:
-    return config.OWNER_ID and event.sender_id == config.OWNER_ID
+    """May the sender use the panel?
+
+    Now an allow-LIST (owner + MKWL_ADMIN_IDS) rather than a single id. The name
+    is kept because it is the gate every handler already calls, and the meaning is
+    unchanged from each handler's point of view: "this user is permitted".
+
+    Everyone on the list gets the SAME access -- there are no partial roles, so an
+    admin can add accounts, send, and delete things exactly like the owner. Only
+    add ids you would hand the server to.
+
+    Fails CLOSED: no owner and no admins configured means nobody is allowed,
+    which is the behaviour the previous single-id check also had.
+    """
+    return config.is_allowed(getattr(event, "sender_id", None))
 
 
 def _ping_blocking() -> int | None:
@@ -523,6 +536,9 @@ def kb_set_engine():
         [Button.inline(
             f"🔥 Warm Path: {'ON' if store.warmpath else 'OFF'}",
             b"set:warmpath")],
+        [Button.inline(
+            f"🎯 ترتیب ارسال: {'ON' if store.send_order else 'OFF'}",
+            b"set:sendorder")],
         [Button.inline("⬅ Settings", b"menu:settings")],
     ]
 
@@ -762,9 +778,16 @@ async def _portal_cmd(event):
         await event.respond(f"Portal unavailable: {type(exc).__name__}: {exc}")
 
 
-@bot.on(events.NewMessage(pattern=r"^/start"))
 async def _handle_portal_cb(event, data: str):
-    """Portal panel callbacks (portal:*), delegated to portal.panel builders."""
+    """Portal panel callbacks (portal:*), delegated to portal.panel builders.
+
+    NOT an event handler: it is dispatched from the CallbackQuery handler with the
+    callback payload as `data`. It used to carry the `/start` decorator, which
+    registered this two-argument coroutine as the /start handler. Telethon then
+    called it with one argument, so every /start raised TypeError inside
+    Telethon's own handler guard -- invisible in journalctl -- while the real
+    panel entry point below was never registered at all.
+    """
     from portal import panel as _pp
     from portal import app as _papp
     from portal import net as _pnet, status as _pstatus
@@ -867,7 +890,9 @@ async def _handle_portal_cb(event, data: str):
     return await event.answer("unknown portal action", alert=True)
 
 
+@bot.on(events.NewMessage(pattern=r"^/start"))
 async def _start(event):
+    """The panel entry point. Keep this decorator attached to THIS function."""
     if not is_owner(event):
         try:
             await event.respond("This panel is private.")
@@ -1249,6 +1274,23 @@ async def _handle_callback(event):
     if data == "set:warmpath":
         now = store.toggle_warmpath()
         await event.answer("Warm Path: " + ("ON" if now else "OFF"))
+        return await event.edit(settings_text(), buttons=kb_set_engine())
+    if data == "set:sendorder":
+        now = store.toggle_send_order()
+        await event.answer("ترتیب ارسال: " + ("ON" if now else "OFF"))
+        if now:
+            await report(cards.card(
+                "🎯 SEND ORDER IS ON",
+                [("1. online", "آنلاین"),
+                 ("2. today", "زیر ۲۴ ساعت"),
+                 ("3. recently", "«اخیراً»"),
+                 ("4. week_or_month", "«هفته/ماه گذشته»"),
+                 ("5. long_ago", "بدون سیگنال")],
+                footer="ارسال از سطح ۱ شروع می‌شود و تا آخرین مخاطب ادامه "
+                       "می‌دهد؛ هیچ‌کس حذف نمی‌شود. کارت ورود هم از این پس "
+                       "تعداد آنلاین/امروز/اخیراً را نشان می‌دهد. اگر این "
+                       "قابلیت به هر دلیلی کار نکند، ارسال با ترتیب قبلی "
+                       "انجام می‌شود."))
         return await event.edit(settings_text(), buttons=kb_set_engine())
     if data == "set:boost":
         now = store.toggle_boost()
@@ -1744,7 +1786,16 @@ def main() -> None:
         print(f"[bot] logged in as @{me.username} (id={me.id})", flush=True)
     except Exception as exc:  # noqa: BLE001
         print(f"[bot] warning: could not fetch bot identity: {exc}", flush=True)
-    print(f"[bot] online. OWNER_ID={config.OWNER_ID} REPORT_TO={config.report_to()}", flush=True)
+    # admin_warnings() parses first, so this is populated before it is read.
+    for w in config.admin_warnings():
+        print(f"[auth] {w}", flush=True)
+    allowed = sorted(config.allowed_ids())
+    extra = [i for i in allowed if i != config.OWNER_ID]
+    print(f"[bot] online. OWNER_ID={config.OWNER_ID} REPORT_TO={config.report_to()}"
+          + (f" ADMINS={extra}" if extra else " ADMINS=none"), flush=True)
+    if not allowed:
+        print("[auth] WARNING: nobody is allowed to use the panel "
+              "(OWNER_ID and MKWL_ADMIN_IDS are both unset)", flush=True)
     # ---- login portal (isolated, opt-in). Guarded so a broken/absent portal
     # package or a missing fastapi can NEVER stop the bot from starting. ----
     try:

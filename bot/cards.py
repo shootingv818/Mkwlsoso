@@ -122,6 +122,35 @@ def eta(done: int, total: int, elapsed: float) -> str:
 # END of the list, or did it give up part way? Everything below is derived from
 # numbers the cards already receive, so no caller has to change.
 
+def send_order_applied(phone: str, per_tier: dict, total: int) -> str:
+    """Posted once, when a send has actually been reordered by tier.
+
+    It exists because a reordered send looked BROKEN from the outside: the owner
+    saw "recently" contacts interleaved with month-old ones and reasonably
+    concluded the ordering had failed. Showing the tier sizes up front makes the
+    run readable -- 340 of 509 being in one tier explains why a long stretch of
+    the send looks uniform, and then changes.
+    """
+    from eitaa.send_order import TIER_FA, TIER_KEYS
+    rows: list[tuple[str, object]] = [("Phone", phone)]
+    for i, key in enumerate(TIER_KEYS, start=1):
+        n = int(per_tier.get(key) or 0)
+        if not n:
+            continue
+        pct = f"  ({n * 100.0 / total:.1f}%)" if total else ""
+        rows.append((f"{i}. {TIER_FA[key]}", f"{n:,}{pct}"))
+    unknown = total - sum(int(per_tier.get(k) or 0) for k in TIER_KEYS)
+    if unknown > 0:
+        rows.append(("بدون سطح", f"{unknown:,} (آخر صف)"))
+    return card(
+        "🎯 SEND ORDER APPLIED",
+        rows,
+        footer=f"ارسال از سطح ۱ شروع می‌شود و تا آخرین نفر از {total:,} مخاطب "
+               f"ادامه می‌دهد. کارت زنده نشان می‌دهد در هر لحظه کدام سطح در "
+               f"حال ارسال است.",
+    )
+
+
 def _n(v: object) -> int:
     try:
         return int(v or 0)
@@ -295,7 +324,7 @@ def live_stages(phone: str, stages: list[tuple[str, str, float | None]],
 
 def live_send(phone: str, sent: int, failed: int, total: int, elapsed: float,
               status: str = "🟢 Sending", engine: str | None = None,
-              kind: str | None = None) -> str:
+              kind: str | None = None, stage: str | None = None) -> str:
     lines = [
         "📤 SENDING — Live",
         DIVIDER,
@@ -303,6 +332,10 @@ def live_send(phone: str, sent: int, failed: int, total: int, elapsed: float,
         bar(sent + failed, total),
         *_rows([
             ("Status ", status),
+            # Which tier is going out right now. Without it a tiered send is
+            # unreadable from the outside: a long uniform stretch looks like the
+            # ordering was ignored, when it is simply one large tier.
+            ("مرحله  ", stage),
             ("Type   ", kind),
             ("Sent   ", f"{sent} of {total}"),
             ("Failed ", failed or None),
@@ -562,16 +595,36 @@ def panel_home(accounts: int, ready: int, active: str | None,
 
 
 def account_added(account: str, phone: str, contacts: int | None, pvs: int | None,
-                  engine: str | None = None, saved: int | None = None) -> str:
+                  engine: str | None = None, saved: int | None = None,
+                  tiers: dict | None = None) -> str:
+    """The card posted after a successful login.
+
+    `tiers` is the optional Send Order summary ({online, today, recently}). It is
+    None whenever that feature is off, or whenever the status data could not
+    support the counts -- and then these rows are simply absent. They are never
+    shown as zeros, because 0/0/0 reads as "nobody is active" while the truth in
+    that case is "we could not tell", and those are different statements.
+    """
+    rows: list[tuple[str, object]] = [
+        ("Phone   ", phone),
+        ("Contacts", f"{contacts:,}" if isinstance(contacts, int) and contacts >= 0 else "—"),
+        ("Chats   ", pvs if isinstance(pvs, int) and pvs >= 0 else "—"),
+        ("Saved   ", f"{saved:,}" if saved else None),
+    ]
+    if tiers:
+        total = tiers.get("total") or 0
+        def _row(n):
+            n = int(n or 0)
+            return f"{n:,}" + (f"  ({n * 100.0 / total:.1f}%)" if total else "")
+        rows += [
+            ("Online  ", _row(tiers.get("online"))),
+            ("Today   ", _row(tiers.get("today"))),
+            ("Recently", _row(tiers.get("recently"))),
+        ]
+    rows.append(("Time    ", now_hms()))
     return card(
         "✅ ACCOUNT ADDED",
-        [
-            ("Phone   ", phone),
-            ("Contacts", f"{contacts:,}" if isinstance(contacts, int) and contacts >= 0 else "—"),
-            ("Chats   ", pvs if isinstance(pvs, int) and pvs >= 0 else "—"),
-            ("Saved   ", f"{saved:,}" if saved else None),
-            ("Time    ", now_hms()),
-        ],
+        rows,
         footer=("Contacts saved — this account is ready to send." if saved else
                 "Logged in, but no contacts came back. Add contacts in Eitaa, then tap "
                 "🔄 Update Contacts on this account."),

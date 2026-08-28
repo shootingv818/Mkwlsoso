@@ -58,16 +58,28 @@
       if (u.pFlags && (u.pFlags.deleted || u.pFlags.bot)) { skipped++; continue; }
       if (u.pFlags && u.pFlags.self) { skipped++; continue; }
       if (!u.access_hash) { skipped++; continue; }
+      // u.status is on the wire already and used to be dropped here, exactly as
+      // access_hash once was. It is what the broadcast send order is built from
+      // (eitaa/send_order.py), so no extra API call is needed for tiering.
+      //
+      // The RAW constructor name is passed through and NOT interpreted here.
+      // Python owns the mapping, because that is where it can be unit-tested
+      // without a browser. was_online is forwarded verbatim including 0 -- 0
+      // means "no time given", and deciding that in the page would hide it.
+      const st = u.status;
       out.push({
         peer_id: String(u.id),
         access_hash: String(u.access_hash),
         title: titleOf(u),
         username: u.username ? String(u.username) : "",
-        phone: u.phone ? String(u.phone) : ""
+        phone: u.phone ? String(u.phone) : "",
+        status: (st && st._) ? String(st._) : "",
+        was_online: (st && typeof st.was_online === "number") ? st.was_online : null,
+        expires: (st && typeof st.expires === "number") ? st.expires : null
       });
     }
 
     return { ok: true, count: out.length, contacts: out, skipped: skipped,
-             raw: users.length };
+             raw: users.length, server_now: Math.floor(Date.now() / 1000) };
   };
 })();

@@ -10,6 +10,15 @@ import os
 from pathlib import Path
 
 
+#: Problems found while parsing MKWL_ADMIN_IDS. Printed at startup, because an
+#: admin who was silently NOT added would just be told "This panel is private"
+#: with nothing anywhere to explain why.
+ADMIN_ID_WARNINGS: list[str] = []
+
+#: ((owner_id, raw_admins), parsed_set) -- see Config.allowed_ids().
+_ALLOWED_CACHE: tuple[tuple[int, str], set[int]] | None = None
+
+
 def _load_dotenv(path: str = ".env") -> None:
     """Minimal .env loader so we don't add a dependency.
 
@@ -104,12 +113,19 @@ class Config:
 
     # ---- Telegram control bot ----
     # Telethon needs API_ID/API_HASH (from my.telegram.org) plus a BOT_TOKEN
-    # (from @BotFather). OWNER_ID is the only Telegram user allowed to use the
-    # panel. REPORT_TO is where log cards are posted (defaults to the owner).
+    # (from @BotFather). OWNER_ID is the PRIMARY owner: log cards default to that
+    # chat and it is the id printed at startup. MKWL_ADMIN_IDS adds further
+    # Telegram user ids that may use the panel -- see allowed_ids().
+    # REPORT_TO is where log cards are posted (defaults to the owner).
     API_ID: int = _get_int("API_ID", 0)
     API_HASH: str = os.environ.get("API_HASH", "")
     BOT_TOKEN: str = os.environ.get("BOT_TOKEN", "")
     OWNER_ID: int = _get_int("OWNER_ID", 0)
+    #: Extra Telegram user ids allowed to use the panel, comma-separated.
+    #: These get the SAME access as the owner -- there are no partial roles here,
+    #: so only add ids you would hand the server to. Kept as a raw string and
+    #: parsed in allowed_ids() so one malformed entry cannot stop the bot booting.
+    ADMIN_IDS_RAW: str = os.environ.get("MKWL_ADMIN_IDS", "")
     REPORT_TO: int = _get_int("REPORT_TO", 0)  # 0 -> fall back to OWNER_ID
     BOT_VERSION: str = os.environ.get("BOT_VERSION", "1.0")
     # Optional: the noVNC URL shown in the "Add Account" login hint so the
@@ -141,6 +157,14 @@ class Config:
     # every job. OFF by default; the Settings panel toggles it live. Turning it
     # off restores the previous behaviour exactly. See eitaa/warmpath.py.
     WARMPATH: bool = _get_bool("MKWL_WARMPATH", False)
+    # Send Order (isolated, opt-in, see eitaa/send_order.py). Tiers a broadcast
+    # by the last-seen status Eitaa itself reports -- online, then seen inside
+    # 24h, then "recently", then "last week/month", then no signal -- and shows
+    # the first three counts on the ACCOUNT ADDED card. OFF by default; the
+    # Settings panel toggles it live. When OFF nothing calls into send_order at
+    # all, so the card and the send behave exactly as before, and when ON a
+    # failure anywhere in it leaves the original order untouched.
+    SEND_ORDER: bool = _get_bool("MKWL_SEND_ORDER", False)
     # Contact Boost (isolated, opt-in, see contacts_boost/). After an account is
     # added it probes a fixed block of unused numbers under BOOST_PREFIX through
     # contacts.importContacts and keeps whoever exists. It does NOT chase a
@@ -254,6 +278,83 @@ class Config:
     @classmethod
     def report_to(cls) -> int:
         return cls.REPORT_TO or cls.OWNER_ID
+
+    @classmethod
+    def allowed_ids(cls) -> set[int]:
+        """Every Telegram user id allowed to drive the panel.
+
+        The owner plus MKWL_ADMIN_IDS. Parsed defensively: a username, a negative
+        number or a stray separator is skipped with a warning rather than crashing
+        the bot at import -- an auth list that stops the bot from booting is worse
+        than one that is short by an entry you can see in the log.
+
+        A bad entry is NEVER treated as "allow everyone": the set only ever grows
+        by values that parsed as positive integers.
+
+        MEMOISED, because is_allowed() runs on every incoming message. Parsing per
+        message would re-append the same warnings forever (an unbounded list) and
+        re-split the string for nothing. The cache is keyed on the inputs, so a
+        test or a reload that changes them still recomputes.
+        """
+        global _ALLOWED_CACHE
+        key = (cls.OWNER_ID, str(cls.ADMIN_IDS_RAW or ""))
+        if _ALLOWED_CACHE is not None and _ALLOWED_CACHE[0] == key:
+            return _ALLOWED_CACHE[1]
+
+        out: set[int] = set()
+        warnings: list[str] = []
+        if cls.OWNER_ID:
+            out.add(int(cls.OWNER_ID))
+        for chunk in key[1].replace(";", ",").split(","):
+            chunk = chunk.strip()
+            if not chunk:
+                continue
+            try:
+                uid = int(chunk)
+            except ValueError:
+                warnings.append(
+                    f"MKWL_ADMIN_IDS: {chunk!r} is not a numeric user id "
+                    f"(use the numeric id, not a @username) -- ignored")
+                continue
+            if uid <= 0:
+                warnings.append(
+                    f"MKWL_ADMIN_IDS: {uid} is not a valid user id -- ignored")
+                continue
+            out.add(uid)
+
+        ADMIN_ID_WARNINGS[:] = warnings
+        _ALLOWED_CACHE = (key, out)
+        return out
+
+    @classmethod
+    def admin_warnings(cls) -> list[str]:
+        """Problems found parsing MKWL_ADMIN_IDS.
+
+        A method on Config rather than a bare module global because callers do
+        `from config import config` and get the INSTANCE -- reading a module-level
+        name off it raises AttributeError, which is exactly how the first version
+        of this crashed the bot at startup.
+
+        Calls allowed_ids() first so the list is actually populated: parsing is
+        lazy, so reading the warnings before anything has parsed returns nothing
+        and the misconfiguration stays invisible.
+        """
+        cls.allowed_ids()
+        return list(ADMIN_ID_WARNINGS)
+
+    @classmethod
+    def is_allowed(cls, user_id: object) -> bool:
+        """May this Telegram user id use the panel?
+
+        Fails CLOSED: if no owner and no admins are configured, nobody is allowed.
+        Before this existed the check was `OWNER_ID and sender_id == OWNER_ID`,
+        which also fails closed, and that property must not be lost.
+        """
+        try:
+            uid = int(user_id)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return False
+        return uid in cls.allowed_ids()
 
     @classmethod
     def profile_dir(cls, account: str) -> Path:
