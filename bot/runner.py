@@ -156,21 +156,28 @@ def _is_limit(detail: str) -> bool:
 ENGINES = ("bridge", "hybrid", "direct")
 
 
-def _order_by_tier(account: str, items: list) -> tuple[list, dict, dict]:
+async def _order_by_tier(account: str, items: list,
+                         driver=None) -> tuple[list, dict, dict]:
     """Reorder a send by Eitaa's own last-seen tier. OPT-IN, and never fatal.
 
-    Returns (items, title -> tier rank, tier -> count). When the feature is off,
-    or when there is no tier data, the items come back UNTOUCHED and both maps are
-    empty, so the caller's behaviour is identical to before.
+    Returns (items, peer_id -> tier rank, tier -> count). When the feature is
+    off, or when no tier data can be obtained, the items come back UNTOUCHED and
+    both maps are empty, so behaviour is identical to before.
 
-    Tiers are read from the CONTACTS CACHE, not from the browser. That is what
-    lets the browser-free send path order itself too -- it has no page to ask.
+    SELF-HEALING. Tiers normally come from the contacts cache, which is what lets
+    the browser-free path order itself -- it has no page to ask. But a cache
+    written before tiers existed has none, and the first live run hit exactly
+    that: the order was left alone, no stage appeared on the card, and the fix
+    was a manual "Update Contacts" the owner had no reason to know about. So when
+    a `driver` IS available (every bridge send has one), the statuses are fetched
+    and written onto the cache in passing. The feature repairs itself instead of
+    depending on a step someone has to remember.
 
-    The first attempt at this feature was wired into jobs/campaign.py, which is
-    the CLI path; the bot sends through bot/runner.py, so the ordering never ran
-    and a send came out in its original order while everything reported success.
-    Hence the loud log line either way: an ordering that silently did nothing has
-    to be distinguishable from one that worked.
+    The first version of this was wired into jobs/campaign.py, which is the CLI
+    path, while the bot sends through this file -- so the ordering never ran and
+    reported success anyway. Hence the loud log line on every outcome: an
+    ordering that silently did nothing must be distinguishable from one that
+    worked.
     """
     try:
         from bot.store import store as _s
@@ -183,37 +190,84 @@ def _order_by_tier(account: str, items: list) -> tuple[list, dict, dict]:
 
     try:
         from bot import contacts_store as _cs
-        from eitaa.send_order import reorder_recipients
+        from eitaa.send_order import classify, reorder_recipients
 
-        ranks = _cs.tiers(account)
-        if not ranks:
-            print(f"[send_order] ON but SKIPPED for {account}: the saved contacts "
-                  f"carry no tier. Tap '🔄 Update Contacts' on this account to "
-                  f"read statuses and store them.", flush=True)
+        by_peer = _cs.tiers_by_peer(account)
+        by_title = _cs.tiers(account)
+
+        if not by_peer and driver is not None:
+            # Repair the cache from the live page, then carry on.
+            try:
+                res = await driver.bridge_contacts_list()
+                rows = [c for c in ((res or {}).get("contacts") or [])
+                        if isinstance(c, dict) and c.get("status")]
+                if rows:
+                    now = (res or {}).get("server_now")
+                    fresh = {}
+                    for c in rows:
+                        tier, _r = classify(c.get("status"),
+                                            was_online=c.get("was_online"),
+                                            expires=c.get("expires"), now=now)
+                        if c.get("peer_id"):
+                            fresh[str(c["peer_id"])] = tier
+                    n = _cs.update_tiers(account, fresh)
+                    print(f"[send_order] the cache had no tiers; read statuses "
+                          f"live and saved {n} of {len(fresh)}", flush=True)
+                    by_peer = _cs.tiers_by_peer(account)
+                    by_title = _cs.tiers(account)
+                else:
+                    print("[send_order] tried to repair the cache but the "
+                          "contacts bridge returned no statuses "
+                          f"(code={(res or {}).get('code')}); this browser "
+                          "session may be running an older cached bridge",
+                          flush=True)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[send_order] live tier read failed: "
+                      f"{type(exc).__name__}: {exc}", flush=True)
+
+        if not by_peer and not by_title:
+            print(f"[send_order] ON but SKIPPED for {account}: no tier data, and "
+                  f"it could not be read live. Tap '🔄 Update Contacts' on this "
+                  f"account.", flush=True)
             return items, {}, {}
 
-        ordered, stats = reorder_recipients(items, ranks)
+        ordered, stats = reorder_recipients(items, by_title, peer_to_tier=by_peer)
         if not stats.get("applied"):
             print(f"[send_order] SKIPPED, original order kept: "
                   f"{stats.get('reason')}", flush=True)
             return items, {}, {}
 
         print(f"[send_order] applied to {len(ordered)}: {stats.get('summary')}"
+              f"  matched-by-peer={stats.get('by_peer')}"
+              f"  by-title={stats.get('by_title')}"
               f"  no-tier={stats.get('unmatched')} (last)", flush=True)
-        return ordered, ranks, (stats.get("per_tier") or {})
+        # BOTH maps go back. The bridge path can key the stage label on peer_id,
+        # but the browser-free path's "peer" is a serialised blob rather than an
+        # id, so there the title is the only key available. Returning one map
+        # would have silently dropped the stage line on that path.
+        return ordered, {"by_peer": by_peer, "by_title": by_title}, \
+            (stats.get("per_tier") or {})
     except Exception as exc:  # noqa: BLE001 - order is never worth a failed send
         print(f"[send_order] FAILED, original order kept: "
               f"{type(exc).__name__}: {exc}", flush=True)
         return items, {}, {}
 
 
-def _stage_for(name: str, tier_by_name: dict, tier_totals: dict) -> str | None:
-    """The live card's 'مرحله' line for the recipient being sent right now."""
-    if not tier_by_name:
+def _stage_for(peer_id, name, maps: dict, tier_totals: dict) -> str | None:
+    """The live card's 'مرحله' line for the recipient going out right now.
+
+    Tries peer_id then title, in the SAME order the ordering itself used, so the
+    label cannot disagree with the position -- which it would for two contacts
+    sharing a name if one keyed on peer and the other on title.
+    """
+    if not maps:
         return None
     try:
         from eitaa.send_order import stage_label
-        return stage_label(tier_by_name.get(name), tier_totals)
+        rank = (maps.get("by_peer") or {}).get(str(peer_id or ""))
+        if rank is None:
+            rank = (maps.get("by_title") or {}).get(str(name or "").strip())
+        return stage_label(rank, tier_totals)
     except Exception:  # noqa: BLE001 - a label must not break a send
         return None
 
@@ -1920,8 +1974,10 @@ class JobManager:
                 # SEND ORDER (opt-in). Applied here, AFTER the resume ledger and
                 # the refused-peer filter, so it orders exactly the list that is
                 # about to go out rather than one that still gets trimmed.
-                recipient_items, tier_by_name, tier_totals = _order_by_tier(
-                    account, recipient_items)
+                # `driver` is passed so a cache with no tiers repairs itself from
+                # the live page instead of silently skipping the ordering.
+                recipient_items, tier_maps, tier_totals = await _order_by_tier(
+                    account, recipient_items, driver=driver)
                 if tier_totals:
                     await report(cards.send_order_applied(phone, tier_totals,
                                                           len(recipient_items)))
@@ -2354,7 +2410,8 @@ class JobManager:
                                 total=total, elapsed=time.time() - start,
                                 status="🟢 Sending", state="running",
                                 engine=engine, kind=kind,
-                                stage=_stage_for(name, tier_by_name, tier_totals))
+                                stage=_stage_for(peer_id, name, tier_maps,
+                                                 tier_totals))
                         elif i % log_every == 0:
                             await report(cards.send_progress(
                                 sent, failed, skipped, total - i, time.time() - start))
@@ -2618,9 +2675,11 @@ class JobManager:
                     await agg.update(account, state="failed", force=True)
                 return
 
-            # Same ordering as the bridge path. It reads the contacts CACHE, so
-            # it works here despite there being no browser page to ask.
-            targets, tier_by_name, tier_totals = _order_by_tier(account, targets)
+            # Same ordering as the bridge path. No driver here -- this path has
+            # no page by design -- so it relies on the cache, which the bridge
+            # path keeps repaired.
+            targets, tier_maps, tier_totals = await _order_by_tier(
+                account, targets)
             if tier_totals:
                 await report(cards.send_order_applied(phone, tier_totals,
                                                       len(targets)))
@@ -2700,7 +2759,7 @@ class JobManager:
                         total=total, elapsed=time.time() - start,
                         status="🟢 Sending", state="running",
                         engine=engine, kind=kind,
-                        stage=_stage_for(label, tier_by_name, tier_totals))
+                        stage=_stage_for(None, label, tier_maps, tier_totals))
                 elif i % log_every == 0:
                     await report(cards.send_progress(
                         sent, failed, skipped, total - i, time.time() - start))

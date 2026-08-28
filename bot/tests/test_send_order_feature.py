@@ -116,7 +116,7 @@ def run(driver, recipients):
     return out, buf.getvalue()
 
 
-def run_bot(account, items):
+def run_bot(account, items, driver=None):
     """Call the real _order_by_tier -- the path the BOT actually sends through.
 
     This exists because the feature was first wired ONLY into jobs/campaign.py,
@@ -127,7 +127,7 @@ def run_bot(account, items):
     buf, old = io.StringIO(), sys.stdout
     sys.stdout = buf
     try:
-        res = _order_by_tier(account, items)
+        res = asyncio.run(_order_by_tier(account, items, driver=driver))
     finally:
         sys.stdout = old
     return res, buf.getvalue()
@@ -310,15 +310,15 @@ def test_the_path_the_bot_actually_sends_through() -> None:
     # The live card's stage line, which is what makes a long uniform stretch
     # readable instead of looking like the order was ignored.
     from bot.runner import _stage_for
-    check("stage at the start names tier 3 of 5",
-          "اخیراً (3 از 5)" in (_stage_for(names[0], tb, tt) or ""),
-          _stage_for(names[0], tb, tt))
-    check("stage after 400 has moved to tier 4",
-          "(4 از 5)" in (_stage_for(names[400], tb, tt) or ""),
-          _stage_for(names[400], tb, tt))
-    check("stage counts the tier's size",
-          "340" in (_stage_for(names[0], tb, tt) or ""),
-          _stage_for(names[0], tb, tt))
+    peers = [p for _n, p in out]
+
+    def stage(k):
+        return _stage_for(peers[k], names[k], tb, tt) or ""
+    check("stage at the start names tier 3 of 5", "اخیراً (3 از 5)" in stage(0),
+          stage(0))
+    check("stage after 400 has moved to tier 4", "(4 از 5)" in stage(400),
+          stage(400))
+    check("stage counts the tier's size", "340" in stage(0), stage(0))
 
     # A cache written before tiers existed must be left completely alone.
     cs.save("OLD", [{"title": "X1", "peer_id": "1"},
@@ -332,11 +332,126 @@ def test_the_path_the_bot_actually_sends_through() -> None:
     set_toggle(False)
 
 
+def test_duplicate_titles_do_not_swap_tiers() -> None:
+    """Reported live as an order that was "mostly right, a few wrong".
+
+    Real contact lists contain the same name twice. The lookup was keyed on
+    title, so one of the pair got the other's tier -- a handful of contacts sent
+    in the wrong place while the rest looked fine, which is exactly the shape of
+    the complaint. peer_id is unique and is now the primary key.
+    """
+    print("\n[duplicate names] peer_id must win over title")
+    from bot import contacts_store as cs
+    from bot.runner import _order_by_tier, _stage_for
+
+    cs.save("DUP", [
+        {"title": "علی", "peer_id": "1", "access_hash": "h",
+         "status": "userStatusOnline", "expires": 9e9},
+        {"title": "علی", "peer_id": "2", "access_hash": "h",
+         "status": "userStatusLastMonth"},
+        {"title": "زهرا", "peer_id": "3", "access_hash": "h",
+         "status": "userStatusRecently"},
+    ])
+    check("each duplicate keeps its OWN tier in the cache",
+          cs.tiers_by_peer("DUP") == {"1": 0, "2": 3, "3": 2},
+          cs.tiers_by_peer("DUP"))
+
+    set_toggle(True)
+    # The month-old 'علی' is fed FIRST, so a title-keyed lookup would leave it
+    # ahead of the online one.
+    (out, maps, tt), log = run_bot("DUP", [("علی", "2"), ("زهرا", "3"),
+                                           ("علی", "1")])
+    check("the ONLINE علی goes first, not the month-old one",
+          out == [("علی", "1"), ("زهرا", "3"), ("علی", "2")], out)
+    check("every match was made by peer_id", "matched-by-peer=3" in log, log)
+    check("and none fell back to title", "by-title=0" in log, log)
+    check("the stage label agrees with the position for peer 1",
+          "آنلاین" in (_stage_for("1", "علی", maps, tt) or ""),
+          _stage_for("1", "علی", maps, tt))
+    check("and differs for peer 2 despite the same name",
+          "هفته/ماه" in (_stage_for("2", "علی", maps, tt) or ""),
+          _stage_for("2", "علی", maps, tt))
+    set_toggle(False)
+
+
+def test_a_tierless_cache_repairs_itself() -> None:
+    """The reason no stage line appeared on the live run.
+
+    The account's cache predated tier saving, so there was nothing to order by.
+    The old code skipped and told the owner to run "Update Contacts" -- a manual
+    step nobody had reason to know about, in a log they were not reading. With a
+    driver available the statuses are now read live and written to the cache.
+    """
+    print("\n[self-heal] a cache with no tiers must fix itself, not just skip")
+    from bot import contacts_store as cs
+    from bot.runner import _order_by_tier
+
+    class LiveDriver:
+        def __init__(self, reply):
+            self._reply = reply
+            self.calls = 0
+
+        async def bridge_contacts_list(self):
+            self.calls += 1
+            if isinstance(self._reply, Exception):
+                raise self._reply
+            return self._reply
+
+    cs.save("HEAL", [{"title": "X1", "peer_id": "11"},
+                     {"title": "X2", "peer_id": "12"}])
+    check("the cache starts with no tiers", cs.tiers_by_peer("HEAL") == {},
+          cs.tiers_by_peer("HEAL"))
+
+    set_toggle(True)
+    drv = LiveDriver({"ok": True, "server_now": NOW, "contacts": [
+        {"title": "X1", "peer_id": "11", "access_hash": "h",
+         "status": "userStatusLastMonth"},
+        {"title": "X2", "peer_id": "12", "access_hash": "h",
+         "status": "userStatusOnline", "expires": 9e9}]})
+    (out, maps, tt), log = run_bot("HEAL", cs.items("HEAL"), driver=drv)
+    check("it read the statuses live", "read statuses live and saved 2" in log,
+          log.strip())
+    check("the order was then applied", out == [("X2", "12"), ("X1", "11")], out)
+    check("and the tiers are PERSISTED for next time",
+          cs.tiers_by_peer("HEAL") == {"11": 3, "12": 0},
+          cs.tiers_by_peer("HEAL"))
+    check("so the card can be posted", tt.get("online") == 1, tt)
+
+    # A second send needs no repair: the cache is already annotated.
+    drv2 = LiveDriver(RuntimeError("must not be called"))
+    (out2, _m2, _t2), _log2 = run_bot("HEAL", cs.items("HEAL"), driver=drv2)
+    check("a later send does not re-read", drv2.calls == 0, drv2.calls)
+    check("and is still ordered", out2 == [("X2", "12"), ("X1", "11")], out2)
+
+    # Repair failing must still leave the send alone rather than break it.
+    cs.save("HEAL2", [{"title": "Y1", "peer_id": "21"}])
+    before = cs.items("HEAL2")
+    (out3, _m3, tt3), log3 = run_bot("HEAL2", before,
+                                     driver=LiveDriver(RuntimeError("page gone")))
+    check("a failed repair keeps the original order", out3 == before, out3)
+    check("says the live read failed", "live tier read failed" in log3,
+          log3.strip())
+    check("and posts no card", tt3 == {}, tt3)
+
+    # A bridge with no statuses (old cached JS) must say so, not invent tiers.
+    (out4, _m4, tt4), log4 = run_bot(
+        "HEAL2", before,
+        driver=LiveDriver({"ok": True, "server_now": NOW,
+                           "contacts": [{"title": "Y1", "peer_id": "21"}]}))
+    check("a statusless bridge is reported", "returned no statuses" in log4,
+          log4.strip())
+    check("order untouched", out4 == before, out4)
+    check("no card", tt4 == {}, tt4)
+    set_toggle(False)
+
+
 def main() -> int:
     print("=" * 66)
     print("SEND ORDER FEATURE — opt-in, and unable to harm a send")
     print("=" * 66)
     test_the_path_the_bot_actually_sends_through()
+    test_duplicate_titles_do_not_swap_tiers()
+    test_a_tierless_cache_repairs_itself()
     test_off_is_a_true_no_op()
     test_on_applies_the_agreed_order()
     test_recipients_with_no_status_go_last_not_first()

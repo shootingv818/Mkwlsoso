@@ -155,6 +155,62 @@ def items(account: str) -> list[tuple[str, str | None]]:
             if c.get("title") or c.get("peer_id")]
 
 
+def tiers_by_peer(account: str) -> dict[str, int]:
+    """peer_id -> send-order tier rank. THE map to match on.
+
+    Titles are not unique. A real contact list has the same name twice, and
+    matching a send order by title gave one of them the other's tier -- reported
+    live as "mostly right, a few wrong". peer_id is unique, so this is the
+    primary lookup and tiers() is only the fallback for recipients that have no
+    peer_id at all.
+    """
+    out: dict[str, int] = {}
+    for c in contacts(account):
+        pid = c.get("peer_id")
+        rank = c.get("tier_rank")
+        if pid not in (None, "") and isinstance(rank, int):
+            out[str(pid)] = rank
+    return out
+
+
+def update_tiers(account: str, by_peer: dict[str, str]) -> int:
+    """Patch tiers onto an EXISTING cache without rewriting the contacts list.
+
+    Deliberately not a save(): save() has truncation guards and rebuilds the
+    list, and a tier refresh must never be able to shrink or reorder the cache it
+    is annotating. Returns how many contacts were updated.
+    """
+    if not by_peer:
+        return 0
+    rec = load(account)
+    rows = rec.get("contacts") or []
+    if not rows:
+        return 0
+    try:
+        from eitaa.send_order import TIER_INDEX
+    except Exception:  # noqa: BLE001
+        return 0
+    n = 0
+    for c in rows:
+        tier = by_peer.get(str(c.get("peer_id") or ""))
+        if not tier or tier not in TIER_INDEX:
+            continue
+        if c.get("tier") == tier:
+            continue
+        c["tier"] = tier
+        c["tier_rank"] = TIER_INDEX[tier]
+        n += 1
+    if not n:
+        return 0
+    rec["tiers_updated"] = time.time()
+    p = path_for(account)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(rec, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(p)
+    return n
+
+
 def tiers(account: str) -> dict[str, int]:
     """title -> send-order tier rank, for the contacts that have one.
 

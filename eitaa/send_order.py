@@ -484,7 +484,27 @@ def name_of(item) -> str:
     return str(item or "").strip()
 
 
-def reorder_recipients(recipients: list, name_to_tier: dict) -> tuple[list, dict]:
+def peer_of(item) -> str:
+    """The peer_id of a recipient, or "" when it has none.
+
+    Matching an order by TITLE put contacts with duplicate names in each other's
+    tier, which showed up live as an order that was "mostly right, a few wrong".
+    peer_id is unique, so it is what the lookup keys on.
+    """
+    if isinstance(item, (tuple, list)):
+        return str(item[1] or "") if len(item) > 1 and item[1] is not None else ""
+    for attr in ("peer_id", "peer"):
+        v = getattr(item, attr, None)
+        if v not in (None, ""):
+            return str(v)
+    if isinstance(item, dict):
+        v = item.get("peer_id")
+        return str(v) if v not in (None, "") else ""
+    return ""
+
+
+def reorder_recipients(recipients: list, name_to_tier: dict,
+                       peer_to_tier: dict | None = None) -> tuple[list, dict]:
     """Sort recipients into tier order. Returns (ordered, stats).
 
     Accepts objects with .name, (title, peer) pairs, or dicts -- see name_of().
@@ -498,16 +518,23 @@ def reorder_recipients(recipients: list, name_to_tier: dict) -> tuple[list, dict
     unchanged along with stats saying so.
     """
     try:
-        if not name_to_tier:
+        peer_to_tier = peer_to_tier or {}
+        if not name_to_tier and not peer_to_tier:
             return list(recipients), {"applied": False,
                                       "reason": "no tier data available"}
         unknown_rank = len(TIER_KEYS)
         decorated = []
         matched = 0
+        by_peer = 0
         per_tier = {k: 0 for k in TIER_KEYS}
         for i, r in enumerate(recipients):
             name = name_of(r)
-            rank = name_to_tier.get(name)
+            # peer_id FIRST: it is unique, while a title is not.
+            rank = peer_to_tier.get(peer_of(r))
+            if rank is not None:
+                by_peer += 1
+            else:
+                rank = name_to_tier.get(name)
             if rank is None:
                 rank = unknown_rank
             else:
@@ -518,6 +545,8 @@ def reorder_recipients(recipients: list, name_to_tier: dict) -> tuple[list, dict
         return [t[2] for t in decorated], {
             "applied": True, "matched": matched,
             "unmatched": len(recipients) - matched,
+            "by_peer": by_peer,
+            "by_title": matched - by_peer,
             "per_tier": per_tier,
             "summary": "  ".join(f"{k}={per_tier[k]}" for k in TIER_KEYS
                                  if per_tier[k]),
