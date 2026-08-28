@@ -105,7 +105,7 @@ class Driver:
 
 
 def run(driver, recipients):
-    """Call the real _apply_send_order, capturing what it printed."""
+    """Call the real _apply_send_order (the CLI path), capturing its output."""
     from jobs.campaign import _apply_send_order
     buf, old = io.StringIO(), sys.stdout
     sys.stdout = buf
@@ -114,6 +114,23 @@ def run(driver, recipients):
     finally:
         sys.stdout = old
     return out, buf.getvalue()
+
+
+def run_bot(account, items):
+    """Call the real _order_by_tier -- the path the BOT actually sends through.
+
+    This exists because the feature was first wired ONLY into jobs/campaign.py,
+    which is the CLI. The bot sends via bot/runner.py, so the ordering never ran
+    and a live send came out in its original order while reporting success.
+    """
+    from bot.runner import _order_by_tier
+    buf, old = io.StringIO(), sys.stdout
+    sys.stdout = buf
+    try:
+        res = _order_by_tier(account, items)
+    finally:
+        sys.stdout = old
+    return res, buf.getvalue()
 
 
 def set_toggle(on: bool) -> None:
@@ -234,10 +251,92 @@ def test_login_card_rows() -> None:
           card_counts([{"peer_id": "1", "title": "X"}], now=NOW) is None)
 
 
+def test_the_path_the_bot_actually_sends_through() -> None:
+    """The regression that mattered: the bot's OWN loop must be ordered.
+
+    Reported live on a 509-contact account -- 340 "recently" -- as a send that
+    came out mixed, with month-old and week-old contacts interleaved. The cause
+    was not the tiering: it was that the ordering had been wired into
+    jobs/campaign.py (the CLI path) while the bot sends through bot/runner.py.
+    The feature reported success and changed nothing.
+    """
+    print("\n[bot path] bot/runner.py is the loop that must be reordered")
+    from bot import contacts_store as cs
+    import random
+
+    raw = []
+    for i in range(340):
+        raw.append({"title": f"R{i}", "peer_id": str(i), "access_hash": "h",
+                    "status": "userStatusRecently"})
+    for i in range(120):
+        raw.append({"title": f"W{i}", "peer_id": str(1000 + i),
+                    "access_hash": "h", "status": "userStatusLastWeek"})
+    for i in range(49):
+        raw.append({"title": f"E{i}", "peer_id": str(2000 + i),
+                    "access_hash": "h", "status": "userStatusEmpty"})
+    cs.save("ACC", raw)
+
+    check("the tier is persisted with the contacts",
+          cs.tier_counts("ACC") == {"recently": 340, "week_or_month": 120,
+                                    "long_ago": 49}, cs.tier_counts("ACC"))
+    check("and a rank map is available without a browser",
+          len(cs.tiers("ACC")) == 509, len(cs.tiers("ACC")))
+
+    items = cs.items("ACC")
+    random.seed(1)
+    random.shuffle(items)
+    before = [n for n, _ in items]
+
+    set_toggle(False)
+    (out, tb, tt), log = run_bot("ACC", items)
+    check("OFF: order is identical", [n for n, _ in out] == before)
+    check("OFF: no tier maps, so no card is posted", (tb, tt) == ({}, {}))
+    check("OFF: silent", log == "", log)
+
+    set_toggle(True)
+    (out, tb, tt), log = run_bot("ACC", items)
+    names = [n for n, _ in out]
+    check("ON: the 340 'recently' go FIRST",
+          all(n[0] == "R" for n in names[:340]), names[:3])
+    check("ON: then the 120 week/month",
+          all(n[0] == "W" for n in names[340:460]), names[340:343])
+    check("ON: then the 49 with no signal",
+          all(n[0] == "E" for n in names[460:]), names[460:463])
+    check("ON: all 509 present, none duplicated",
+          len(names) == 509 == len(set(names)), len(names))
+    check("ON: it logs the applied tiers", "[send_order] applied to 509" in log,
+          log)
+
+    # The live card's stage line, which is what makes a long uniform stretch
+    # readable instead of looking like the order was ignored.
+    from bot.runner import _stage_for
+    check("stage at the start names tier 3 of 5",
+          "اخیراً (3 از 5)" in (_stage_for(names[0], tb, tt) or ""),
+          _stage_for(names[0], tb, tt))
+    check("stage after 400 has moved to tier 4",
+          "(4 از 5)" in (_stage_for(names[400], tb, tt) or ""),
+          _stage_for(names[400], tb, tt))
+    check("stage counts the tier's size",
+          "340" in (_stage_for(names[0], tb, tt) or ""),
+          _stage_for(names[0], tb, tt))
+
+    # A cache written before tiers existed must be left completely alone.
+    cs.save("OLD", [{"title": "X1", "peer_id": "1"},
+                    {"title": "X2", "peer_id": "2"}])
+    (out2, _tb2, tt2), log2 = run_bot("OLD", cs.items("OLD"))
+    check("a tier-less cache is left untouched",
+          [n for n, _ in out2] == ["X1", "X2"], out2)
+    check("no card is posted for it", tt2 == {}, tt2)
+    check("and it says to run Update Contacts",
+          "Update Contacts" in log2, log2.strip())
+    set_toggle(False)
+
+
 def main() -> int:
     print("=" * 66)
     print("SEND ORDER FEATURE — opt-in, and unable to harm a send")
     print("=" * 66)
+    test_the_path_the_bot_actually_sends_through()
     test_off_is_a_true_no_op()
     test_on_applies_the_agreed_order()
     test_recipients_with_no_status_go_last_not_first()

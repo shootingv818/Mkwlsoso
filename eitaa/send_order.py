@@ -465,8 +465,29 @@ def order_names(contacts: list[dict], now: int | None = None) -> dict:
     return out
 
 
+def name_of(item) -> str:
+    """The title of a recipient, whatever shape the caller uses.
+
+    The three send paths carry three different shapes -- jobs/campaign.py has an
+    object with .name, and both bot/runner.py loops have (title, peer) pairs. One
+    accessor so an ordering cannot silently match nothing just because it was
+    handed the shape it did not expect. That is exactly how the first attempt at
+    this feature ended up wired into a code path the bot never runs.
+    """
+    if isinstance(item, (tuple, list)):
+        return str(item[0] if item else "").strip()
+    name = getattr(item, "name", None)
+    if name is not None:
+        return str(name).strip()
+    if isinstance(item, dict):
+        return str(item.get("title") or item.get("name") or "").strip()
+    return str(item or "").strip()
+
+
 def reorder_recipients(recipients: list, name_to_tier: dict) -> tuple[list, dict]:
     """Sort recipients into tier order. Returns (ordered, stats).
+
+    Accepts objects with .name, (title, peer) pairs, or dicts -- see name_of().
 
     Recipients with no known tier keep their relative order and go LAST: an
     unknown tier is not evidence of activity, and guessing one would be the same
@@ -485,7 +506,7 @@ def reorder_recipients(recipients: list, name_to_tier: dict) -> tuple[list, dict
         matched = 0
         per_tier = {k: 0 for k in TIER_KEYS}
         for i, r in enumerate(recipients):
-            name = str(getattr(r, "name", "") or "").strip()
+            name = name_of(r)
             rank = name_to_tier.get(name)
             if rank is None:
                 rank = unknown_rank
@@ -498,7 +519,35 @@ def reorder_recipients(recipients: list, name_to_tier: dict) -> tuple[list, dict
             "applied": True, "matched": matched,
             "unmatched": len(recipients) - matched,
             "per_tier": per_tier,
+            "summary": "  ".join(f"{k}={per_tier[k]}" for k in TIER_KEYS
+                                 if per_tier[k]),
         }
     except Exception as exc:  # noqa: BLE001
         return list(recipients), {"applied": False,
                                   "reason": f"{type(exc).__name__}: {exc}"}
+
+
+
+#: Short Persian labels for the live send card, so the owner can see WHICH tier a
+#: send is currently working through instead of only a percentage. A mixed-looking
+#: send was reported as broken once already, and a stage line is what makes the
+#: difference between "the order is wrong" and "it has moved on to tier 4".
+TIER_FA: dict[str, str] = {
+    "online": "آنلاین",
+    "today": "۲۴ ساعت اخیر",
+    "recently": "اخیراً",
+    "week_or_month": "هفته/ماه گذشته",
+    "long_ago": "قدیمی / نامعلوم",
+}
+
+
+def stage_label(rank: int | None, per_tier: dict | None = None) -> str | None:
+    """"اخیراً (۳ از ۵) · ۳۴۰ نفر" for the tier currently being sent."""
+    if rank is None or not (0 <= rank < len(TIER_KEYS)):
+        return None
+    key = TIER_KEYS[rank]
+    txt = f"{TIER_FA[key]} ({rank + 1} از {len(TIER_KEYS)})"
+    n = (per_tier or {}).get(key)
+    if n:
+        txt += f" · {n:,} نفر"
+    return txt

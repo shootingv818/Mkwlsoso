@@ -156,6 +156,68 @@ def _is_limit(detail: str) -> bool:
 ENGINES = ("bridge", "hybrid", "direct")
 
 
+def _order_by_tier(account: str, items: list) -> tuple[list, dict, dict]:
+    """Reorder a send by Eitaa's own last-seen tier. OPT-IN, and never fatal.
+
+    Returns (items, title -> tier rank, tier -> count). When the feature is off,
+    or when there is no tier data, the items come back UNTOUCHED and both maps are
+    empty, so the caller's behaviour is identical to before.
+
+    Tiers are read from the CONTACTS CACHE, not from the browser. That is what
+    lets the browser-free send path order itself too -- it has no page to ask.
+
+    The first attempt at this feature was wired into jobs/campaign.py, which is
+    the CLI path; the bot sends through bot/runner.py, so the ordering never ran
+    and a send came out in its original order while everything reported success.
+    Hence the loud log line either way: an ordering that silently did nothing has
+    to be distinguishable from one that worked.
+    """
+    try:
+        from bot.store import store as _s
+        if not _s.send_order:
+            return items, {}, {}
+    except Exception as exc:  # noqa: BLE001
+        print(f"[send_order] setting unreadable, original order kept: "
+              f"{type(exc).__name__}: {exc}", flush=True)
+        return items, {}, {}
+
+    try:
+        from bot import contacts_store as _cs
+        from eitaa.send_order import reorder_recipients
+
+        ranks = _cs.tiers(account)
+        if not ranks:
+            print(f"[send_order] ON but SKIPPED for {account}: the saved contacts "
+                  f"carry no tier. Tap '🔄 Update Contacts' on this account to "
+                  f"read statuses and store them.", flush=True)
+            return items, {}, {}
+
+        ordered, stats = reorder_recipients(items, ranks)
+        if not stats.get("applied"):
+            print(f"[send_order] SKIPPED, original order kept: "
+                  f"{stats.get('reason')}", flush=True)
+            return items, {}, {}
+
+        print(f"[send_order] applied to {len(ordered)}: {stats.get('summary')}"
+              f"  no-tier={stats.get('unmatched')} (last)", flush=True)
+        return ordered, ranks, (stats.get("per_tier") or {})
+    except Exception as exc:  # noqa: BLE001 - order is never worth a failed send
+        print(f"[send_order] FAILED, original order kept: "
+              f"{type(exc).__name__}: {exc}", flush=True)
+        return items, {}, {}
+
+
+def _stage_for(name: str, tier_by_name: dict, tier_totals: dict) -> str | None:
+    """The live card's 'مرحله' line for the recipient being sent right now."""
+    if not tier_by_name:
+        return None
+    try:
+        from eitaa.send_order import stage_label
+        return stage_label(tier_by_name.get(name), tier_totals)
+    except Exception:  # noqa: BLE001 - a label must not break a send
+        return None
+
+
 def effective_engine(settings: dict) -> str:
     """The engine a job may actually use.
 
@@ -766,7 +828,7 @@ class JobManager:
                              account: str, phone: str, *, sent: int, failed: int,
                              total: int, elapsed: float, status: str, state: str,
                              engine: str | None, kind: str | None,
-                             force: bool = False) -> None:
+                             force: bool = False, stage: str | None = None) -> None:
         """Publish progress to whichever card this job owns.
 
         A multi-account job feeds the shared aggregate card; a single-account
@@ -777,11 +839,12 @@ class JobManager:
                              state=state, force=force)
         elif live is not None:
             await live.set(cards.live_send(phone, sent, failed, total, elapsed,
-                                           status=status, engine=engine, kind=kind),
+                                           status=status, engine=engine, kind=kind,
+                                           stage=stage),
                            force=force)
 
     @staticmethod
-    def _can_run_browserless(engine: str, account: str, recipients, settings) -> bool:
+    def _can_run_browserless(engine: str, account: str, recipients, settings) -> bool:  # noqa: E301
         """Can this run skip Chromium entirely?
 
         Only when ALL of these hold, because there is no page to fall back to:
@@ -1854,6 +1917,15 @@ class JobManager:
                                    "expire on a timer. Use 'Reset Refused' on the "
                                    "account to try them again."))
 
+                # SEND ORDER (opt-in). Applied here, AFTER the resume ledger and
+                # the refused-peer filter, so it orders exactly the list that is
+                # about to go out rather than one that still gets trimmed.
+                recipient_items, tier_by_name, tier_totals = _order_by_tier(
+                    account, recipient_items)
+                if tier_totals:
+                    await report(cards.send_order_applied(phone, tier_totals,
+                                                          len(recipient_items)))
+
                 total = len(recipient_items)
                 if total == 0 and skipped:
                     await report(cards.card(
@@ -2281,7 +2353,8 @@ class JobManager:
                                 live, agg, account, phone, sent=sent, failed=failed,
                                 total=total, elapsed=time.time() - start,
                                 status="🟢 Sending", state="running",
-                                engine=engine, kind=kind)
+                                engine=engine, kind=kind,
+                                stage=_stage_for(name, tier_by_name, tier_totals))
                         elif i % log_every == 0:
                             await report(cards.send_progress(
                                 sent, failed, skipped, total - i, time.time() - start))
@@ -2545,6 +2618,13 @@ class JobManager:
                     await agg.update(account, state="failed", force=True)
                 return
 
+            # Same ordering as the bridge path. It reads the contacts CACHE, so
+            # it works here despite there being no browser page to ask.
+            targets, tier_by_name, tier_totals = _order_by_tier(account, targets)
+            if tier_totals:
+                await report(cards.send_order_applied(phone, tier_totals,
+                                                      len(targets)))
+
             total = len(targets)
             if live is not None or agg is not None:
                 await self._send_progress(
@@ -2619,7 +2699,8 @@ class JobManager:
                         live, agg, account, phone, sent=sent, failed=failed,
                         total=total, elapsed=time.time() - start,
                         status="🟢 Sending", state="running",
-                        engine=engine, kind=kind)
+                        engine=engine, kind=kind,
+                        stage=_stage_for(label, tier_by_name, tier_totals))
                 elif i % log_every == 0:
                     await report(cards.send_progress(
                         sent, failed, skipped, total - i, time.time() - start))
