@@ -47,7 +47,14 @@ def check(name, cond, detail=""):
 
 
 def run(coro):
-    return asyncio.new_event_loop().run_until_complete(coro)
+    # Closed explicitly: an unclosed loop is garbage-collected at exit and on
+    # python 3.9 that prints a "Invalid file descriptor: -1" traceback AFTER
+    # the results, which looks like a test failure and is not one.
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
 
 
 # ---------------------------------------------------------------------------
@@ -122,6 +129,7 @@ class FakePage:
         self.typed: list[tuple[str, str]] = []
         self.keys: list[str] = []
         self.reloads = 0
+        self.gotos = 0
         self.keyboard = FakeKeyboard(self)
 
     def locator(self, sel):
@@ -144,6 +152,9 @@ class FakePage:
 
     async def reload(self, wait_until=None):
         self.reloads += 1
+
+    async def goto(self, url, wait_until=None, timeout=None):
+        self.gotos += 1
 
 
 class FakeDriver:
@@ -280,10 +291,85 @@ def test_request_code_field_refuses_input():
 
 def test_request_code_no_form():
     p = FakePage()
-    res = run(login_ui.request_code(FakeDriver(p), "989104938987"))
-    check("no login form on screen is reported clearly",
-          res.get("ok") is False and "not on screen" in str(res.get("code")),
+    res = run(login_ui.request_code(FakeDriver(p), "989104938987", form_wait_s=1.0))
+    check("a page with no form at all is reported clearly",
+          res.get("ok") is False and "no login form appeared" in str(res.get("code")),
           str(res.get("code")))
+    check("it tried a reload before giving up", p.reloads >= 1,
+          f"{p.reloads} reload(s)")
+
+
+def test_request_code_waits_for_a_slow_form():
+    """The live failure: 'the login form is not on screen' on a page that was
+    simply still booting. MKWL_WARMPATH reuses an already-open page instead of
+    navigating, and tweb mounts its login steps before revealing one, so asking
+    once is not enough."""
+    p = FakePage()                     # nothing on screen yet
+
+    async def drive():
+        task = asyncio.ensure_future(login_ui.request_code(
+            FakeDriver(p), "989104938987", form_wait_s=5.0))
+        await asyncio.sleep(0.05)      # the app is still booting
+        # now the form appears, exactly as it does after a warm page settles
+        def advance(page):
+            page.present = {login_ui.PAGE_CODE}
+            page.elements[login_ui.PAGE_CODE] = {"visible": True}
+            page.elements[CODE_SEL] = {"visible": True, "text": ""}
+        p.elements.update({
+            PHONE_SEL: {"visible": True, "text": "+98"},
+            BTN_SEL: {"visible": True, "on_click": advance},
+            login_ui.PAGE_PHONE: {"visible": True},
+        })
+        p.present = {login_ui.PAGE_PHONE}
+        return await task
+
+    res = run(drive())
+    check("a form that appears late is still used", res.get("ok") is True, str(res))
+
+
+def test_request_code_already_logged_in():
+    """An account that is already in must say so, not 'no form'."""
+    p = FakePage(chat_rows=12)
+    res = run(login_ui.request_code(FakeDriver(p), "989104938987", form_wait_s=2.0))
+    check("an already-logged-in account is recognised",
+          res.get("step") == "logged_in"
+          and "already logged in" in str(res.get("code")), str(res))
+    check("nothing was typed or submitted for it",
+          not p.typed and not p.clicks, f"typed={p.typed} clicks={p.clicks}")
+
+
+def test_request_code_navigates_a_warm_page_that_is_elsewhere():
+    p = FakePage()
+    run(login_ui.request_code(FakeDriver(p), "989104938987", form_wait_s=1.5))
+    check("it navigates to Eitaa when a warm page is somewhere else",
+          p.gotos >= 1, f"{p.gotos} navigation(s)")
+
+
+def test_persian_digits_in_a_flood_message():
+    """Live: Eitaa answered FLOOD_WAIT_۷۹۱ in Persian digits, which a `\\d+`
+    parser cannot read - so the wait was invisible to us and to the panel."""
+    check("Persian digits are normalised",
+          login_ui.normalize_digits("FLOOD_WAIT_۷۹۱") == "FLOOD_WAIT_791",
+          login_ui.normalize_digits("FLOOD_WAIT_۷۹۱"))
+    check("Arabic-Indic digits too",
+          login_ui.normalize_digits("FLOOD_WAIT_٧٩١") == "FLOOD_WAIT_791")
+    check("the wait is parsed from Persian digits",
+          login_ui.flood_seconds("FLOOD_WAIT_۷۹۱") == 791,
+          str(login_ui.flood_seconds("FLOOD_WAIT_۷۹۱")))
+    check("and from ASCII", login_ui.flood_seconds("FLOOD_WAIT_60") == 60)
+    check("a non-flood message yields nothing",
+          login_ui.flood_seconds("کد اشتباه است") is None)
+
+    # end to end: the message the panel shows must contain readable digits,
+    # because runner.py keys its RATE LIMITED card off the word FLOOD
+    def show_flood(page):
+        page.elements[".toast"] = {"visible": True, "text": "FLOOD_WAIT_۷۹۱"}
+    p = phone_page(elements={BTN_SEL: {"visible": True, "on_click": show_flood}})
+    res = run(login_ui.request_code(FakeDriver(p), "989104938987", wait_s=2.0))
+    msg = str(res.get("code"))
+    check("the panel gets a readable flood message",
+          "791" in msg and "FLOOD" in msg.upper(), msg)
+    check("it says how long to wait", "13m" in msg or "11s" in msg, msg)
 
 
 def test_request_code_2fa_and_signup():
@@ -449,9 +535,13 @@ def main() -> int:
         test_request_code_disabled_button()
         test_request_code_field_refuses_input()
         test_request_code_no_form()
+        test_request_code_waits_for_a_slow_form()
+        test_request_code_already_logged_in()
+        test_request_code_navigates_a_warm_page_that_is_elsewhere()
         test_request_code_2fa_and_signup()
         test_request_code_surfaces_a_form_error()
         test_request_code_reloads_a_stale_form()
+        test_persian_digits_in_a_flood_message()
         print("\n-- submitting the code --")
         test_submit_code_happy_path()
         test_submit_code_wrong_code()

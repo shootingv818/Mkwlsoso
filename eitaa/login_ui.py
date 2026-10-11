@@ -134,6 +134,22 @@ async def current_step(page: Any) -> str:
     return "none"
 
 
+# Eitaa renders numbers with Persian/Arabic-Indic digits, so a live FLOOD came
+# back as "FLOOD_WAIT_۷۹۱" - unreadable to a `\d+` parser, and to the panel's
+# own FLOOD handling. Normalised on the way out so the wait is legible.
+_DIGIT_MAP = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
+
+
+def normalize_digits(text: str) -> str:
+    return (text or "").translate(_DIGIT_MAP)
+
+
+def flood_seconds(text: str) -> int | None:
+    """Seconds from a FLOOD message, whichever digits it used."""
+    m = re.search(r"FLOOD_WAIT_?(\d+)", normalize_digits(text), re.I)
+    return int(m.group(1)) if m else None
+
+
 async def page_error(page: Any) -> str | None:
     """Any error text the form is showing (wrong code, flood, invalid phone)."""
     for sel in _ERROR_SELECTORS:
@@ -142,10 +158,70 @@ async def page_error(page: Any) -> str | None:
             if await loc.is_visible():
                 txt = (await loc.inner_text()).strip()
                 if txt:
-                    return txt[:200]
+                    return normalize_digits(txt)[:200]
         except Exception:  # noqa: BLE001
             continue
     return None
+
+
+async def looks_logged_in(page: Any) -> bool:
+    """Cheap DOM-only check, used to tell 'no form' from 'already in'."""
+    try:
+        return bool(await page.evaluate(
+            "() => document.querySelectorAll('.chatlist-chat').length > 0"))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+async def wait_for_login_form(page: Any, timeout_s: float = 45.0) -> str:
+    """Wait until a login step is actually VISIBLE, and recover if it is not.
+
+    The first version of this asked once and gave up, which produced "the login
+    form is not on screen" on a page that was simply still booting. Two things
+    make that likely on this host: MKWL_WARMPATH reuses an already-open page
+    rather than navigating, so the page may be showing something else entirely;
+    and tweb mounts all of its login steps and reveals one, so there is a window
+    where `.page-sign` exists but is not visible yet.
+
+    So: poll, then try one reload, then one explicit navigation, before
+    concluding the form is not there. Returns the step name, "logged_in", or
+    "none".
+    """
+    from config import config
+
+    deadline = time.time() + timeout_s
+    reloaded = False
+    navigated = False
+    while time.time() < deadline:
+        step = await current_step(page)
+        if step != "none":
+            return step
+        if await looks_logged_in(page):
+            return "logged_in"
+        left = deadline - time.time()
+        # A stuck SPA boot is fixed by a reload; a slow one is only made worse,
+        # so this happens once, at the two-thirds mark.
+        if not reloaded and left < timeout_s / 3 * 2:
+            reloaded = True
+            print("[login-ui] no login form yet - reloading once", flush=True)
+            try:
+                await page.reload(wait_until="domcontentloaded")
+                await page.wait_for_timeout(3000)
+            except Exception:  # noqa: BLE001
+                pass
+        # And if the page was never on Eitaa to begin with (a warm page left
+        # elsewhere), navigate explicitly.
+        elif not navigated and left < timeout_s / 3:
+            navigated = True
+            print(f"[login-ui] still no form - navigating to "
+                  f"{config.EITAA_WEB_URL}", flush=True)
+            try:
+                await page.goto(config.EITAA_WEB_URL, wait_until="domcontentloaded")
+                await page.wait_for_timeout(4000)
+            except Exception:  # noqa: BLE001
+                pass
+        await page.wait_for_timeout(500)
+    return "none"
 
 
 def national_part(intl: str) -> str:
@@ -179,7 +255,8 @@ async def _type_into(page: Any, loc: Any, text: str) -> str:
 
 
 async def request_code(driver: Any, intl_phone: str,
-                       wait_s: float = 45.0) -> dict:
+                       wait_s: float = 45.0,
+                       form_wait_s: float = 45.0) -> dict:
     """Fill the phone in and press continue, ONCE.
 
     Returns {ok, step, typed, detail}. `step` is where the page ended up:
@@ -187,10 +264,14 @@ async def request_code(driver: Any, intl_phone: str,
     number has no Eitaa account, "phone" means the form refused it.
     """
     page = driver.page
-    step = await current_step(page)
+    step = await wait_for_login_form(page, timeout_s=form_wait_s)
+    if step == "logged_in":
+        return {"ok": False, "step": "logged_in",
+                "code": "this account is already logged in"}
     if step == "none":
-        return {"ok": False, "code": "the login form is not on screen "
-                                     "(already logged in, or the page did not load)"}
+        return {"ok": False, "step": "none",
+                "code": f"no login form appeared within {form_wait_s:.0f}s, after a "
+                        f"reload and a fresh navigation - the app did not boot"}
     if step != "phone":
         # A half-finished attempt from a previous run: reload to get a clean form.
         print(f"[login-ui] page was on the '{step}' step; reloading to start clean",
@@ -200,6 +281,11 @@ async def request_code(driver: Any, intl_phone: str,
             await page.wait_for_timeout(4000)
         except Exception:  # noqa: BLE001
             pass
+        step = await wait_for_login_form(page, timeout_s=form_wait_s)
+        if step != "phone":
+            return {"ok": False, "step": step,
+                    "code": f"after reloading, the form was on the '{step}' step "
+                            f"instead of the phone step"}
 
     field, sel = await _visible(page, PHONE_FIELD, timeout_ms=15000)
     if field is None:
@@ -247,6 +333,10 @@ async def request_code(driver: Any, intl_phone: str,
                              "this number has no Eitaa account")}
         err = await page_error(page)
         if err:
+            fw = flood_seconds(err)
+            if fw is not None:
+                err = (f"{err}  (rate limited for {fw}s ~ {fw // 60}m "
+                       f"{fw % 60}s - wait it out, do not retry)")
             print(f"[login-ui] the form reported: {err}", flush=True)
             return {"ok": False, "step": "phone", "typed": shown, "code": err}
         await page.wait_for_timeout(500)
