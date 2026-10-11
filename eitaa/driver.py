@@ -77,6 +77,12 @@ try:
 except Exception:  # noqa: BLE001
     _TRANSPORT_PROBE_SRC = ""
 
+# Source of the app-level logged-in check (an async IIFE returning a dict).
+try:
+    _LOGGED_IN_SRC = (Path(__file__).with_name("logged_in.js")).read_text(encoding="utf-8")
+except Exception:  # noqa: BLE001
+    _LOGGED_IN_SRC = ""
+
 
 class DriverError(Exception):
     pass
@@ -131,10 +137,44 @@ class EitaaDriver:
         # Give the SPA time to boot and restore the session.
         await self.page.wait_for_timeout(4000)
 
+    async def login_state(self) -> dict:
+        """Ask the APP whether it is logged in, and say how it decided.
+
+        The DOM check this replaces looked for selectors.SEARCH_INPUT, all of
+        which are `input` elements. Measured live: on the current Eitaa build
+        every one of them matches nothing, because its fields are
+        `div[contenteditable]`. A logged-in app was therefore invisible to the
+        old check, which is what reported "LOGIN NOT CONFIRMED" after a sign-in
+        the server had already accepted.
+
+        Returns the raw dict from logged_in.js (logged_in / how / my_id /
+        auth_state / chat_rows), or a DOM-only answer if the page cannot run it.
+        """
+        from eitaa.api_resolver import ensure_api_resolver
+        await ensure_api_resolver(self.page)
+        if _LOGGED_IN_SRC:
+            try:
+                res = await self.page.evaluate(_LOGGED_IN_SRC)
+                if isinstance(res, dict):
+                    return res
+            except Exception as exc:  # noqa: BLE001
+                print(f"[login] app-level login check failed ({exc}); "
+                      f"falling back to the DOM", flush=True)
+        # Fallback: the old selectors plus the chat rows this build does render.
+        loc = await _first_visible(self.page, S.SEARCH_INPUT, timeout=4000)
+        rows = 0
+        try:
+            rows = await self.page.evaluate(
+                "() => document.querySelectorAll('.chatlist-chat').length")
+        except Exception:  # noqa: BLE001
+            pass
+        return {"logged_in": loc is not None or bool(rows),
+                "how": "dom fallback", "chat_rows": rows}
+
     async def is_logged_in(self) -> bool:
-        """Heuristic: the chat list / search input exists when logged in."""
-        loc = await _first_visible(self.page, S.SEARCH_INPUT, timeout=8000)
-        return loc is not None
+        """True when this account is logged in. See login_state() for why."""
+        st = await self.login_state()
+        return bool(st.get("logged_in"))
 
     async def _snapshot_chats(self) -> list[dict]:
         """Read currently-rendered chat rows: clean title + peer type.

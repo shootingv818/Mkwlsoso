@@ -145,8 +145,62 @@ async def resolve_creds_with_page(driver: Any, api_id: int, api_hash: str) -> tu
     return api_id, api_hash
 
 
+# Which way to log in.
+#
+#   "ui"  - drive Eitaa's own login form (default). Eitaa then stores the
+#           session itself, exactly as it does for a person.
+#   "api" - call auth.sendCode / auth.signIn directly. This is what the bot did
+#           before, and on the current build it CANNOT persist a session: the
+#           sign-in is accepted, Eitaa even sends its confirmation
+#           notification, and then the app comes back with
+#           authState=authStateSignIn, getMyId()=0 and getContacts ->
+#           INVALID_LOGIN, because the code that saves a session is Eitaa's own
+#           login flow, which the direct call bypasses. Kept only so an older
+#           build can still be used, and for comparison.
+LOGIN_MODE = (os.environ.get("MKWL_LOGIN_MODE", "ui") or "ui").strip().lower()
+
+# A placeholder where the API path would return a real phone_code_hash. The
+# form keeps its own state, so there is nothing to carry between the two steps -
+# but bot/runner.py checks that this field is non-empty before it asks the owner
+# for the code, so the UI path reports one.
+UI_HASH = "ui-form"
+
+
+async def send_code_ui(driver: Any, phone: str) -> dict:
+    """Request ONE code by filling in Eitaa's login form."""
+    from eitaa import login_ui
+
+    res = await login_ui.request_code(driver, phone)
+    if res.get("ok"):
+        return {"ok": True, "phone_code_hash": UI_HASH, "mode": "ui",
+                "type": "form", "step": res.get("step")}
+    detail = str(res.get("code") or "the login form did not reach the code step")
+    if res.get("step") == "password":
+        # The panel has a dedicated 2FA card; reuse the signal it looks for.
+        return {"ok": False, "code": "SESSION_PASSWORD_NEEDED", "mode": "ui"}
+    return {"ok": False, "code": detail, "mode": "ui", "step": res.get("step")}
+
+
+async def sign_in_ui(driver: Any, code: str) -> dict:
+    """Type the received code into the form."""
+    from eitaa import login_ui
+
+    res = await login_ui.submit_code(driver, code)
+    if res.get("ok"):
+        return {"ok": True, "mode": "ui", "result": "form accepted the code"}
+    out = {"ok": False, "mode": "ui", "code": str(res.get("code") or "code refused")}
+    if res.get("needs_password"):
+        out["needs_password"] = True
+    return out
+
+
 async def send_code(driver: Any, phone: str, api_id: int, api_hash: str) -> dict:
-    """Request ONE login code via the bridge. Never retries."""
+    """Request ONE login code. Never retries.
+
+    Routes through the form by default; see LOGIN_MODE for why.
+    """
+    if LOGIN_MODE != "api":
+        return await send_code_ui(driver, phone)
     if not await ensure_login_bridge(driver):
         # Say WHICH route was missing. "auth bridge unavailable" on its own sent
         # us hunting through the network, the phone number and the host before
@@ -171,7 +225,13 @@ async def send_code(driver: Any, phone: str, api_id: int, api_hash: str) -> dict
 
 
 async def sign_in(driver: Any, phone: str, phone_code_hash: str, code: str) -> dict:
-    """Complete sign-in with the code the user received."""
+    """Complete sign-in with the code the user received.
+
+    The hash tells the two paths apart, so bot/runner.py needs no change: the
+    form path returns UI_HASH from send_code and therefore comes back here.
+    """
+    if phone_code_hash == UI_HASH or LOGIN_MODE != "api":
+        return await sign_in_ui(driver, code)
     try:
         res = await driver.page.evaluate(
             "(a) => window.__MKWL_signIn(a.p, a.h, a.c)",
