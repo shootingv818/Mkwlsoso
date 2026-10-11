@@ -121,10 +121,15 @@ class FakePage:
     querySelector probe current_step() uses.
     """
 
-    def __init__(self, elements=None, present=None, chat_rows=0):
+    def __init__(self, elements=None, present=None, chat_rows=0,
+                 app_logged_in=False, my_id=0):
         self.elements = elements or {}
         self.present = set(present or [])
         self.chat_rows = chat_rows
+        # what the app answers for the logged-in check (logged_in.js)
+        self.app_logged_in = app_logged_in
+        self.my_id = my_id
+        self.on_reload = None
         self.clicks: list[str] = []
         self.typed: list[tuple[str, str]] = []
         self.keys: list[str] = []
@@ -138,8 +143,18 @@ class FakePage:
     async def evaluate(self, js, arg=None):
         if isinstance(arg, str):            # the querySelector existence probe
             return arg in self.present
+        # logged_in.js: an async IIFE returning the decision dict
+        if "logged_in" in js and "rootScope" in js:
+            return {"logged_in": bool(self.app_logged_in),
+                    "how": "rootScope.getMyId" if self.app_logged_in else None,
+                    "my_id": self.my_id, "auth_state":
+                        "authStateSignedIn" if self.app_logged_in else "authStateSignIn",
+                    "chat_rows": self.chat_rows}
+        # api_resolver.js injection + its typeof probe
+        if "__MKWL_api" in js:
+            return True
         if "chatlist-chat" in js:
-            return self.chat_rows
+            return self.chat_rows > 0 if ">" in js else self.chat_rows
         return None
 
     async def wait_for_timeout(self, ms):
@@ -152,6 +167,8 @@ class FakePage:
 
     async def reload(self, wait_until=None):
         self.reloads += 1
+        if callable(self.on_reload):
+            self.on_reload(self)
 
     async def goto(self, url, wait_until=None, timeout=None):
         self.gotos += 1
@@ -329,13 +346,54 @@ def test_request_code_waits_for_a_slow_form():
 
 def test_request_code_already_logged_in():
     """An account that is already in must say so, not 'no form'."""
-    p = FakePage(chat_rows=12)
+    p = FakePage(chat_rows=12, app_logged_in=True)
     res = run(login_ui.request_code(FakeDriver(p), "989104938987", form_wait_s=2.0))
     check("an already-logged-in account is recognised",
           res.get("step") == "logged_in"
           and "already logged in" in str(res.get("code")), str(res))
     check("nothing was typed or submitted for it",
           not p.typed and not p.clicks, f"typed={p.typed} clicks={p.clicks}")
+
+
+def test_already_logged_in_account_with_no_chats():
+    """The live failure. A freshly created account has NO chats, so counting
+    .chatlist-chat rows reported zero and an account that had logged in seconds
+    earlier came back as "no login form appeared" - which then looked like a
+    boot problem and invited another code request that Eitaa rate-limited."""
+    p = FakePage(chat_rows=0, app_logged_in=True, my_id=778899)
+    check("zero chats does not mean logged out",
+          run(login_ui.looks_logged_in(p)) is True,
+          "asks the app (getMyId / authState) instead of counting chat rows")
+    res = run(login_ui.request_code(FakeDriver(p), "989336724339", form_wait_s=2.0))
+    check("an empty but logged-in account is reported as logged in",
+          res.get("step") == "logged_in", str(res))
+    check("and no code is requested for it", not p.clicks, str(p.clicks))
+
+
+def test_logged_out_account_is_not_mistaken_for_logged_in():
+    """The opposite error would be worse: never offering the form."""
+    p = phone_page()
+    p.app_logged_in = False
+    p.my_id = 0
+    check("a logged-out account still gets the form",
+          run(login_ui.looks_logged_in(p)) is False)
+    res = run(login_ui.request_code(FakeDriver(p), "989104938987"))
+    check("and the login proceeds normally", res.get("ok") is True, str(res))
+
+
+def test_session_restored_by_the_reload_is_noticed():
+    """A reload can restore a stored session, and restoring takes a moment, so
+    the recovery steps must re-ask instead of pressing on to the form."""
+    p = FakePage()                      # nothing on screen, not logged in yet
+
+    def on_reload(page):
+        page.app_logged_in = True       # the session comes back
+        page.my_id = 4242
+
+    p.on_reload = on_reload
+    res = run(login_ui.request_code(FakeDriver(p), "989104938987", form_wait_s=3.0))
+    check("a session restored by the reload is reported as logged in",
+          res.get("step") == "logged_in", str(res))
 
 
 def test_request_code_navigates_a_warm_page_that_is_elsewhere():
@@ -537,6 +595,9 @@ def main() -> int:
         test_request_code_no_form()
         test_request_code_waits_for_a_slow_form()
         test_request_code_already_logged_in()
+        test_already_logged_in_account_with_no_chats()
+        test_logged_out_account_is_not_mistaken_for_logged_in()
+        test_session_restored_by_the_reload_is_noticed()
         test_request_code_navigates_a_warm_page_that_is_elsewhere()
         test_request_code_2fa_and_signup()
         test_request_code_surfaces_a_form_error()

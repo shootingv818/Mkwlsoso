@@ -44,7 +44,15 @@ from __future__ import annotations
 
 import re
 import time
+from pathlib import Path
 from typing import Any
+
+# The same app-level logged-in check the driver uses, so "already logged in"
+# means the same thing in both places.
+try:
+    _LOGGED_IN_SRC = (Path(__file__).with_name("logged_in.js")).read_text(encoding="utf-8")
+except Exception:  # noqa: BLE001
+    _LOGGED_IN_SRC = ""
 
 # Each element has several candidates: the first that is visible wins, so a
 # class rename does not take the login down. The contenteditable div is the
@@ -165,7 +173,28 @@ async def page_error(page: Any) -> str | None:
 
 
 async def looks_logged_in(page: Any) -> bool:
-    """Cheap DOM-only check, used to tell 'no form' from 'already in'."""
+    """Is this account already logged in? Used to tell 'no form' from 'already in'.
+
+    This started as `.chatlist-chat` rows > 0 and that was wrong in a way a live
+    run exposed immediately: a freshly created account has NO chats, so zero
+    rows, so an account that had logged in seconds earlier was reported as "no
+    login form appeared". Asking the app is both correct and cheaper - the same
+    check eitaa/logged_in.js does for the driver.
+    """
+    if _LOGGED_IN_SRC:
+        try:
+            from eitaa.api_resolver import ensure_api_resolver
+            await ensure_api_resolver(page)
+            res = await page.evaluate(_LOGGED_IN_SRC)
+            if isinstance(res, dict):
+                if res.get("logged_in"):
+                    print(f"[login-ui] already logged in (via {res.get('how')}, "
+                          f"id={res.get('my_id')})", flush=True)
+                    return True
+                return False
+        except Exception:  # noqa: BLE001
+            pass
+    # DOM fallback only: an account WITH chats still answers correctly here.
     try:
         return bool(await page.evaluate(
             "() => document.querySelectorAll('.chatlist-chat').length > 0"))
@@ -209,6 +238,10 @@ async def wait_for_login_form(page: Any, timeout_s: float = 45.0) -> str:
                 await page.wait_for_timeout(3000)
             except Exception:  # noqa: BLE001
                 pass
+            # A reload can restore a stored session, which takes a moment to
+            # settle - so ask again before treating the missing form as a fault.
+            if await looks_logged_in(page):
+                return "logged_in"
         # And if the page was never on Eitaa to begin with (a warm page left
         # elsewhere), navigate explicitly.
         elif not navigated and left < timeout_s / 3:
@@ -220,6 +253,8 @@ async def wait_for_login_form(page: Any, timeout_s: float = 45.0) -> str:
                 await page.wait_for_timeout(4000)
             except Exception:  # noqa: BLE001
                 pass
+            if await looks_logged_in(page):
+                return "logged_in"
         await page.wait_for_timeout(500)
     return "none"
 
