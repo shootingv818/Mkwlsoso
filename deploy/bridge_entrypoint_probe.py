@@ -102,10 +102,19 @@ def dump(label: str, obj, indent: str = "        ") -> None:
         print(indent + line, flush=True)
 
 
-async def ev(page, js: str, arg=None):
-    """evaluate -> (value, error_text); never raises."""
+async def ev(page, js: str, arg=None, timeout: float = 25.0):
+    """evaluate -> (value, error_text); never raises, never hangs.
+
+    A call into the manager worker can stay pending forever (an unauthorized or
+    half-booted worker simply never answers), and page.evaluate has no timeout
+    of its own, so every evaluate gets a hard ceiling here as well as the
+    JS-side Promise.race in RPC_JS.
+    """
+    coro = page.evaluate(js, arg) if arg is not None else page.evaluate(js)
     try:
-        return (await (page.evaluate(js, arg) if arg is not None else page.evaluate(js)), None)
+        return (await asyncio.wait_for(asyncio.shield(coro), timeout=timeout), None)
+    except asyncio.TimeoutError:
+        return (None, f"timeout: no answer within {timeout:.0f}s")
     except Exception as exc:  # noqa: BLE001
         return (None, f"{type(exc).__name__}: {exc}")
 
@@ -323,6 +332,14 @@ FACTORY_JS = r"""
 RPC_JS = r"""
 async (a) => {
   const t0 = Date.now();
+  const LIMIT = a.timeout_ms || 12000;
+  // A call into the manager worker can stay pending forever. Every await below
+  // is raced against a timer so one dead candidate cannot stall the whole probe.
+  const cap = (p, what) => Promise.race([
+    p,
+    new Promise((_, rej) => setTimeout(
+      () => rej(new Error("MKWL_TIMEOUT after " + LIMIT + "ms (" + what + ")")), LIMIT))
+  ]);
   let target = null, how = a.how;
   try {
     if (how === "factory") {
@@ -335,7 +352,7 @@ async (a) => {
     } else if (how === "apiManagerProxy.getManagers") {
       const p = window.apiManagerProxy;
       if (!p || typeof p.getManagers !== "function") return { ok: false, code: "no getManagers" };
-      const m = await p.getManagers();
+      const m = await cap(Promise.resolve(p.getManagers()), "getManagers");
       target = m && m.apiManager;
     } else {
       target = window[how];
@@ -348,7 +365,7 @@ async (a) => {
   try { fn = target[method]; } catch (e) { return { ok: false, code: "member: " + String(e) }; }
   if (typeof fn !== "function") return { ok: false, code: "no " + method + " on target" };
   try {
-    const res = await target[method](a.rpc, {});
+    const res = await cap(Promise.resolve(target[method](a.rpc, {})), method);
     let shape = null;
     try {
       shape = (res && typeof res === "object")
@@ -452,13 +469,13 @@ async def run(args) -> int:
         while waited < float(args.wait):
             await asyncio.sleep(2.5)
             waited += 2.5
-            n, _ = await ev(page, "() => (window.__MKWL_PORTLOG || []).length")
+            n, _ = await ev(page, "() => (window.__MKWL_PORTLOG || []).length", timeout=10)
             info(f"recorded {n} message(s) after {waited:.0f}s")
-            if isinstance(n, int) and n >= 40:
+            if isinstance(n, int) and n >= 25:
                 break
 
         banner("SECTION 2  -  what the page itself says to its manager worker")
-        pl, err = await ev(page, PORTLOG_JS)
+        pl, err = await ev(page, PORTLOG_JS, timeout=15)
         REPORT["sections"]["portlog"] = pl or {"error": err}
         if err:
             bad(f"could not read the recorder log - {err}")
@@ -488,7 +505,7 @@ async def run(args) -> int:
         for name in ("apiManagerProxy", "mtprotoMessagePort", "rootScope",
                      "telegramMeWebManager", "appStorage", "commonStateStorage",
                      "rootScope.managers", "apiManagerProxy.managers"):
-            d, e = await ev(page, DEEP_JS, name)
+            d, e = await ev(page, DEEP_JS, name, timeout=12)
             deep[name] = d or {"error": e}
             if not d or not d.get("present"):
                 info(f"{name}: absent")
@@ -506,7 +523,7 @@ async def run(args) -> int:
         REPORT["sections"]["deep"] = deep
 
         banner("SECTION 4  -  createProxiedManagersForAccount: what does it return")
-        fac, err = await ev(page, FACTORY_JS, args.acc_index)
+        fac, err = await ev(page, FACTORY_JS, args.acc_index, timeout=15)
         REPORT["sections"]["factory"] = fac or {"error": err}
         if err or not fac:
             bad(f"could not probe the factory - {err}")
@@ -533,22 +550,22 @@ async def run(args) -> int:
         banner("SECTION 5  -  PROOF: harmless RPC through each candidate")
         info("calling help.getNearestDc (unauthenticated, read-only, no code sent)")
         attempts = [
-            {"how": "factory", "idx": args.acc_index, "method": "invokeApi", "rpc": "help.getNearestDc"},
-            {"how": "factory", "idx": 1, "method": "invokeApi", "rpc": "help.getNearestDc"},
-            {"how": "factory", "idx": 0, "method": "invokeApi", "rpc": "help.getNearestDc"},
-            {"how": "factory", "idx": None, "method": "invokeApi", "rpc": "help.getNearestDc"},
-            {"how": "factory", "idx": args.acc_index, "method": "invokeApiSingle", "rpc": "help.getNearestDc"},
-            {"how": "factory", "idx": args.acc_index, "method": "invokeApiCacheable", "rpc": "help.getNearestDc"},
-            {"how": "rootScope.managers", "idx": None, "method": "invokeApi", "rpc": "help.getNearestDc"},
-            {"how": "apiManagerProxy.getManagers", "idx": None, "method": "invokeApi", "rpc": "help.getNearestDc"},
-            {"how": "apiManagerProxy", "idx": None, "method": "invokeApi", "rpc": "help.getNearestDc"},
+            {"how": "factory", "idx": args.acc_index, "method": "invokeApi", "rpc": "help.getNearestDc", "timeout_ms": 10000},
+            {"how": "factory", "idx": 1, "method": "invokeApi", "rpc": "help.getNearestDc", "timeout_ms": 10000},
+            {"how": "factory", "idx": 0, "method": "invokeApi", "rpc": "help.getNearestDc", "timeout_ms": 10000},
+            {"how": "factory", "idx": None, "method": "invokeApi", "rpc": "help.getNearestDc", "timeout_ms": 10000},
+            {"how": "factory", "idx": args.acc_index, "method": "invokeApiSingle", "rpc": "help.getNearestDc", "timeout_ms": 10000},
+            {"how": "factory", "idx": args.acc_index, "method": "invokeApiCacheable", "rpc": "help.getNearestDc", "timeout_ms": 10000},
+            {"how": "rootScope.managers", "idx": None, "method": "invokeApi", "rpc": "help.getNearestDc", "timeout_ms": 10000},
+            {"how": "apiManagerProxy.getManagers", "idx": None, "method": "invokeApi", "rpc": "help.getNearestDc", "timeout_ms": 10000},
+            {"how": "apiManagerProxy", "idx": None, "method": "invokeApi", "rpc": "help.getNearestDc", "timeout_ms": 10000},
         ]
         results = []
         winner = None
         for a in attempts:
             label = (f"{a['how']}(idx={a['idx']}).{a['method']}" if a["how"] == "factory"
                      else f"{a['how']}.{a['method']}")
-            r, e = await ev(page, RPC_JS, a)
+            r, e = await ev(page, RPC_JS, a, timeout=15)
             rec = {"label": label, "attempt": a, "result": r or {"evaluate_error": e}}
             results.append(rec)
             if e:
@@ -573,7 +590,7 @@ async def run(args) -> int:
             # mistaken for a working entry point.
             a2 = dict(w)
             a2["rpc"] = "help.getCountriesList"
-            r2, _ = await ev(page, RPC_JS, a2)
+            r2, _ = await ev(page, RPC_JS, a2, timeout=15)
             REPORT["sections"]["rpc_confirm"] = r2
             if r2 and r2.get("ok"):
                 ok(f"confirmed on a second method (help.getCountriesList) in {r2['ms']}ms")
@@ -609,7 +626,7 @@ async def run(args) -> int:
               return out;
             }
             """
-            p6, e6 = await ev(page, probe_js, w)
+            p6, e6 = await ev(page, probe_js, w, timeout=15)
             REPORT["sections"]["login_surface"] = p6 or {"error": e6}
             if p6:
                 dump("managers/methods reachable through the winner:", p6)
@@ -678,7 +695,7 @@ def main() -> int:
         description="Find and PROVE the new in-page API entry point. "
                     "Never requests a login code.")
     p.add_argument("--account", required=True, help="profile/account id, e.g. 989939094655")
-    p.add_argument("--wait", type=float, default=25, help="seconds of boot traffic to record")
+    p.add_argument("--wait", type=float, default=20, help="seconds of boot traffic to record")
     p.add_argument("--acc-index", type=int, default=1,
                    help="account slot passed to createProxiedManagersForAccount (default 1)")
     p.add_argument("--headed", action="store_true")
