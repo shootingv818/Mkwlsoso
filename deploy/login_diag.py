@@ -735,7 +735,7 @@ async def run(args) -> int:
     lease = None
     try:
         if args.pool:
-            from capture.pool import session_pool
+            from capture.pool import pool as session_pool
             info("leasing from capture/pool.py (identical to bot/runner.py)")
             lease = session_pool.lease(args.account, headed=args.headed)
             session = await lease.__aenter__()
