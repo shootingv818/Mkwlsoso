@@ -369,41 +369,32 @@ def match(messages, records):
 # ROUTE A: the direct media-host path with a bare apk
 # ==========================================================================
 
-async def try_direct(account, size_big, real, settle, verify_page) -> None:
+async def try_direct(account, size_big, real, settle, driver, verify_page) -> None:
+    """ROUTE A, done right: reuse the ALREADY-open session (which this run
+    opened with worker_capture.js), instead of launching a second browser on the
+    same profile. Two Chromium on one persistent profile is what raised
+    TargetClosedError last time - a profile can only be held by one process.
+    """
     banner("ROUTE A  -  bare apk via the direct media-host path (best if it works)")
     os.environ.setdefault("MKWL_ENABLE_DIRECT", "1")
     os.environ.setdefault("MKWL_APK_OCTET", "1")
-    import tempfile
-    from capture.browser import BrowserSession
-    from eitaa.driver import EitaaDriver
     from bot import direct_ctx
-    from config import config
 
-    cap = os.path.join(_ROOT, "eitaa", "worker_capture.js")
-    if not os.path.isfile(cap):
-        bad("eitaa/worker_capture.js missing - cannot build the direct context")
-        return
-    sess = None
     try:
-        sess = await BrowserSession(account, init_script_path=cap).start()
-        await sess.page.goto(config.EITAA_WEB_URL, wait_until="domcontentloaded",
-                             timeout=120_000)
-        await asyncio.sleep(18)
-        refresh = await direct_ctx.refresh_from_driver(EitaaDriver(sess), account)
+        refresh = await direct_ctx.refresh_from_driver(driver, account)
         REPORT["direct_refresh"] = refresh
         if not refresh.get("ok") and not direct_ctx.has_context(account):
             bad(f"direct context did not build: {refresh.get('code')}")
+            if "worker_capture" in str(refresh.get("code", "")):
+                info("the session must be opened WITH eitaa/worker_capture.js; "
+                     "this run now does that - if you still see this, the hook "
+                     "did not capture traffic, so interact with the app once")
             return
         ok(f"direct context: user_id={refresh.get('user_id')}, "
            f"{refresh.get('kept')} record(s)")
     except Exception as exc:  # noqa: BLE001
-        bad(f"capture session raised: {type(exc).__name__}: {str(exc)[:150]}")
-        REPORT["direct_open_tb"] = traceback.format_exc()
-        if sess:
-            try:
-                await sess.close()
-            except Exception:  # noqa: BLE001
-                pass
+        bad(f"direct context refresh raised: {type(exc).__name__}: {str(exc)[:150]}")
+        REPORT["direct_refresh_tb"] = traceback.format_exc()
         return
 
     sender = None
@@ -418,19 +409,19 @@ async def try_direct(account, size_big, real, settle, verify_page) -> None:
         tmp = os.path.join(__import__("tempfile").gettempdir(),
                            f"apkf_{int(time.time())}.apk")
         open(tmp, "wb").write(apk)
-        for label in ("a1-direct-raw", "a2-direct-named"):
-            marker = mk_marker(label)
-            info(f"{label}: uploading {len(apk) / 1e6:.1f} MB bare apk (octet)")
-            try:
-                up = await asyncio.to_thread(sender.upload_file, tmp, marker)
-                if not up.get("ok"):
-                    bad(f"{label}: upload failed - {up.get('code')}")
-                    REPORT["cases"].append({"label": label, "marker": marker,
-                                            "result": up, "recipient": "none - bare apk",
-                                            "delivered": False})
-                    continue
-                snd = await asyncio.to_thread(sender.send_uploaded_file, self_peer, marker)
-                rec = {"label": label, "name": "app.apk", "mime": OCTET,
+        marker = mk_marker("a1-direct-raw")
+        info(f"uploading a bare {len(apk) / 1e6:.1f} MB apk via the media host "
+             f"(octet mode)")
+        try:
+            up = await asyncio.to_thread(sender.upload_file, tmp, marker)
+            REPORT["direct_upload"] = up
+            if not up.get("ok"):
+                bad(f"direct upload failed: {up.get('code')}")
+            else:
+                info(f"uploaded {up.get('parts')} part(s) to {up.get('host')}")
+                snd = await asyncio.to_thread(sender.send_uploaded_file,
+                                              self_peer, marker)
+                rec = {"label": "a1-direct-raw", "name": "app.apk", "mime": OCTET,
                        "marker": marker, "result": snd,
                        "recipient": "none - installs on tap", "check": "apk"}
                 REPORT["cases"].append(rec)
@@ -438,33 +429,33 @@ async def try_direct(account, size_big, real, settle, verify_page) -> None:
                 match((back.get("messages") or []), [rec])
                 if rec.get("delivered"):
                     s = rec.get("stored") or {}
-                    win(f"ROUTE A WIN: bare apk delivered via direct, "
+                    win(f"ROUTE A WIN: a BARE apk delivered via the direct path, "
                         f"{len(apk) / 1e6:.1f} MB, stored mime={s.get('mime')} "
-                        f"name={s.get('file_name')}. Recipient taps and installs.")
-                    REPORT["wins"].append({"label": label, "kind": "RAW-APK",
+                        f"name={s.get('file_name')}. Recipient taps and installs - "
+                        f"nothing to open.")
+                    REPORT["wins"].append({"label": "a1-direct-raw",
+                                           "kind": "RAW-APK",
                                            "recipient": "taps and installs",
                                            "stored": s})
                 else:
-                    bad(f"{label}: accepted but not in Saved Messages (filtered)")
-            except Exception as exc:  # noqa: BLE001
-                bad(f"{label} raised: {type(exc).__name__}: {str(exc)[:150]}")
+                    bad("direct: accepted but the apk is NOT in Saved Messages - "
+                        "the content filter reaches the media host too")
+        except Exception as exc:  # noqa: BLE001
+            bad(f"direct send raised: {type(exc).__name__}: {str(exc)[:150]}")
+            REPORT["direct_send_tb"] = traceback.format_exc()
         try:
             os.unlink(tmp)
         except Exception:  # noqa: BLE001
             pass
     except Exception as exc:  # noqa: BLE001
-        bad(f"direct sender raised: {type(exc).__name__}: {str(exc)[:150]}")
-        REPORT["direct_tb"] = traceback.format_exc()
+        bad(f"DirectSender raised: {type(exc).__name__}: {str(exc)[:150]}")
+        REPORT["direct_sender_tb"] = traceback.format_exc()
     finally:
         if sender:
             try:
                 await sender.close()
             except Exception:  # noqa: BLE001
                 pass
-        try:
-            await sess.close()
-        except Exception:  # noqa: BLE001
-            pass
 
 
 # ==========================================================================
@@ -501,11 +492,18 @@ async def run(args) -> int:
     from eitaa.api_resolver import ensure_api_resolver
     from eitaa.driver import EitaaDriver
 
-    banner("STEP 1  -  open the account")
+    banner("STEP 1  -  open the account (with the worker capture, for ROUTE A)")
     light = False if args.no_light else None
+    # Open the ONE session with worker_capture.js as its init script, so the
+    # direct route can build its context from this same browser. Opening a
+    # second browser on the same profile is what crashed last time.
+    cap = os.path.join(_ROOT, "eitaa", "worker_capture.js")
+    init_script = cap if (not args.no_direct and os.path.isfile(cap)) else None
     session = await BrowserSession(args.account, headed=args.headed,
-                                   light_assets=light).start()
+                                   light_assets=light,
+                                   init_script_path=init_script).start()
     page = session.page
+    driver = EitaaDriver(session)
     real = args.real_apk if args.real_apk and os.path.isfile(args.real_apk) else None
     try:
         resp = await page.goto(config.EITAA_WEB_URL, wait_until="domcontentloaded",
@@ -513,7 +511,7 @@ async def run(args) -> int:
         info(f"HTTP {resp.status if resp else '?'}; booting {args.wait:.0f}s")
         await asyncio.sleep(float(args.wait))
         await ensure_api_resolver(page)
-        st = await EitaaDriver(session).login_state()
+        st = await driver.login_state()
         if not st.get("logged_in"):
             bad(f"not logged in ({st})")
             REPORT["verdict"].append("Not logged in - log in first.")
@@ -533,10 +531,18 @@ async def run(args) -> int:
         big_apk = base_apk(int(float(args.max_mb) * 1024 * 1024), real)
 
         # ---- ROUTE A first: a bare apk is the ideal, so try it up front ----
+        # Give the capture hook a moment of real traffic to record, so the
+        # direct context has something to extract.
         if not args.no_direct:
             try:
+                info("nudging the app so the worker capture sees live traffic")
+                try:
+                    await driver.bridge_stats(with_pvs=False)
+                except Exception:  # noqa: BLE001
+                    pass
+                await asyncio.sleep(3)
                 await try_direct(args.account, int(float(args.max_mb) * 1024 * 1024),
-                                 real, args.settle, page)
+                                 real, args.settle, driver, page)
             except Exception:  # noqa: BLE001
                 REPORT["direct_outer_tb"] = traceback.format_exc()
                 bad("route A raised; see report")
