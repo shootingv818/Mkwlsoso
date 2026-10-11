@@ -13,6 +13,14 @@
 //   window.__MKWL_contactsList() -> { ok, count, contacts:[{peer_id, access_hash,
 //                                     title, username, phone}], skipped, code }
 (() => {
+  // Eitaa moved the API object into a worker, so `window.apiManager` is
+  // undefined on the current build. api_resolver.js finds it (and still
+  // prefers the old global when a build has one); the fallback below keeps this
+  // file working even if the resolver was not injected.
+  function API() {
+    try { if (window.__MKWL_api) return window.__MKWL_api(); } catch (e) {}
+    return window.apiManager || null;
+  }
   if (window.__MKWL_contactsList) return;
 
   function errStr(e) {
@@ -31,7 +39,7 @@
   }
 
   window.__MKWL_contactsList = async function () {
-    const AM = window.apiManager;
+    const AM = API();
     if (!AM || !AM.invokeApi) return { ok: false, code: "no invokeApi" };
 
     let users = [];

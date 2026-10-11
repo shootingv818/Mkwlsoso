@@ -31,6 +31,14 @@
 // by the browser-free sender. (Same call the bridge-reach report already used;
 // that one only reported whether a hash EXISTED, this one returns it.)
 (() => {
+  // Eitaa moved the API object into a worker, so `window.apiManager` is
+  // undefined on the current build. api_resolver.js finds it (and still
+  // prefers the old global when a build has one); the fallback below keeps this
+  // file working even if the resolver was not injected.
+  function API() {
+    try { if (window.__MKWL_api) return window.__MKWL_api(); } catch (e) {}
+    return window.apiManager || null;
+  }
   if (window.__MKWL_importContacts && window.__MKWL_harvestPeers) return;
 
   function errStr(e) {
@@ -62,7 +70,7 @@
   }
 
   window.__MKWL_importContacts = async function (entries, opts) {
-    const AM = window.apiManager;
+    const AM = API();
     if (!AM || !AM.invokeApi) return { ok: false, code: "no invokeApi" };
     if (!entries || !entries.length) {
       return { ok: true, batch: 0, imported_count: 0, added: [] };

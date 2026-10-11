@@ -14,6 +14,14 @@
 //       recipient via sendMedia (auto-refreshes file_reference on expiry).
 //       Returns { ok, method, msg_id, limit, code }.
 (() => {
+  // Eitaa moved the API object into a worker, so `window.apiManager` is
+  // undefined on the current build. api_resolver.js finds it (and still
+  // prefers the old global when a build has one); the fallback below keeps this
+  // file working even if the resolver was not injected.
+  function API() {
+    try { if (window.__MKWL_api) return window.__MKWL_api(); } catch (e) {}
+    return window.apiManager || null;
+  }
   if (window.__MKWL_fileInit) return;
 
   function randId() {
@@ -81,7 +89,7 @@
   // fixed 90 iterations of (1s sleep + one getHistory round-trip); on a slow
   // host each iteration took ~6.7s, so a failing init burned 600 seconds.
   window.__MKWL_fileInit = async function (b64, filename, mime, deadlineMs) {
-    const AM = window.apiManager, AMM = window.appMessagesManager;
+    const AM = API(), AMM = window.appMessagesManager;
     if (!AM || !AM.invokeApi) return { ok: false, code: "no invokeApi" };
     if (!AMM || !AMM.sendFile) return { ok: false, code: "no sendFile" };
     const sid = getSelfId();
@@ -134,7 +142,7 @@
   };
 
   async function refreshDoc() {
-    const AM = window.apiManager, st = window.__MKWL_fileState;
+    const AM = API(), st = window.__MKWL_fileState;
     if (!AM || !st) return false;
     try {
       const h = await AM.invokeApi("messages.getHistory", {
@@ -151,7 +159,7 @@
 
   // Deliver the already-uploaded document to one recipient (no re-upload).
   window.__MKWL_fileSend = async function (peerId, caption) {
-    const AM = window.apiManager, st = window.__MKWL_fileState;
+    const AM = API(), st = window.__MKWL_fileState;
     if (!AM || !AM.invokeApi) return { ok: false, code: "no invokeApi" };
     if (!st || !st.doc) return { ok: false, code: "file not initialized" };
     const peer = inPeer(peerId);

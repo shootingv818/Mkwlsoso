@@ -23,6 +23,7 @@ from playwright.async_api import Locator, Page, TimeoutError as PWTimeout
 from config import config
 from capture.browser import BrowserSession
 from eitaa import selectors as S
+from eitaa.api_resolver import ensure_api_resolver
 
 
 # Source of the in-page bridge send function (window.__MKWL_send). Loaded once
@@ -827,6 +828,7 @@ class EitaaDriver:
             return True
         if not _BRIDGE_SEND_SRC:
             return False
+        await ensure_api_resolver(self.page)
         try:
             await self.page.evaluate(_BRIDGE_SEND_SRC)  # IIFE defines window.__MKWL_send
             return await self.page.evaluate("() => typeof window.__MKWL_send === 'function'")
@@ -862,6 +864,7 @@ class EitaaDriver:
             return True
         if not _BRIDGE_FILE_SRC:
             return False
+        await ensure_api_resolver(self.page)
         try:
             await self.page.evaluate(_BRIDGE_FILE_SRC)
             return await self.page.evaluate("() => typeof window.__MKWL_fileInit === 'function'")
@@ -1063,6 +1066,7 @@ class EitaaDriver:
             return True
         if not _BRIDGE_STATS_SRC:
             return False
+        await ensure_api_resolver(self.page)
         try:
             await self.page.evaluate(_BRIDGE_STATS_SRC)
             return await self.page.evaluate("() => typeof window.__MKWL_stats === 'function'")
@@ -1100,6 +1104,7 @@ class EitaaDriver:
             return True
         if not _BRIDGE_CONTACTS_LIST_SRC:
             return False
+        await ensure_api_resolver(self.page)
         try:
             await self.page.evaluate(_BRIDGE_CONTACTS_LIST_SRC)
             return await self.page.evaluate(self._CONTACTS_LIST_PROBE)
@@ -1148,6 +1153,7 @@ class EitaaDriver:
             pass
         if not _PRESENCE_SRC:
             return False
+        await ensure_api_resolver(self.page)
         try:
             await self.page.evaluate(_PRESENCE_SRC)
             return await self.page.evaluate(self._PRESENCE_PROBE)
@@ -1200,6 +1206,7 @@ class EitaaDriver:
             return True
         if not _BRIDGE_CONTACTS_SRC:
             return False
+        await ensure_api_resolver(self.page)
         try:
             await self.page.evaluate(_BRIDGE_CONTACTS_SRC)
             return await self.page.evaluate(self._CONTACTS_BRIDGE_PROBE)

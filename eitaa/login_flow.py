@@ -19,10 +19,14 @@ import glob
 import json
 import os
 import re
+import time
 from pathlib import Path
 from typing import Any
 
 from config import config
+from eitaa.api_resolver import (
+    READY_TIMEOUT, api_info, api_ready, ensure_api_resolver,
+)
 
 _LOGIN_JS_PATH = Path(__file__).with_name("login_bridge.js")
 try:
@@ -80,26 +84,51 @@ def resolve_api_creds() -> tuple[int, str]:
 
 
 async def ensure_login_bridge(driver: Any) -> bool:
-    """Inject login_bridge.js if needed and wait for apiManager to be ready."""
+    """Inject login_bridge.js if needed and wait for the API to be reachable.
+
+    This used to poll for `window.apiManager` for 15 s and return False
+    otherwise, which produced a single opaque "auth bridge unavailable" for four
+    different failures - and once Eitaa shipped the multi-account build, where
+    that global does not exist at all, it was the only outcome possible.
+
+    Two things changed. The API object is now located by eitaa/api_resolver.js
+    (which still prefers `window.apiManager` when a build provides it), and the
+    reason for giving up is printed instead of discarded.
+    """
+    page = driver.page
+    # The resolver must exist before login_bridge.js runs, because the bridge
+    # asks it where the API is.
+    if not await ensure_api_resolver(page):
+        print("[login] could not inject api_resolver.js - the page is not "
+              "usable (closed, crashed, or navigating)", flush=True)
+        return False
     try:
-        has = await driver.page.evaluate("() => typeof window.__MKWL_sendCode === 'function'")
-    except Exception:  # noqa: BLE001
-        has = False
+        has = await page.evaluate("() => typeof window.__MKWL_sendCode === 'function'")
+    except Exception as exc:  # noqa: BLE001
+        print(f"[login] the page did not answer a typeof probe: {exc}", flush=True)
+        return False
     if not has:
         if not _LOGIN_SRC:
+            print(f"[login] login_bridge.js is missing or unreadable at "
+                  f"{_LOGIN_JS_PATH}", flush=True)
             return False
         try:
-            await driver.page.evaluate(_LOGIN_SRC)
-        except Exception:  # noqa: BLE001
+            await page.evaluate(_LOGIN_SRC)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[login] injecting login_bridge.js failed: {exc}", flush=True)
             return False
-    # tweb builds the unauthorized DC auth_key shortly after load; wait for it.
-    for _ in range(30):
-        try:
-            if await driver.page.evaluate("() => !!(window.apiManager && window.apiManager.invokeApi)"):
-                return True
-        except Exception:  # noqa: BLE001
-            pass
-        await driver.page.wait_for_timeout(500)
+    # The managers appear ~10-12 s after domcontentloaded on this host, so the
+    # old 15 s ceiling had almost no margin. Wait longer, and say what happened.
+    deadline = time.time() + READY_TIMEOUT
+    while time.time() < deadline:
+        if await api_ready(page):
+            info = await api_info(page)
+            print(f"[login] api reachable via {info.get('source')} after "
+                  f"{READY_TIMEOUT - (deadline - time.time()):.1f}s", flush=True)
+            return True
+        await page.wait_for_timeout(500)
+    print(f"[login] no API object after {READY_TIMEOUT:.0f}s. "
+          f"state={await api_info(page)}", flush=True)
     return False
 
 
@@ -119,7 +148,14 @@ async def resolve_creds_with_page(driver: Any, api_id: int, api_hash: str) -> tu
 async def send_code(driver: Any, phone: str, api_id: int, api_hash: str) -> dict:
     """Request ONE login code via the bridge. Never retries."""
     if not await ensure_login_bridge(driver):
-        return {"ok": False, "code": "auth bridge unavailable"}
+        # Say WHICH route was missing. "auth bridge unavailable" on its own sent
+        # us hunting through the network, the phone number and the host before
+        # the real cause (Eitaa moved apiManager) was found.
+        info = await api_info(driver.page)
+        detail = (f"legacy_global={info.get('legacy_global')} "
+                  f"managers_proxy={info.get('managers_proxy')} "
+                  f"source={info.get('source')}") if info else "no page info"
+        return {"ok": False, "code": f"auth bridge unavailable ({detail})"}
     api_id, api_hash = await resolve_creds_with_page(driver, api_id, api_hash)
     if not api_id or not api_hash:
         return {"ok": False, "code": "missing api_id/api_hash "

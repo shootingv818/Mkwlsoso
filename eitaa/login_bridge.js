@@ -22,8 +22,16 @@
   }
   function hasFn(o, m) { try { return !!(o && typeof o[m] === "function"); } catch (e) { return false; } }
 
+  // Where the API lives is api_resolver.js's job now (Eitaa moved it into a
+  // worker; see that file for the evidence). The fallback keeps this working if
+  // the resolver was not injected for some reason.
+  function API() {
+    try { if (window.__MKWL_api) return window.__MKWL_api(); } catch (e) {}
+    return window.apiManager || null;
+  }
   window.__MKWL_authReady = function () {
-    return !!(window.apiManager && window.apiManager.invokeApi);
+    const AM = API();
+    return !!(AM && AM.invokeApi);
   };
 
   window.__MKWL_authCreds = function () {
@@ -51,9 +59,21 @@
       setUserAuth: hasFn(window.apiManager, "setUserAuth"),
       baseDcId: (function () { try { return window.apiManager && window.apiManager.baseDcId; } catch (e) { return null; } })()
     };
+    // What the resolver actually found, which on the current Eitaa build is the
+    // worker-backed managers proxy rather than the old global.
+    out.resolved = (function () {
+      try { return window.__MKWL_apiInfo ? window.__MKWL_apiInfo() : null; }
+      catch (e) { return null; }
+    })();
     out.apiManagerProxy = {
       present: !!window.apiManagerProxy,
-      setUserAuth: hasFn(window.apiManagerProxy, "setUserAuth")
+      setUserAuth: hasFn(window.apiManagerProxy, "setUserAuth"),
+      dispatchUserAuth: hasFn(window.apiManagerProxy, "dispatchUserAuth"),
+      switchAccount: hasFn(window.apiManagerProxy, "switchAccount")
+    };
+    out.telegramMeWebManager = {
+      present: !!window.telegramMeWebManager,
+      setAuthorized: hasFn(window.telegramMeWebManager, "setAuthorized")
     };
     out.appUsersManager = {
       present: !!window.appUsersManager,
@@ -86,19 +106,54 @@
     } catch (e) { steps.push("saveApiUser:" + errStr(e)); }
 
     // 2) Set the user-auth marker (this is what a reload checks).
+    //
+    // Old build: apiManager.setUserAuth(...) - we passed the marker in.
+    // New build: that method is gone. Its replacement is
+    // apiManagerProxy.dispatchUserAuth(), which takes NO arguments: it reads
+    // the auth state the worker already stored during auth.signIn and then
+    // dispatches tweb's own 'user_auth' event. Verified on the live page:
+    //
+    //   async dispatchUserAuth(){const e=await Ke.get(xe());
+    //     e.userId&&F.dispatchEvent("user_auth",{dcID:e.dcId||0,
+    //       date:e.date||Date.now()/1e3|0,id:e.userId.toPeerId(!1)})}
+    //
+    // The consequence worth knowing: it only works if the worker really did
+    // persist the authorization, so it is a confirmation step, not a way to
+    // fake a login. Both paths are attempted, newest first, and every attempt
+    // is recorded so a failure here is visible instead of silent.
     let dcId = null;
     try { dcId = window.apiManager && window.apiManager.baseDcId; } catch (e) {}
-    for (const M of [window.apiManager, window.apiManagerProxy]) {
-      if (hasFn(M, "setUserAuth")) {
-        try {
-          M.setUserAuth(dcId != null ? { dcID: dcId, id: uid } : uid);
-          steps.push("setUserAuth(obj)");
-        } catch (e) {
-          try { M.setUserAuth(uid); steps.push("setUserAuth(id)"); }
-          catch (e2) { steps.push("setUserAuth:" + errStr(e2)); }
+
+    let marked = false;
+    if (hasFn(window.apiManagerProxy, "dispatchUserAuth")) {
+      try {
+        await window.apiManagerProxy.dispatchUserAuth();
+        steps.push("dispatchUserAuth");
+        marked = true;
+      } catch (e) { steps.push("dispatchUserAuth:" + errStr(e)); }
+    }
+    if (!marked) {
+      for (const M of [window.apiManager, window.apiManagerProxy]) {
+        if (hasFn(M, "setUserAuth")) {
+          try {
+            M.setUserAuth(dcId != null ? { dcID: dcId, id: uid } : uid);
+            steps.push("setUserAuth(obj)");
+            marked = true;
+          } catch (e) {
+            try { M.setUserAuth(uid); steps.push("setUserAuth(id)"); marked = true; }
+            catch (e2) { steps.push("setUserAuth:" + errStr(e2)); }
+          }
+          break;
         }
-        break;
       }
+    }
+    if (!marked) steps.push("no user-auth marker method on this build");
+
+    // 2b) The new build also records the login with its own web manager. Not
+    // required for the session, so a failure here is noted and ignored.
+    if (hasFn(window.telegramMeWebManager, "setAuthorized")) {
+      try { window.telegramMeWebManager.setAuthorized(true); steps.push("setAuthorized"); }
+      catch (e) { steps.push("setAuthorized:" + errStr(e)); }
     }
 
     // 3) Nudge tweb to react live if it listens for this.
@@ -113,7 +168,7 @@
   }
 
   window.__MKWL_sendCode = async function (phone, apiId, apiHash) {
-    const AM = window.apiManager;
+    const AM = API();
     if (!AM || !AM.invokeApi) return { ok: false, code: "no invokeApi" };
     try {
       const res = await AM.invokeApi("auth.sendCode", {
@@ -132,7 +187,7 @@
   };
 
   window.__MKWL_signIn = async function (phone, hash, code) {
-    const AM = window.apiManager;
+    const AM = API();
     if (!AM || !AM.invokeApi) return { ok: false, code: "no invokeApi" };
     try {
       const res = await AM.invokeApi("auth.signIn", {

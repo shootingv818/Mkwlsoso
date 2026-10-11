@@ -15,6 +15,14 @@
 //
 // Returns: { ok, method, msg_id, limit, code, detail }
 (() => {
+  // Eitaa moved the API object into a worker, so `window.apiManager` is
+  // undefined on the current build. api_resolver.js finds it (and still
+  // prefers the old global when a build has one); the fallback below keeps this
+  // file working even if the resolver was not injected.
+  function API() {
+    try { if (window.__MKWL_api) return window.__MKWL_api(); } catch (e) {}
+    return window.apiManager || null;
+  }
   if (window.__MKWL_send) return;
 
   window.__MKWL_send = async function (peerId, text) {
@@ -76,9 +84,10 @@
 
     // Preferred path: invokeApi with a resolved inputPeer -> explicit server ACK.
     var peer = getInputPeer(peerId);
-    if (peer && window.apiManager && window.apiManager.invokeApi) {
+    var AM0 = API();
+    if (peer && AM0 && AM0.invokeApi) {
       try {
-        var res = await window.apiManager.invokeApi("messages.sendMessage", {
+        var res = await AM0.invokeApi("messages.sendMessage", {
           peer: peer, message: text, random_id: randId()
         });
         var id = extractId(res);
