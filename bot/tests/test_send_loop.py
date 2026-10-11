@@ -119,10 +119,10 @@ class FakeDriver:
     async def bridge_file_ready(self):
         return self.upload_alive
 
-    async def bridge_file_send(self, peer_id, caption=""):
+    async def bridge_file_send(self, peer_id, caption="", access_hash=None):
         return await self._send(peer_id)
 
-    async def bridge_send(self, peer_id, text):
+    async def bridge_send(self, peer_id, text, access_hash=None):
         return await self._send(peer_id)
 
     async def _send(self, peer_id):
@@ -644,7 +644,7 @@ def test_exception_does_not_lose_the_ledger():
     content = {"kind": "text", "text": "boom"}
 
     class Boom(FakeDriver):
-        async def bridge_send(self, peer_id, text):
+        async def bridge_send(self, peer_id, text, access_hash=None):
             self.calls["bridge"] += 1
             if self.calls["bridge"] == 3:
                 raise RuntimeError("page crashed")

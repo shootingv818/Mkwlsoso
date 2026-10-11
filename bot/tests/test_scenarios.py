@@ -417,7 +417,7 @@ def s15_transport_raises_on_every_recipient():
     progress_store.clear("s15")
 
     class Boom(T.FakeDriver):
-        async def bridge_send(self, peer_id, text):
+        async def bridge_send(self, peer_id, text, access_hash=None):
             raise RuntimeError("page crashed")
 
     d = Boom(ui_ok=False)
@@ -441,7 +441,7 @@ def s16_every_peer_refused_is_remembered_once():
     blocked_store.clear("s16")
 
     class AllFlood(T.FakeDriver):
-        async def bridge_send(self, peer_id, text):
+        async def bridge_send(self, peer_id, text, access_hash=None):
             return {"ok": False, "limit": True, "code": "PEER_FLOOD"}
 
     d = AllFlood()
@@ -464,7 +464,7 @@ def s17_flaky_transport_still_delivers_everyone_eventually():
     progress_store.clear("s17")
 
     class Flaky(T.FakeDriver):
-        async def bridge_send(self, peer_id, text):
+        async def bridge_send(self, peer_id, text, access_hash=None):
             self.calls["bridge"] += 1
             if self.calls["bridge"] % 2 == 0:
                 return {"ok": False, "code": "transport hiccup"}
@@ -540,7 +540,7 @@ def s20_hybrid_file_fallback_uploads_on_the_page_first():
         async def bridge_file_ready(self):
             return "init" in calls
 
-        async def bridge_file_send(self, peer, caption=""):
+        async def bridge_file_send(self, peer, caption="", access_hash=None):
             calls.append("send")
             return {"ok": True, "method": "bridge"}
 
@@ -584,7 +584,7 @@ def s22_refusals_survive_a_force_stop():
     progress_store.clear("s22")
 
     class SlowFlood(T.FakeDriver):
-        async def bridge_send(self, peer_id, text):
+        async def bridge_send(self, peer_id, text, access_hash=None):
             await asyncio.sleep(0.01)
             return {"ok": False, "limit": True, "code": "PEER_FLOOD"}
 

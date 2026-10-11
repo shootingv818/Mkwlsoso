@@ -875,8 +875,15 @@ class EitaaDriver:
         except Exception:  # noqa: BLE001
             return False
 
-    async def bridge_send(self, peer_id: str, text: str) -> dict:
+    async def bridge_send(self, peer_id: str, text: str,
+                          access_hash: str | None = None) -> dict:
         """Send `text` to `peer_id` through Eitaa's own engine (no UI).
+
+        `access_hash` comes from the contacts list (bot/transports.py passes the
+        same map the direct engine uses). The page needs it because this Eitaa
+        build no longer exposes window.appPeersManager, so it cannot turn a
+        peer_id into an inputPeer by itself - without the hash every send
+        returned "no bridge method available" having never reached the server.
 
         Returns the raw result dict from window.__MKWL_send:
         {ok, method, msg_id, limit, code, detail}. Never raises.
@@ -887,8 +894,9 @@ class EitaaDriver:
             return {"ok": False, "code": "bridge unavailable"}
         try:
             res = await self.page.evaluate(
-                "(a) => window.__MKWL_send(a.p, a.t)",
-                {"p": str(peer_id), "t": text},
+                "(a) => window.__MKWL_send(a.p, a.t, a.h)",
+                {"p": str(peer_id), "t": text,
+                 "h": str(access_hash) if access_hash else None},
             )
             return res if isinstance(res, dict) else {"ok": False, "code": "bad bridge result"}
         except Exception as exc:  # noqa: BLE001
@@ -1014,8 +1022,13 @@ class EitaaDriver:
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "code": f"file init evaluate error: {exc}"}
 
-    async def bridge_file_send(self, peer_id: str, caption: str = "") -> dict:
+    async def bridge_file_send(self, peer_id: str, caption: str = "",
+                               access_hash: str | None = None) -> dict:
         """Deliver the already-uploaded file to one recipient (no re-upload).
+
+        `access_hash` is needed for the same reason as in bridge_send: this
+        build has no window.appPeersManager, so the page cannot resolve the
+        recipient on its own.
 
         Requires bridge_file_init() to have succeeded first. Returns
         {ok, method, msg_id, limit, code}. Never raises.
@@ -1026,8 +1039,9 @@ class EitaaDriver:
             return {"ok": False, "code": "file bridge unavailable"}
         try:
             res = await self.page.evaluate(
-                "(a) => window.__MKWL_fileSend(a.p, a.c)",
-                {"p": str(peer_id), "c": caption or ""},
+                "(a) => window.__MKWL_fileSend(a.p, a.c, a.h)",
+                {"p": str(peer_id), "c": caption or "",
+                 "h": str(access_hash) if access_hash else None},
             )
             return res if isinstance(res, dict) else {"ok": False, "code": "bad send result"}
         except Exception as exc:  # noqa: BLE001

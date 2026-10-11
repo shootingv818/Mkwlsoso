@@ -72,11 +72,11 @@ class FakeBridgeDriver:
     async def bridge_file_ready(self):
         return self.ok
 
-    async def bridge_send(self, peer, text):
+    async def bridge_send(self, peer, text, access_hash=None):
         self.calls.append(f"text:{peer}")
         return {"ok": self.ok, "method": "bridge", "msg_id": 2}
 
-    async def bridge_file_send(self, peer, caption=""):
+    async def bridge_file_send(self, peer, caption="", access_hash=None):
         self.calls.append(f"file:{peer}")
         return {"ok": self.ok, "method": "bridge", "msg_id": 3}
 

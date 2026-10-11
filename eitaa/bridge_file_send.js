@@ -55,24 +55,52 @@
     } catch (e) {}
     return null;
   }
-  function getSelfId() {
+  async function getSelfId() {
     const c = [];
     try { c.push(window.appPeersManager && window.appPeersManager.peerId); } catch (e) {}
     try { c.push(window.appImManager && window.appImManager.myId); } catch (e) {}
     try { if (window.appUsersManager && window.appUsersManager.getSelf) {
       const s = window.appUsersManager.getSelf(); c.push(s && (s.id != null ? s.id : s)); } } catch (e) {}
-    for (const x of c) { if (x != null && ["number", "string", "bigint"].includes(typeof x)) return x; }
+    // New build: rootScope.getMyId() and the worker-backed manager both answer,
+    // and both are asynchronous - the old globals above are undefined here.
+    try {
+      if (window.rootScope && window.rootScope.getMyId) c.push(await window.rootScope.getMyId());
+    } catch (e) {}
+    try {
+      const M = window.__MKWL_mgr ? window.__MKWL_mgr("appUsersManager") : null;
+      if (M && M.getSelf) { const s = await M.getSelf(); if (s && s.id != null) c.push(s.id); }
+    } catch (e) {}
+    for (const x of c) {
+      if (x != null && ["number", "string", "bigint"].includes(typeof x) && +x !== 0) return x;
+    }
     return null;
   }
-  function inPeer(pid) {
+  // Same resolution order as eitaa/bridge_send.js, and for the same reason:
+  // window.appPeersManager is gone on this build. The access_hash comes from
+  // the contacts list via bot/transports.py, and the inputPeerUser shape is the
+  // one direct/peers.py already builds (ctor + user_id:long + access_hash:long).
+  async function inPeers(pid, ah) {
+    if (ah) {
+      return [
+        { _: "inputPeerUser", user_id: pid, access_hash: ah },
+        { _: "inputPeerUser", user_id: +pid, access_hash: ah }
+      ];
+    }
     const APM = window.appPeersManager;
     const tries = [
       () => APM && APM.getInputPeerById && APM.getInputPeerById(pid),
       () => APM && APM.getInputPeerById && APM.getInputPeerById(+pid),
       () => APM && APM.getInputPeer && APM.getInputPeer(pid)
     ];
-    for (let i = 0; i < tries.length; i++) { try { const p = tries[i](); if (p) return p; } catch (e) {} }
-    return null;
+    for (let i = 0; i < tries.length; i++) { try { const p = tries[i](); if (p) return [p]; } catch (e) {} }
+    try {
+      const M = window.__MKWL_mgr ? window.__MKWL_mgr("appPeersManager") : null;
+      if (M && M.getInputPeerById) {
+        const q = await M.getInputPeerById(+pid || pid);
+        if (q) return [q];
+      }
+    } catch (e) {}
+    return [];
   }
   const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
@@ -92,7 +120,7 @@
     const AM = API(), AMM = window.appMessagesManager;
     if (!AM || !AM.invokeApi) return { ok: false, code: "no invokeApi" };
     if (!AMM || !AMM.sendFile) return { ok: false, code: "no sendFile" };
-    const sid = getSelfId();
+    const sid = await getSelfId();
     if (sid == null) return { ok: false, code: "no self id" };
     const selfNum = (typeof sid !== "number" && !isNaN(+sid)) ? +sid : sid;
     const peerSelf = { _: "inputPeerSelf" };
@@ -158,12 +186,17 @@
   }
 
   // Deliver the already-uploaded document to one recipient (no re-upload).
-  window.__MKWL_fileSend = async function (peerId, caption) {
+  window.__MKWL_fileSend = async function (peerId, caption, accessHash) {
     const AM = API(), st = window.__MKWL_fileState;
     if (!AM || !AM.invokeApi) return { ok: false, code: "no invokeApi" };
     if (!st || !st.doc) return { ok: false, code: "file not initialized" };
-    const peer = inPeer(peerId);
-    if (!peer) return { ok: false, code: "peer_unresolved" };
+    const peers = await inPeers(peerId, accessHash);
+    if (!peers.length) {
+      return { ok: false, code: accessHash ? "peer_unresolved"
+        : "peer_unresolved: no access_hash for this peer and no appPeersManager "
+          + "on this build" };
+    }
+    let peer = peers[0];
 
     const mkMedia = (d) => ({
       _: "inputMediaDocument",
@@ -176,8 +209,21 @@
       const r = await call();
       return { ok: true, method: "sendMedia", msg_id: extractId(r) };
     } catch (e) {
-      const code = errCode(e);
+      let code = errCode(e);
       if (isLimit(code)) return { ok: false, limit: true, code: code };
+      // The candidates differ only in how user_id is typed, so a serialization
+      // complaint is worth one retry with the other shape. Any other error is
+      // the server's answer and repeating the call cannot change it.
+      if (peers.length > 1 && /serializ|type|long|invalid.*peer/i.test(code)) {
+        peer = peers[1];
+        try {
+          const r1 = await call();
+          return { ok: true, method: "sendMedia(alt peer)", msg_id: extractId(r1) };
+        } catch (e1) {
+          code = errCode(e1);
+          if (isLimit(code)) return { ok: false, limit: true, code: code };
+        }
+      }
       if (String(code).toUpperCase().indexOf("FILE_REFERENCE") >= 0) {
         // The document's file_reference expired; refresh from Saved Messages
         // and retry once.

@@ -1264,8 +1264,15 @@ class JobManager:
         engine cannot be set up, because a campaign that silently changes engine
         is impossible to reason about later.
         """
-        bridge = transports.BridgeTransport(driver)
+        # The SAME map the direct engine gets, built by the same helper. The
+        # bridge needs it too now: this Eitaa build dropped
+        # window.appPeersManager, so the page cannot resolve a recipient on its
+        # own any more and the access_hash has to come from the contacts list.
+        hashes = transports.access_hash_map(contacts_store.contacts(account))
+        bridge = transports.BridgeTransport(driver, hashes)
         if engine == "bridge":
+            print(f"[engine] bridge ready: {len(hashes)} peer(s) with an "
+                  f"access_hash", flush=True)
             return bridge, "bridge"
 
         # The direct engine needs a live session context; refresh it from the
@@ -1290,7 +1297,6 @@ class JobManager:
                        f"sending with the bridge instead"))
             return bridge, "bridge"
 
-        hashes = transports.access_hash_map(contacts_store.contacts(account))
         direct = transports.DirectTransport(sender, hashes)
         print(f"[engine] direct ready: {len(hashes)} peer(s) addressable without a "
               f"browser", flush=True)

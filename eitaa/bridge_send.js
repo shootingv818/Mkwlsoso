@@ -25,7 +25,10 @@
   }
   if (window.__MKWL_send) return;
 
-  window.__MKWL_send = async function (peerId, text) {
+  window.__MKWL_send = async function (peerId, text, accessHash) {
+    // accessHash is handed in by bot/transports.py from the contacts
+    // list, because this Eitaa build has no window.appPeersManager for
+    // the page to resolve a recipient with. See getInputPeer below.
     function randId() {
       try {
         var a = new Uint32Array(2);
@@ -64,9 +67,35 @@
       catch (x) { return "ERR"; }
     }
 
-    // Resolve peerId -> inputPeer using Eitaa's own peer manager (uses cached
-    // access_hash). Tries a few known method names/signatures.
-    function getInputPeer(pid) {
+    // Resolve peerId -> inputPeer.
+    //
+    // This used to rely on window.appPeersManager alone. The current Eitaa
+    // build does not expose it, so every send returned "no bridge method
+    // available" with the server never contacted: the peer came back null, the
+    // invokeApi path was skipped, and appMessagesManager (also gone) could not
+    // run either.
+    //
+    // The fix needs no new mechanism, because the project already has both
+    // halves. The contacts list carries an access_hash for every contact
+    // (eitaa/contacts_list.js, measured 124 of 124), and direct/peers.py
+    // already builds a peer from a user_id plus that hash - the 20-byte
+    // inputPeerUser, ctor 0xdde8a54c + user_id:long + access_hash:long. The
+    // same thing one layer up is the plain TL object below, and the hash is
+    // handed in by bot/transports.py from the very map the direct engine uses.
+    //
+    // Order: the hash we were given first (works on every build), then the old
+    // global for an older build, then the worker-backed manager through the
+    // resolver, which returns a promise and so must be awaited.
+    async function getInputPeer(pid, ah) {
+      if (ah) {
+        // Pass the values through in the shape Eitaa's own API gave them to us
+        // (contacts.getContacts returns long fields as strings), with a numeric
+        // user_id as the second candidate.
+        return [
+          { _: "inputPeerUser", user_id: pid, access_hash: ah },
+          { _: "inputPeerUser", user_id: +pid, access_hash: ah }
+        ];
+      }
       var APM = window.appPeersManager;
       var tries = [
         function () { return APM && APM.getInputPeerById && APM.getInputPeerById(pid); },
@@ -75,39 +104,61 @@
         function () { return APM && APM.getInputPeer && APM.getInputPeer(+pid); }
       ];
       for (var i = 0; i < tries.length; i++) {
-        try { var p = tries[i](); if (p) return p; } catch (e) {}
+        try { var p = tries[i](); if (p) return [p]; } catch (e) {}
       }
-      return null;
+      // Worker-backed manager: same method names, but asynchronous.
+      try {
+        var M = window.__MKWL_mgr ? window.__MKWL_mgr("appPeersManager") : null;
+        if (M && M.getInputPeerById) {
+          var q = await M.getInputPeerById(+pid || pid);
+          if (q) return [q];
+        }
+      } catch (e) {}
+      return [];
     }
 
     var pidNum = (typeof peerId === "string" && peerId !== "" && !isNaN(+peerId)) ? +peerId : peerId;
 
     // Preferred path: invokeApi with a resolved inputPeer -> explicit server ACK.
-    var peer = getInputPeer(peerId);
+    var peers = await getInputPeer(peerId, accessHash);
     var AM0 = API();
-    if (peer && AM0 && AM0.invokeApi) {
-      try {
-        var res = await AM0.invokeApi("messages.sendMessage", {
-          peer: peer, message: text, random_id: randId()
-        });
-        var id = extractId(res);
-        if (id != null) {
-          return { ok: true, method: "invokeApi", msg_id: id, detail: "server ack" };
+    if (peers.length && AM0 && AM0.invokeApi) {
+      for (var pi = 0; pi < peers.length; pi++) {
+        try {
+          var res = await AM0.invokeApi("messages.sendMessage", {
+            peer: peers[pi], message: text, random_id: randId()
+          });
+          var id = extractId(res);
+          if (id != null) {
+            return { ok: true, method: "invokeApi", msg_id: id, detail: "server ack" };
+          }
+          // Resolved but no id -> uncertain; let sendText try for a definite path.
+          window.__MKWL_lastErr = "invokeApi resolved without id";
+          break;
+        } catch (e) {
+          var code = errCode(e);
+          if (isLimit(code)) return { ok: false, limit: true, method: "invokeApi", code: code };
+          window.__MKWL_lastErr = code;
+          // A serialization complaint means this candidate had the wrong field
+          // types, so the next one is worth trying; anything else is the
+          // server's answer and retrying the same call cannot change it.
+          if (!/serializ|type|long|invalid.*peer/i.test(code)) break;
         }
-        // Resolved but no id -> uncertain; let sendText try for a definite path.
-        window.__MKWL_lastErr = "invokeApi resolved without id";
-      } catch (e) {
-        var code = errCode(e);
-        if (isLimit(code)) return { ok: false, limit: true, method: "invokeApi", code: code };
-        window.__MKWL_lastErr = code; // fall through to sendText
       }
+    } else if (!peers.length) {
+      window.__MKWL_lastErr = accessHash
+        ? "could not build an inputPeer"
+        : "no access_hash for this peer and no appPeersManager on this build";
     }
 
     // Fallback path: appMessagesManager.sendText resolves the peer itself and
-    // runs the full app send pipeline (confirmed to deliver).
-    if (window.appMessagesManager && window.appMessagesManager.sendText) {
+    // runs the full app send pipeline (confirmed to deliver). On this build the
+    // global is gone, so the resolver supplies the worker-backed manager.
+    var AMM = window.appMessagesManager
+      || (window.__MKWL_mgr ? window.__MKWL_mgr("appMessagesManager") : null);
+    if (AMM && AMM.sendText) {
       try {
-        await window.appMessagesManager.sendText(pidNum, text);
+        await AMM.sendText(pidNum, text);
         return {
           ok: true, method: "sendText", msg_id: null,
           detail: "sent via sendText", invoke_err: window.__MKWL_lastErr || null

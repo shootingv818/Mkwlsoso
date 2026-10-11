@@ -59,12 +59,26 @@ class Transport:
 
 
 class BridgeTransport(Transport):
-    """The proven path: Eitaa's own web app, driven in-page."""
+    """The proven path: Eitaa's own web app, driven in-page.
+
+    `access_hashes` maps peer_id -> access_hash, exactly as DirectTransport
+    already takes it and from the same `access_hash_map(contacts_store...)`
+    call. The bridge used to resolve its recipients through
+    `window.appPeersManager`, which the current Eitaa build no longer exposes -
+    so every send came back "no bridge method available" with the page never
+    contacted. The contacts list already carries an access_hash for every
+    contact (measured: 124 of 124), and direct/peers.py already builds a peer
+    out of one, so the bridge is given the same map instead of a new mechanism.
+    """
 
     label = "bridge"
 
-    def __init__(self, driver) -> None:
+    def __init__(self, driver, access_hashes: dict[str, str] | None = None) -> None:
         self.driver = driver
+        self.access_hashes = access_hashes or {}
+
+    def _hash_for(self, peer_id: str) -> str | None:
+        return self.access_hashes.get(str(peer_id)) if peer_id else None
 
     async def prepare_file(self, file_path: str, caption: str = "") -> dict:
         return await self.driver.bridge_file_init(file_path, caption)
@@ -72,10 +86,22 @@ class BridgeTransport(Transport):
     async def file_ready(self) -> bool:
         return await self.driver.bridge_file_ready()
 
+    # The hash is passed ONLY when there is one. Anything that wraps or doubles
+    # the driver - and the four fake drivers in the offline suites do exactly
+    # that - still defines the two-argument bridge_send, so always passing a
+    # third argument would break every one of them for no gain. With no hash
+    # there is nothing to tell the page anyway: it falls back to its own
+    # resolution, which is what an older Eitaa build needs.
     async def send_text(self, peer_id: str, text: str) -> dict:
+        ah = self._hash_for(peer_id)
+        if ah:
+            return await self.driver.bridge_send(peer_id, text, ah)
         return await self.driver.bridge_send(peer_id, text)
 
     async def send_file(self, peer_id: str, caption: str = "") -> dict:
+        ah = self._hash_for(peer_id)
+        if ah:
+            return await self.driver.bridge_file_send(peer_id, caption, ah)
         return await self.driver.bridge_file_send(peer_id, caption)
 
 
