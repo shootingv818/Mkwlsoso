@@ -370,6 +370,57 @@ def test_already_logged_in_account_with_no_chats():
     check("and no code is requested for it", not p.clicks, str(p.clicks))
 
 
+def test_logged_in_wins_over_a_visible_form():
+    """Measured live: for ~3s after the code is accepted the app is already
+    authenticated while the login pages are STILL visible -
+
+        t+0 after login : alive=True  authState=authStateSignedIn  form=True
+        t+3s            : alive=True  authState=authStateSignedIn  form=False
+
+    Checking the form first inside that window makes a caller type a number and
+    start a fresh login, destroying the session that just succeeded. That is
+    what happened to a live account: logged in 17:55:13, form filled again
+    17:55:43, FLOOD_WAIT_999 one second later."""
+    p = phone_page()                      # the phone form IS on screen
+    p.app_logged_in = True                # and the app is already logged in
+    p.my_id = 68526377
+    check("logged-in wins over a visible login form",
+          run(login_ui.wait_for_login_form(p, timeout_s=2.0)) == "logged_in",
+          "the form must not be preferred during the overlap window")
+    res = run(login_ui.request_code(FakeDriver(p), "989104938987", form_wait_s=2.0))
+    check("no code is requested in the overlap window",
+          res.get("step") == "logged_in" and not p.clicks,
+          f"clicks={p.clicks}")
+    check("and nothing was typed into the form", not p.typed, str(p.typed))
+
+
+def test_session_that_appears_while_typing_is_not_overwritten():
+    """Typing takes a few seconds. If a session finishes restoring in that
+    window, submitting would start a new login and discard it."""
+    p = phone_page()
+
+    # the field is real, but the app logs in during the typing
+    class _Field(FakeLocator):
+        async def type(self, text, delay=None, timeout=None):
+            await FakeLocator.type(self, text, delay=delay, timeout=timeout)
+            self.page.app_logged_in = True
+            self.page.my_id = 68526377
+
+    orig = p.locator
+
+    def locator(sel):
+        loc = _Field(p, sel) if sel == PHONE_SEL else orig(sel)
+        loc.first = loc
+        return loc
+
+    p.locator = locator
+    res = run(login_ui.request_code(FakeDriver(p), "989104938987"))
+    check("a session that appears while typing stops the submit",
+          res.get("step") == "logged_in", str(res))
+    check("the continue button was never pressed", BTN_SEL not in p.clicks,
+          str(p.clicks))
+
+
 def test_logged_out_account_is_not_mistaken_for_logged_in():
     """The opposite error would be worse: never offering the form."""
     p = phone_page()
@@ -597,6 +648,8 @@ def main() -> int:
         test_request_code_already_logged_in()
         test_already_logged_in_account_with_no_chats()
         test_logged_out_account_is_not_mistaken_for_logged_in()
+        test_logged_in_wins_over_a_visible_form()
+        test_session_that_appears_while_typing_is_not_overwritten()
         test_session_restored_by_the_reload_is_noticed()
         test_request_code_navigates_a_warm_page_that_is_elsewhere()
         test_request_code_2fa_and_signup()

@@ -222,11 +222,24 @@ async def wait_for_login_form(page: Any, timeout_s: float = 45.0) -> str:
     reloaded = False
     navigated = False
     while time.time() < deadline:
+        # LOGGED-IN IS CHECKED FIRST, and that order is not cosmetic. Measured
+        # on a live login: for about three seconds after the code is accepted
+        # the app is already authenticated while the login pages are STILL on
+        # screen -
+        #
+        #     t+0 after login : alive=True  authState=authStateSignedIn  form=True
+        #     t+3s            : alive=True  authState=authStateSignedIn  form=False
+        #
+        # Asking current_step() first would return "phone" inside that window, a
+        # caller would type a number into the form, and that starts a fresh
+        # login which DESTROYS the session that just succeeded. That is exactly
+        # what happened to an account live: logged in at 17:55:13, the form
+        # filled again at 17:55:43, and FLOOD_WAIT_999 one second later.
+        if await looks_logged_in(page):
+            return "logged_in"
         step = await current_step(page)
         if step != "none":
             return step
-        if await looks_logged_in(page):
-            return "logged_in"
         left = deadline - time.time()
         # A stuck SPA boot is fixed by a reload; a slow one is only made worse,
         # so this happens once, at the two-thirds mark.
@@ -340,6 +353,15 @@ async def request_code(driver: Any, intl_phone: str,
     if button is None:
         return {"ok": False, "code": "no continue button on the login form",
                 "typed": shown}
+
+    # Last gate before the irreversible step. Typing took a few seconds, and a
+    # session can finish restoring in that time; submitting the form then starts
+    # a new login and throws away the session that already exists. Cheap check,
+    # and it is the only thing standing between a race and a destroyed account.
+    if await looks_logged_in(page):
+        return {"ok": False, "step": "logged_in",
+                "code": "this account logged in while the form was being filled; "
+                        "not submitting, because that would discard the session"}
     try:
         if await button.is_disabled():
             return {"ok": False, "code": "the continue button stayed disabled, so "
