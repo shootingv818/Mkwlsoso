@@ -97,7 +97,8 @@ async (a) => {
         const doc=m.media&&m.media.document; if(!doc) continue;
         let fn=null, attrs=[];
         for(const at of (doc.attributes||[])){ attrs.push(at._); if(at._==="documentAttributeFilename") fn=at.file_name; }
-        out.push({msg_id:m.id, peer:peer.__d, out:!!m.out, file_name:fn, mime:doc.mime_type,
+        const isOut = !!(m.pFlags && m.pFlags.out) || !!m.out;
+        out.push({msg_id:m.id, peer:peer.__d, out:isOut, file_name:fn, mime:doc.mime_type,
           size:String(doc.size), dc_id:doc.dc_id, doc_id:String(doc.id),
           access_hash:String(doc.access_hash), file_reference:frhex(doc.file_reference),
           attributes:attrs, has_thumb:!!(doc.thumbs&&doc.thumbs.length)});
@@ -271,22 +272,25 @@ async def fetch_tail(page, doc, size, want, label):
 
 
 # --------------------------------- picking ----------------------------------
+def _sz(d):
+    try:
+        return int(d.get("size") or 0)
+    except Exception:  # noqa: BLE001
+        return 0
+
+
 def pick_target(docs, name_like, any_doc):
-    cands = []
-    for d in docs:
-        if name_like:
-            if not (d.get("file_name") and name_like in d["file_name"]):
-                continue
-            cands.append(d)
-        elif any_doc:
-            cands.append(d)
-        else:
-            if d.get("mime") == "application/zip":
-                cands.append(d)
-    if not cands:
+    if not docs:
         return None
-    cands.sort(key=lambda d: int(d.get("size") or 0), reverse=True)
-    return cands[0]
+    if name_like:
+        m = [d for d in docs if d.get("file_name") and name_like in d["file_name"]]
+        return max(m, key=_sz) if m else None
+    if any_doc:
+        return max(docs, key=_sz)
+    zips = [d for d in docs if d.get("mime") == "application/zip"]
+    if zips:
+        return max(zips, key=_sz)
+    return max(docs, key=_sz)  # fallback: biggest document of any kind
 
 
 # --------------------------------- dissect ----------------------------------
@@ -429,49 +433,58 @@ async def run(args) -> int:
             return 2
         ok(f"logged in: my_id={st.get('my_id')}")
 
-        # seed the "seen" set unless we want to grab an existing file
-        seen = set()
-        if not args.include_existing:
-            r, err = await ev(page, SCAN_DOCS_JS, {}, timeout=90)
-            if r and r.get("ok"):
-                for d in r["docs"]:
-                    seen.add(d["doc_id"])
-                info(f"seeded {len(seen)} existing documents (will react to NEW sends)")
-            banner(f"WATCHING for a NEW send for {args.watch}s")
-            print("  >>> NOW log the other bot into this account and have it SEND the "
-                  "file. <<<", flush=True)
-        else:
-            banner("SCANNING existing history (no wait)")
+        banner("INVENTORY  -  documents currently in history (self + 20 dialogs)")
+        r, err = await ev(page, SCAN_DOCS_JS, {}, timeout=120)
+        raw = (r or {}).get("docs") or []
+        if err or not (r or {}).get("ok"):
+            bad(f"could not list documents: {(r or {}).get('code') or err}")
+            return 1
+        uniq = {}  # dedupe by doc_id (same file forwarded shows up repeatedly)
+        for d in raw:
+            uniq.setdefault(d["doc_id"], d)
+        docs = sorted(uniq.values(), key=_sz, reverse=True)
+        if not docs:
+            bad("no documents visible. Make sure the bot already SENT the file to a "
+                "chat (or Saved Messages) this account can see, then re-run.")
+            return 1
+        for d in docs:
+            info(f"{_sz(d):>10} B  {str(d.get('mime')):<24} out={d.get('out')}  "
+                 f"peer={d.get('peer')}  name={d.get('file_name')!r}")
 
         target = None
-        deadline = time.time() + (0 if args.include_existing else float(args.watch))
-        first = True
-        while True:
-            r, err = await ev(page, SCAN_DOCS_JS, {}, timeout=90)
-            if r and r.get("ok"):
-                pool = [d for d in r["docs"] if d["doc_id"] not in seen]
-                if args.include_existing and first:
-                    pool = r["docs"]
-                target = pick_target(pool, args.name_like, args.any)
-                for d in r["docs"]:
+        if args.watch and args.watch > 0:
+            seen = {d["doc_id"] for d in docs}
+            banner(f"WATCHING {args.watch:.0f}s for a NEW send - trigger the bot now")
+            deadline = time.time() + float(args.watch)
+            while time.time() < deadline:
+                await asyncio.sleep(2.0)
+                r2, _ = await ev(page, SCAN_DOCS_JS, {}, timeout=120)
+                pool = [d for d in ((r2 or {}).get("docs") or [])
+                        if d["doc_id"] not in seen]
+                for d in pool:
                     seen.add(d["doc_id"])
+                target = pick_target(pool, args.name_like, args.any)
                 if target:
-                    hit(f"caught: {target.get('file_name')!r}  "
-                        f"{target.get('size')} B  {target.get('mime')}")
+                    hit(f"caught NEW: {target.get('file_name')!r}  {_sz(target)}B")
                     break
-            first = False
-            if time.time() >= deadline:
-                break
-            await asyncio.sleep(2.0)
+            if not target:
+                info("no new send appeared; dissecting the best EXISTING file instead")
 
         if not target:
-            bad("no matching new document appeared in the watch window")
-            info("re-run with a longer --watch, add --any to match non-zip docs,")
-            info("or --include-existing to dissect a file already in history")
+            target = pick_target(docs, args.name_like, args.any)
+        if not target:
+            bad("no candidate matched. Pass --any (match any doc) or --name-like S.")
             return 1
 
+        hit(f"dissecting: {target.get('file_name')!r}  {_sz(target)}B  "
+            f"{target.get('mime')}")
         await dissect(page, target, config)
         return 0
+    except Exception:  # noqa: BLE001
+        import traceback
+        banner("ERROR  -  scan crashed, full traceback below")
+        print(traceback.format_exc(), flush=True)
+        return 3
     finally:
         try:
             await session.close()
@@ -482,12 +495,12 @@ async def run(args) -> int:
 def main() -> int:
     p = argparse.ArgumentParser(description="Catch a fresh send and dissect it hard.")
     p.add_argument("--account", required=True)
-    p.add_argument("--watch", type=float, default=240,
-                   help="seconds to wait for a new send (default 240)")
+    p.add_argument("--watch", type=float, default=0,
+                   help="0 (default) = dissect the file already in history now; "
+                        ">0 = also wait that many seconds for a brand-new send")
     p.add_argument("--name-like", default=None, help="only match names containing this")
-    p.add_argument("--any", action="store_true", help="match ANY new document, not just zips")
-    p.add_argument("--include-existing", action="store_true",
-                   help="dissect a matching file already in history (no waiting)")
+    p.add_argument("--any", action="store_true",
+                   help="match ANY document, not just zips (pick the biggest)")
     p.add_argument("--wait", type=float, default=20, help="seconds to let the app settle")
     args = p.parse_args()
     try:
