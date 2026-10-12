@@ -156,30 +156,59 @@ DOWNLOAD_JS = r"""
 async (a) => {
   function API(){ try{ if(window.__MKWL_api) return window.__MKWL_api(); }catch(e){} return window.apiManager||null; }
   const AM=API(); if(!AM||!AM.invokeApi) return {ok:false, code:"no invokeApi"};
+  function errStr(e){
+    try {
+      if (e == null) return "null";
+      if (typeof e === "string") return e;
+      // Eitaa/tweb errors: {type, code, message, error_message, originalError}
+      const parts = [];
+      for (const k of ["type","code","error_code","error_message","message"]) {
+        if (e[k] != null) parts.push(k+"="+e[k]);
+      }
+      if (parts.length) return parts.join(" ");
+      return JSON.stringify(e).slice(0,200);
+    } catch(x){ return "unserializable error"; }
+  }
   function hx2u(h){ const u=new Uint8Array(h.length/2); for(let i=0;i<u.length;i++) u[i]=parseInt(h.substr(i*2,2),16); return u; }
-  const loc = {
-    _:"inputDocumentFileLocation",
-    id: a.doc_id, access_hash: a.access_hash,
-    file_reference: a.file_reference_hex ? hx2u(a.file_reference_hex) : new Uint8Array(0),
-    thumb_size: ""
-  };
-  const cap = a.cap || (1024*1024);  // 1 MB default; enough to see structure
-  let offset = 0; const chunks = [];
-  try {
-    while (offset < cap) {
-      const part = await AM.invokeApi("upload.getFile", {
-        location: loc, offset: offset, limit: 524288, precise:false, cdn_supported:false
-      }, { dcId: a.dc_id });
-      const bytes = part && part.bytes;
-      if (!bytes || !bytes.length) break;
-      const b = new Uint8Array(bytes);
-      let s=""; for(let i=0;i<b.length;i++) s+=String.fromCharCode(b[i]);
-      chunks.push(btoa(s));
-      offset += b.length;
-      if (b.length < 524288) break;
+
+  const fr = a.file_reference_hex ? hx2u(a.file_reference_hex) : new Uint8Array(0);
+  // Try several location shapes + dc routings; keep the first that returns bytes.
+  const locs = [
+    { label:"inputDocumentFileLocation",
+      loc:{_:"inputDocumentFileLocation", id:a.doc_id, access_hash:a.access_hash,
+           file_reference:fr, thumb_size:""} },
+  ];
+  const dcTries = [a.dc_id, undefined];  // explicit dc, then default routing
+  const cap = a.cap || (1024*1024);
+  const attempts = [];
+
+  for (const L of locs) {
+    for (const dc of dcTries) {
+      let offset = 0; const chunks = [];
+      try {
+        while (offset < cap) {
+          const params = {location:L.loc, offset:offset, limit:524288,
+                          precise:false, cdn_supported:false};
+          const opts = (dc!=null) ? {dcId:dc} : undefined;
+          const part = opts ? await AM.invokeApi("upload.getFile", params, opts)
+                            : await AM.invokeApi("upload.getFile", params);
+          const bytes = part && part.bytes;
+          if (!bytes || !bytes.length) break;
+          const b = new Uint8Array(bytes);
+          let s=""; for(let i=0;i<b.length;i++) s+=String.fromCharCode(b[i]);
+          chunks.push(btoa(s));
+          offset += b.length;
+          if (b.length < 524288) break;
+        }
+        if (offset > 0) return {ok:true, b64parts:chunks, bytes:offset,
+                                via:L.label+" dc="+(dc==null?"default":dc)};
+        attempts.push(L.label+" dc="+(dc==null?"default":dc)+": 0 bytes");
+      } catch(e){
+        attempts.push(L.label+" dc="+(dc==null?"default":dc)+": "+errStr(e));
+      }
     }
-    return {ok:true, b64parts: chunks, bytes: offset};
-  } catch(e){ return {ok:false, code:String(e), bytes: offset}; }
+  }
+  return {ok:false, code:"all download attempts failed", attempts:attempts};
 }
 """
 
@@ -246,7 +275,14 @@ async def download_and_dissect(page, doc: dict, cap_bytes: int) -> dict:
            "dc_id": doc.get("dc_id"), "cap": cap_bytes}
     res, err = await ev(page, DOWNLOAD_JS, arg, timeout=120)
     if err or not res or not res.get("ok"):
-        return {"download_error": (res or {}).get("code") or err}
+        detail = {"download_error": (res or {}).get("code") or err}
+        if res and res.get("attempts"):
+            detail["attempts"] = res["attempts"]
+            info("download attempts (each location/dc tried):")
+            for a2 in res["attempts"]:
+                info(f"    - {a2}")
+        return detail
+    info(f"downloaded via {res.get('via')}")
     try:
         raw = b"".join(base64.b64decode(p) for p in res.get("b64parts", []))
     except Exception as exc:  # noqa: BLE001
