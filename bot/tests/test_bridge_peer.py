@@ -206,6 +206,29 @@ def test_file_bridge_got_the_same_treatment():
           "getMyId() answers 0 while the app is still booting")
 
 
+def test_file_init_resolves_the_manager_through_the_proxy():
+    """The live 'no sendFile' failure: __MKWL_fileInit read the old global
+    window.appMessagesManager, which this Eitaa build dropped, so file upload
+    (and the 'test to me' dry-run) died before uploading anything."""
+    src = open(os.path.join(os.path.dirname(transports.__file__), "..",
+                            "eitaa", "bridge_file_send.js"), encoding="utf-8").read()
+    i_init = src.index("__MKWL_fileInit = async")
+    body = src[i_init:i_init + 900]
+    check("fileInit falls back to the worker proxy for appMessagesManager",
+          "__MKWL_mgr" in body and "appMessagesManager" in body,
+          "must resolve the manager, not read the dropped global")
+    check("fileInit still guards on a usable sendFile",
+          "typeof AMM.sendFile" in body or "AMM.sendFile" in body)
+    # the actual sendFile call tries the object form the matrix proved works
+    i_call = src.index("MKWLUP")
+    call = src[i_call:i_call + 400]
+    check("the upload tries the object-form sendFile first",
+          "peerId:" in call and "caption:" in call,
+          "object form delivered on this build; positional is the fallback")
+    check("the positional form is kept as a fallback",
+          "sendFile(selfNum" in call)
+
+
 def main() -> int:
     print("=" * 68)
     print("BRIDGE PEER RESOLUTION TESTS")
@@ -221,6 +244,7 @@ def main() -> int:
         test_page_prefers_the_given_hash_then_falls_back()
         test_failure_reason_names_the_missing_hash()
         test_file_bridge_got_the_same_treatment()
+        test_file_init_resolves_the_manager_through_the_proxy()
     finally:
         shutil.rmtree(_TMP, ignore_errors=True)
     print("\n" + "=" * 68)

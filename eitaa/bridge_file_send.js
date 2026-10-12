@@ -117,9 +117,16 @@
   // fixed 90 iterations of (1s sleep + one getHistory round-trip); on a slow
   // host each iteration took ~6.7s, so a failing init burned 600 seconds.
   window.__MKWL_fileInit = async function (b64, filename, mime, deadlineMs) {
-    const AM = API(), AMM = window.appMessagesManager;
+    // appMessagesManager used to be a global; on the current Eitaa build it
+    // lives in the worker and is reached through the resolver. The file-send
+    // matrix proved sendFile works via the proxy (same object, async proxy),
+    // and only this guard - which read the old global - stood between the bot
+    // and a working upload ("no sendFile" was it returning here).
+    const AM = API();
+    const AMM = window.appMessagesManager
+      || (window.__MKWL_mgr ? window.__MKWL_mgr("appMessagesManager") : null);
     if (!AM || !AM.invokeApi) return { ok: false, code: "no invokeApi" };
-    if (!AMM || !AMM.sendFile) return { ok: false, code: "no sendFile" };
+    if (!AMM || typeof AMM.sendFile !== "function") return { ok: false, code: "no sendFile" };
     const sid = await getSelfId();
     if (sid == null) return { ok: false, code: "no self id" };
     const selfNum = (typeof sid !== "number" && !isNaN(+sid)) ? +sid : sid;
@@ -136,8 +143,15 @@
     // Tag the Saved-Messages copy with a unique internal marker so we can
     // locate exactly this upload (recipients never see this caption).
     const marker = "MKWLUP" + randId();
+    // The matrix proved the OBJECT form works on this build; the positional
+    // form is the older signature, kept as a fallback so an older build still
+    // works. Either one uploads the file to Saved Messages once.
     try {
-      await AMM.sendFile(selfNum, file, { caption: marker });
+      try {
+        await AMM.sendFile({ peerId: selfNum, file: file, caption: marker });
+      } catch (eObj) {
+        await AMM.sendFile(selfNum, file, { caption: marker });
+      }
     } catch (e) { return { ok: false, code: "sendFile:" + errCode(e) }; }
 
     const budget = (typeof deadlineMs === "number" && deadlineMs > 0) ? deadlineMs : 180000;
