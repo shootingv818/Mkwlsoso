@@ -381,7 +381,10 @@ async def try_direct(account, size_big, real, settle, driver, verify_page) -> No
     from bot import direct_ctx
 
     try:
-        refresh = await direct_ctx.refresh_from_driver(driver, account)
+        # Hard cap: the worker dump reads from the page, and anything that reads
+        # from this Eitaa build can stall. Never let it hang the whole run.
+        refresh = await asyncio.wait_for(
+            direct_ctx.refresh_from_driver(driver, account), timeout=60)
         REPORT["direct_refresh"] = refresh
         if not refresh.get("ok") and not direct_ctx.has_context(account):
             bad(f"direct context did not build: {refresh.get('code')}")
@@ -531,16 +534,12 @@ async def run(args) -> int:
         big_apk = base_apk(int(float(args.max_mb) * 1024 * 1024), real)
 
         # ---- ROUTE A first: a bare apk is the ideal, so try it up front ----
-        # Give the capture hook a moment of real traffic to record, so the
-        # direct context has something to extract.
+        # The worker-capture hook records traffic from the moment the page
+        # loads, so the ~20s boot wait above already gave it plenty - no nudge
+        # needed. (An earlier version called bridge_stats here to "nudge" the
+        # app; that call is slow on this build and hung the run, so it is gone.)
         if not args.no_direct:
             try:
-                info("nudging the app so the worker capture sees live traffic")
-                try:
-                    await driver.bridge_stats(with_pvs=False)
-                except Exception:  # noqa: BLE001
-                    pass
-                await asyncio.sleep(3)
                 await try_direct(args.account, int(float(args.max_mb) * 1024 * 1024),
                                  real, args.settle, driver, page)
             except Exception:  # noqa: BLE001
