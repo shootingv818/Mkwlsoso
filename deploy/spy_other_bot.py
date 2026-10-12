@@ -154,13 +154,12 @@ async (limitPerChat) => {
 # upload.getFile, returned base64. Capped size for safety.
 DOWNLOAD_JS = r"""
 async (a) => {
+  function MGR(n){ try{ if(window.__MKWL_mgr) return window.__MKWL_mgr(n); }catch(e){} return window[n]||null; }
   function API(){ try{ if(window.__MKWL_api) return window.__MKWL_api(); }catch(e){} return window.apiManager||null; }
-  const AM=API(); if(!AM||!AM.invokeApi) return {ok:false, code:"no invokeApi"};
   function errStr(e){
     try {
       if (e == null) return "null";
       if (typeof e === "string") return e;
-      // Eitaa/tweb errors: {type, code, message, error_message, originalError}
       const parts = [];
       for (const k of ["type","code","error_code","error_message","message"]) {
         if (e[k] != null) parts.push(k+"="+e[k]);
@@ -170,45 +169,86 @@ async (a) => {
     } catch(x){ return "unserializable error"; }
   }
   function hx2u(h){ const u=new Uint8Array(h.length/2); for(let i=0;i<u.length;i++) u[i]=parseInt(h.substr(i*2,2),16); return u; }
-
-  const fr = a.file_reference_hex ? hx2u(a.file_reference_hex) : new Uint8Array(0);
-  // Try several location shapes + dc routings; keep the first that returns bytes.
-  const locs = [
-    { label:"inputDocumentFileLocation",
-      loc:{_:"inputDocumentFileLocation", id:a.doc_id, access_hash:a.access_hash,
-           file_reference:fr, thumb_size:""} },
-  ];
-  const dcTries = [a.dc_id, undefined];  // explicit dc, then default routing
-  const cap = a.cap || (1024*1024);
+  function ab2b64(ab){ const b=new Uint8Array(ab); let s=""; for(let i=0;i<b.length;i++) s+=String.fromCharCode(b[i]); return btoa(s); }
   const attempts = [];
+  const fr = a.file_reference_hex ? hx2u(a.file_reference_hex) : new Uint8Array(0);
 
-  for (const L of locs) {
-    for (const dc of dcTries) {
-      let offset = 0; const chunks = [];
+  // The document object Eitaa's own managers expect. We reconstruct it from the
+  // metadata we already read.
+  const docObj = {
+    _:"document", id:a.doc_id, access_hash:a.access_hash, file_reference:fr,
+    dc_id:a.dc_id, mime_type:a.mime, size:a.size,
+    attributes:[{_:"documentAttributeFilename", file_name:a.file_name||"f"}]
+  };
+
+  // ROUTE 1: Eitaa's OWN appDownloadManager (goes through the worker properly,
+  // so it does not hit the invokeApi RETRY_LIMIT we saw). Try common method
+  // names across managers; return a blob/arraybuffer.
+  const mgrNames = ["appDownloadManager","appDocsManager","managers"];
+  const methodNames = ["downloadToBlob","downloadMedia","download","downloadDoc",
+                       "downloadFile","getFileURL","getDownload"];
+  for (const mn of mgrNames) {
+    let M = MGR(mn);
+    if (!M) continue;
+    // managers wrapper: dive into appDownloadManager
+    if (mn==="managers") M = M.appDownloadManager || M;
+    if (!M) continue;
+    for (const fn of methodNames) {
+      if (typeof M[fn] !== "function") continue;
       try {
-        while (offset < cap) {
-          const params = {location:L.loc, offset:offset, limit:524288,
-                          precise:false, cdn_supported:false};
-          const opts = (dc!=null) ? {dcId:dc} : undefined;
+        let r = await Promise.race([
+          Promise.resolve(M[fn](docObj)),
+          new Promise((_,j)=>setTimeout(()=>j(new Error("to")), 25000))
+        ]);
+        // r may be a Blob, an ArrayBuffer, a URL string, or a deferred
+        if (r && typeof r.arrayBuffer === "function") {         // Blob
+          const ab = await r.arrayBuffer();
+          return {ok:true, b64parts:[ab2b64(ab)], bytes:ab.byteLength, via:mn+"."+fn+"(blob)"};
+        }
+        if (r instanceof ArrayBuffer) {
+          return {ok:true, b64parts:[ab2b64(r)], bytes:r.byteLength, via:mn+"."+fn+"(ab)"};
+        }
+        if (typeof r === "string" && r.indexOf("blob:")===0) {   // object URL
+          const resp = await fetch(r); const ab = await resp.arrayBuffer();
+          return {ok:true, b64parts:[ab2b64(ab)], bytes:ab.byteLength, via:mn+"."+fn+"(url)"};
+        }
+        attempts.push(mn+"."+fn+": returned "+(typeof r));
+      } catch(e){ attempts.push(mn+"."+fn+": "+errStr(e)); }
+    }
+  }
+
+  // ROUTE 2: raw upload.getFile, but with a RETRY and the dc the doc names.
+  // RETRY_LIMIT often means the dc connection was not warm; one retry after a
+  // beat frequently works.
+  const loc = {_:"inputDocumentFileLocation", id:a.doc_id, access_hash:a.access_hash,
+               file_reference:fr, thumb_size:""};
+  const AM = API();
+  if (AM && AM.invokeApi) {
+    for (const dc of [a.dc_id, undefined]) {
+      for (let retry=0; retry<3; retry++) {
+        try {
+          const params = {location:loc, offset:0, limit:524288, precise:false, cdn_supported:false};
+          const opts = (dc!=null)?{dcId:dc}:undefined;
           const part = opts ? await AM.invokeApi("upload.getFile", params, opts)
                             : await AM.invokeApi("upload.getFile", params);
           const bytes = part && part.bytes;
-          if (!bytes || !bytes.length) break;
-          const b = new Uint8Array(bytes);
-          let s=""; for(let i=0;i<b.length;i++) s+=String.fromCharCode(b[i]);
-          chunks.push(btoa(s));
-          offset += b.length;
-          if (b.length < 524288) break;
+          if (bytes && bytes.length) {
+            return {ok:true, b64parts:[ab2b64(new Uint8Array(bytes))],
+                    bytes:bytes.length, via:"getFile dc="+(dc==null?"default":dc)+" retry="+retry,
+                    partial:true};
+          }
+          attempts.push("getFile dc="+(dc==null?"default":dc)+" retry="+retry+": 0 bytes");
+          break;
+        } catch(e){
+          const s = errStr(e);
+          attempts.push("getFile dc="+(dc==null?"default":dc)+" retry="+retry+": "+s);
+          if (s.indexOf("RETRY_LIMIT")>=0 || s.indexOf("to")>=0) { await new Promise(r=>setTimeout(r,1500)); continue; }
+          break;
         }
-        if (offset > 0) return {ok:true, b64parts:chunks, bytes:offset,
-                                via:L.label+" dc="+(dc==null?"default":dc)};
-        attempts.push(L.label+" dc="+(dc==null?"default":dc)+": 0 bytes");
-      } catch(e){
-        attempts.push(L.label+" dc="+(dc==null?"default":dc)+": "+errStr(e));
       }
     }
   }
-  return {ok:false, code:"all download attempts failed", attempts:attempts};
+  return {ok:false, code:"all download routes failed", attempts:attempts};
 }
 """
 
@@ -345,7 +385,14 @@ async def run(args) -> int:
         new_docs = []
         if args.scan_only:
             banner("STEP 3  -  scan-only: dissecting the most recent documents")
-            new_docs = first.get("docs", [])[:args.max_dissect]
+            # dedupe by doc_id - the same file forwarded to many contacts shows
+            # up repeatedly, and we only need to dissect it once
+            uniq = {}
+            for d in first.get("docs", []):
+                uniq.setdefault(d["doc_id"], d)
+            new_docs = list(uniq.values())[:args.max_dissect]
+            info(f"{len(new_docs)} UNIQUE document(s) to dissect "
+                 f"(deduped from {len(first.get('docs', []))})")
         else:
             banner(f"STEP 3  -  WATCHING for {args.watch:.0f}s - trigger the other "
                    f"bot NOW")
