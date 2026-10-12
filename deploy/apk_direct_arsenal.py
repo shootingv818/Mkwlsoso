@@ -205,13 +205,60 @@ def probe_host(url: str, timeout: float = 8.0) -> dict:
     return out
 
 
-def map_hosts() -> None:
+HARVEST_HOSTS_JS = r"""
+async () => {
+  // Ask Eitaa for its OWN host list - help.getConfig returns dc_options with
+  // the real ip_address/host of every data centre, which is the authoritative
+  // source instead of a hardcoded guess.
+  function API(){ try{ if(window.__MKWL_api) return window.__MKWL_api(); }catch(e){} return window.apiManager||null; }
+  const AM=API(); if(!AM||!AM.invokeApi) return {ok:false, code:"no invokeApi"};
+  try{
+    const c=await AM.invokeApi("help.getConfig", {});
+    const dcs=[];
+    for(const o of (c&&c.dc_options)||[]){
+      dcs.push({id:o.id, host:o.ip_address, port:o.port,
+                media_only: !!(o.pFlags&&o.pFlags.media_only),
+                tcpo_only: !!(o.pFlags&&o.pFlags.tcpo_only)});
+    }
+    return {ok:true, this_dc:c&&c.this_dc, dc_options:dcs};
+  }catch(e){ return {ok:false, code:String(e)}; }
+}
+"""
+
+
+async def harvest_live_hosts(page) -> list:
+    """Pull Eitaa's own dc_options so we probe the hosts IT uses right now."""
+    res, err = await ev(page, HARVEST_HOSTS_JS, timeout=30)
+    REPORT["hosts"]["getConfig"] = res or {"error": err}
+    hosts = []
+    if res and res.get("ok"):
+        ok(f"Eitaa's own config: this_dc={res.get('this_dc')}, "
+           f"{len(res.get('dc_options', []))} dc_option(s)")
+        for d in res.get("dc_options", []):
+            h = d.get("host")
+            if h and h not in hosts:
+                hosts.append(h)
+            tag = ("media" if d.get("media_only") else "api/media")
+            info(f"        dc{d.get('id')}  {h}:{d.get('port')}  {tag}")
+    else:
+        info(f"could not read Eitaa's config ({(res or {}).get('code') or err}); "
+             f"falling back to the known shard list")
+    return hosts
+
+
+def map_hosts(live_hosts: list | None = None) -> None:
     banner("PHASE 2  -  which Eitaa hosts answer this minute")
     from direct import dc
     api_hosts = [f"https://{h}{dc.DEFAULT_PATH}" for h in dc.EITAA_SHARD_HOSTS]
     media_hosts = ["https://fateme.eitaa.com/eitaa/",
                    "https://hadi.eitaa.com/eitaa/",
                    "https://majid.eitaa.com/eitaa/"]
+    # add any host Eitaa itself named in getConfig that we did not already know
+    for h in (live_hosts or []):
+        u = f"https://{h}{dc.DEFAULT_PATH}"
+        if u not in api_hosts and u not in media_hosts:
+            media_hosts.append(u)
+            info(f"adding live host from Eitaa's config: {h}")
     for label, urls in [("API shards (.ir)", api_hosts),
                         ("media hosts (.com)", media_hosts)]:
         info(label + ":")
@@ -379,7 +426,11 @@ async def run(args) -> int:
         bad("eitaa/worker_capture.js missing - the direct path needs it")
         return 2
     light = False if args.no_light else None
-    session = await BrowserSession(args.account, light_assets=light,
+    # Explicit headless: the server has no X display, and config.HEADED is True
+    # on this host (it is meant for a manual noVNC login), so leaving it to the
+    # default launched a headed Chromium with no XServer and crashed.
+    session = await BrowserSession(args.account, headed=args.headed,
+                                   light_assets=light,
                                    init_script_path=cap).start()
     page = session.page
     driver = EitaaDriver(session)
@@ -415,8 +466,9 @@ async def run(args) -> int:
             summarise(outdir)
             return 1
 
-        # PHASE 2
-        map_hosts()
+        # PHASE 2 - harvest Eitaa's OWN host list, then probe
+        live_hosts = await harvest_live_hosts(page)
+        map_hosts(live_hosts)
 
         # PHASE 3 + 4
         await run_arsenal(args.account, int(args.size_kb * 1024),
@@ -560,6 +612,9 @@ def main() -> int:
     p.add_argument("--wait", type=float, default=20)
     p.add_argument("--settle", type=float, default=18)
     p.add_argument("--no-light", action="store_true")
+    p.add_argument("--headed", action="store_true",
+                   help="show a real window (needs an X display / xvfb); default "
+                        "is headless, which is what a server wants")
     args = p.parse_args()
     try:
         return asyncio.run(run(args))
