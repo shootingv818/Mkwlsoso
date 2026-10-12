@@ -467,6 +467,7 @@ def kb_content():
     return [
         [Button.inline("📝 Set Text", b"content:text"),
          Button.inline("📎 Set File", b"content:file")],
+        [Button.inline("📱 Set APK (→ Zip)", b"content:apk")],
         [Button.inline("🗑 Clear", b"content:clear")],
         [Button.inline("⬅ Back", b"menu:home")],
     ]
@@ -1239,6 +1240,14 @@ async def _handle_callback(event):
                        footer="Upload the file (any type Eitaa allows: zip, pdf, ...). "
                               "Add a caption to the upload to store it too."),
             buttons=kb_back())
+    if data == "content:apk":
+        pending[event.sender_id] = {"step": "await_apk"}
+        return await event.edit(
+            cards.card("📱 SET APK → ZIP",
+                       footer="Upload your .apk now. I wrap it in a zip Eitaa "
+                              "delivers; the person just opens the zip and taps "
+                              "the apk inside to install. You pick the name next."),
+            buttons=kb_back())
     if data == "content:clear":
         store.clear_content()
         await event.answer("Content cleared.")
@@ -1521,6 +1530,73 @@ async def _conversation(event):
         store.set_file_content(str(dest), name, caption)
         pending.pop(event.sender_id, None)
         return await event.respond(content_text(), buttons=kb_content())
+
+    if step == "await_apk":
+        if not event.message.file:
+            return await event.respond("Upload your .apk as a document (file).")
+        config.DATA_DIR.mkdir(parents=True, exist_ok=True)
+        dest_dir = config.DATA_DIR / "content"
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        src_name = event.message.file.name or f"app_{event.message.id}.apk"
+        if not src_name.lower().endswith(".apk"):
+            src_name += ".apk"
+        src = (dest_dir / src_name).resolve()
+        await event.message.download_media(file=str(src))
+        st["apk_path"] = str(src)
+        st["caption"] = text or ""
+        st["step"] = "await_apk_name"
+        return await event.respond(
+            cards.card("📱 APK NAME",
+                       [("Received", src_name)],
+                       footer="Send the name to show the recipient (e.g. «نرم‌افزار» "
+                              "or «app»). They see a zip by this name and the apk "
+                              "inside has the same name. Send «-» to keep the "
+                              "original."),
+            buttons=kb_back())
+
+    if step == "await_apk_name":
+        from pathlib import Path as _Path
+        from direct import apk_mode as _apk
+        chosen = (text or "").strip()
+        if not chosen or chosen == "-":
+            base = _Path(st.get("apk_path", "")).name or "app.apk"
+        else:
+            base = chosen
+        low = base.lower()
+        stem = base[:-4] if (low.endswith(".apk") or low.endswith(".zip")) else base
+        stem = (stem.replace("/", "_").replace("\\", "_").strip() or "app")
+        inner = stem + ".apk"
+        outer = stem + ".zip"
+        try:
+            apk_raw = _Path(st["apk_path"]).read_bytes()
+            zip_bytes = _apk.build_eitaa_apk_zip(apk_raw, inner)
+            # refuse to ship a file the recipient cannot open: verify the wrap
+            # round-trips to the EXACT apk before we store it as content
+            import io as _io
+            import zipfile as _zip
+            names = _zip.ZipFile(_io.BytesIO(zip_bytes)).namelist()
+            if not names or _zip.ZipFile(_io.BytesIO(zip_bytes)).read(names[0]) != apk_raw:
+                raise ValueError("wrapped zip did not round-trip to the apk")
+        except Exception as exc:  # noqa: BLE001
+            pending.pop(event.sender_id, None)
+            return await event.respond(
+                cards.card("📱 APK → ZIP FAILED", [("Error", str(exc)[:140])],
+                           footer="That file may not be a valid apk. Try again."),
+                buttons=kb_content())
+        dest_dir = config.DATA_DIR / "content"
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        zpath = (dest_dir / outer).resolve()
+        zpath.write_bytes(zip_bytes)
+        store.set_file_content(str(zpath), outer, st.get("caption", ""))
+        pending.pop(event.sender_id, None)
+        return await event.respond(
+            cards.card("📱 APK READY",
+                       [("Sends as", outer),
+                        ("Taps to install", inner),
+                        ("Size", f"{len(zip_bytes):,} B")],
+                       footer="Saved as the content. Press Send to broadcast. The "
+                              "recipient opens the zip and taps the apk to install."),
+            buttons=kb_content())
 
     if step == "login_phone":
         phone = re.sub(r"[^\d+]", "", text or "")
