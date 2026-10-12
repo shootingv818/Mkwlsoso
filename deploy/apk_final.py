@@ -534,12 +534,26 @@ async def run(args) -> int:
         big_apk = base_apk(int(float(args.max_mb) * 1024 * 1024), real)
 
         # ---- ROUTE A first: a bare apk is the ideal, so try it up front ----
-        # The worker-capture hook records traffic from the moment the page
-        # loads, so the ~20s boot wait above already gave it plenty - no nudge
-        # needed. (An earlier version called bridge_stats here to "nudge" the
-        # app; that call is slow on this build and hung the run, so it is gone.)
+        # The worker-capture hook records what the app SENDS to its MTProto
+        # worker, so there has to BE traffic: just loading the page produces
+        # none that carries the envelope the direct context needs. So make one
+        # real, light API call first - contacts.getContacts, the same call
+        # Update Contacts uses - which this build answers in well under a second
+        # (measured: 124 contacts in 0.4s). Capped so it can never hang.
         if not args.no_direct:
             try:
+                info("making one light API call (contacts.getContacts) so the "
+                     "worker capture has real traffic to record")
+                try:
+                    r = await asyncio.wait_for(driver.bridge_contacts_list(),
+                                               timeout=45)
+                    n = len(r.get("contacts", [])) if isinstance(r, dict) else 0
+                    info(f"contacts call returned {n} contact(s) - traffic recorded")
+                except asyncio.TimeoutError:
+                    info("contacts call timed out at 45s; trying the dump anyway")
+                except Exception as exc:  # noqa: BLE001
+                    info(f"contacts call error ({exc}); trying the dump anyway")
+                await asyncio.sleep(2)
                 await try_direct(args.account, int(float(args.max_mb) * 1024 * 1024),
                                  real, args.settle, driver, page)
             except Exception:  # noqa: BLE001
