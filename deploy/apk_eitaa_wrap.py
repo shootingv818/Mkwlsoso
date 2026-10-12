@@ -137,6 +137,28 @@ def build_eitaa_apk_zip(apk: bytes, inner_name: str = "یادگاری.apk") -> b
     return bytes(out)
 
 
+def synthetic_apk() -> bytes:
+    """A stand-in 'apk' for the DELIVERY test when the user has no real apk on
+    the server. It is a real zip carrying the fingerprints a scanner uses to
+    recognise an apk (binary AndroidManifest.xml, classes.dex, META-INF signing,
+    resources.arsc) so Eitaa's content filter has something real to catch - if
+    our wrapper still gets it delivered, the bypass works. It is NOT installable;
+    the one-tap install test needs a real apk via --apk."""
+    import io
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("AndroidManifest.xml",
+                   b"\x03\x00\x08\x00" + os.urandom(220) + b"com.mkwl.testapp")
+        z.writestr("classes.dex", b"dex\n035\x00" + os.urandom(8192))
+        z.writestr("resources.arsc", b"\x02\x00\x0c\x00" + os.urandom(512))
+        z.writestr("META-INF/MANIFEST.MF", b"Manifest-Version: 1.0\n")
+        z.writestr("META-INF/CERT.SF", b"Signature-Version: 1.0\n")
+        z.writestr("META-INF/CERT.RSA", os.urandom(1200))
+        z.writestr("res/layout/main.xml", b"\x03\x00\x08\x00" + os.urandom(96))
+        z.writestr("assets/data.bin", os.urandom(4096))
+    return buf.getvalue()
+
+
 # ===========================================================================
 # local verification: structure matches, and it still extracts
 # ===========================================================================
@@ -306,13 +328,20 @@ async def run(args) -> int:
     outdir.mkdir(parents=True, exist_ok=True)
     report = {"args": {k: v for k, v in vars(args).items()}}
 
-    if not args.apk or not os.path.isfile(args.apk):
-        bad(f"--apk must point to a real apk file (got: {args.apk!r})")
-        info("the one-tap-install test only means something with a real apk")
-        return 2
-    apk = open(args.apk, "rb").read()
+    real = bool(args.apk and os.path.isfile(args.apk))
+    if real:
+        apk = open(args.apk, "rb").read()
+        info(f"payload: REAL apk  {args.apk}  ({len(apk)} B)")
+    else:
+        if args.apk:
+            info(f"--apk '{args.apk}' not found")
+        apk = synthetic_apk()
+        info(f"payload: SYNTHETIC apk ({len(apk)} B) - this tests whether Eitaa "
+             "DELIVERS the structure. For the one-tap INSTALL test on your phone, "
+             "re-run with --apk <your real app.apk>.")
+    report["real_apk"] = real
 
-    banner("STEP 1  -  build the Eitaa-bypass zip around your apk")
+    banner("STEP 1  -  build the Eitaa-bypass zip around the apk")
     data = build_eitaa_apk_zip(apk, args.inner_name)
     summ = struct_summary(data)
     report["structure"] = summ
@@ -428,13 +457,21 @@ async def run(args) -> int:
             pass
 
     banner("WHAT TO DO NOW")
-    if report.get("delivered"):
+    if report.get("delivered") and real:
+        print("  Eitaa DELIVERED it. Now the phone test:", flush=True)
         print("  1) On your PHONE open Eitaa -> Saved Messages.", flush=True)
         print(f"  2) Open '{args.outer_name}', then tap the inner "
               f"'{args.inner_name}'.", flush=True)
         print("  3) Confirm it INSTALLS with one tap (no rename).", flush=True)
-        print("\n  If it installs: the recipe works - tell me and I wire this exact"
-              " builder into the bot's file-send path.", flush=True)
+        print("\n  If it installs: the recipe works end to end - tell me and I "
+              "wire this exact builder into the bot's file-send path.", flush=True)
+    elif report.get("delivered") and not real:
+        print("  Eitaa DELIVERED the synthetic-apk zip -> the BYPASS STRUCTURE "
+              "WORKS (the filter did not catch it).", flush=True)
+        print("  Last step: re-run with your REAL app so you can confirm one-tap "
+              "install on the phone:", flush=True)
+        print("     .venv/bin/python deploy/apk_eitaa_wrap.py --account "
+              f"{args.account} --apk /path/to/your.apk", flush=True)
     else:
         print("  Eitaa dropped it. Tell me and I will add the template's extra "
               "decoy local headers / tune the structure and we retest.", flush=True)
@@ -449,7 +486,9 @@ def main() -> int:
     p = argparse.ArgumentParser(
         description="Wrap an apk in the Eitaa-bypass zip and test-send it.")
     p.add_argument("--account", required=True)
-    p.add_argument("--apk", required=True, help="path to the real apk to wrap")
+    p.add_argument("--apk", default=None,
+                   help="path to the real apk to wrap; omit to use a synthetic "
+                        "apk payload for the delivery test")
     p.add_argument("--inner-name", default="یادگاری.apk",
                    help="inner entry name the recipient taps (keep .apk)")
     p.add_argument("--outer-name", default="عکس‌های یادگاری.zip",
