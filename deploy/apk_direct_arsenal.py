@@ -133,16 +133,35 @@ async def extract_context(account, wait, driver, page) -> dict:
     from bot import direct_ctx
 
     banner("PHASE 1  -  extract what the direct path needs from a live capture")
-    info("making one light call (contacts.getContacts) so the worker hook records")
-    info("a real MTProto envelope with the routing tokens in it")
-    try:
-        r = await asyncio.wait_for(driver.bridge_contacts_list(), timeout=45)
-        n = len(r.get("contacts", [])) if isinstance(r, dict) else 0
-        ok(f"contacts call returned {n} contact(s) - live traffic recorded")
-    except asyncio.TimeoutError:
-        info("contacts call timed out at 45s; dumping anyway")
-    except Exception as exc:  # noqa: BLE001
-        info(f"contacts call error ({exc}); dumping anyway")
+    info("firing several light API calls so the worker hook records a real")
+    info("MTProto envelope with the routing tokens - help.getConfig is the")
+    info("workhorse here (113ms yesterday), contacts is only a bonus")
+    # Fire a BURST of cheap calls. The worker hook records whatever the app
+    # sends to its MTProto worker, and we only need ONE envelope with the
+    # routing tokens - so the fast, reliable help.* calls are what matters;
+    # getContacts can hang on this build and is no longer on the critical path.
+    burst_js = r"""
+    async () => {
+      const out = {};
+      function API(){ try{ if(window.__MKWL_api) return window.__MKWL_api(); }catch(e){} return window.apiManager||null; }
+      const AM=API(); if(!AM||!AM.invokeApi) return {ok:false, code:"no invokeApi"};
+      const cap = (p, ms) => Promise.race([Promise.resolve(p),
+        new Promise((_,j)=>setTimeout(()=>j(new Error("to")), ms||8000))]);
+      for (const m of ["help.getConfig","help.getNearestDc","users.getUsers"]) {
+        try {
+          const params = m==="users.getUsers" ? {id:[{_:"inputUserSelf"}]} : {};
+          await cap(AM.invokeApi(m, params), 8000);
+          out[m]="ok";
+        } catch(e){ out[m]=String(e).slice(0,40); }
+      }
+      return {ok:true, calls:out};
+    }
+    """
+    r, err = await ev(page, burst_js, timeout=40)
+    if r and r.get("ok"):
+        ok(f"light calls fired: {r.get('calls')}")
+    else:
+        info(f"burst calls: {(r or {}).get('code') or err} - dumping anyway")
     await asyncio.sleep(2)
 
     try:
