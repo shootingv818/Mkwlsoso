@@ -985,16 +985,27 @@ class EitaaDriver:
         try:
             with open(file_path, "rb") as f:
                 data = f.read()
-            b64 = _b64.b64encode(data).decode("ascii")
             filename = _os.path.basename(file_path)
             mime = _mt.guess_type(file_path)[0] or "application/octet-stream"
-            # APK send mode (opt-in, isolated). Eitaa blocks the real apk MIME
-            # (application/vnd.android.package-archive) on this bridge path too,
-            # so when the toggle is ON we upload an .apk as a generic binary and
-            # let the real ".apk" name ride in the filename attribute (the
-            # recipient still gets a valid apk). Defensive: ANY failure keeps the
-            # original MIME, so non-apk sends and the toggle-OFF path are
-            # byte-for-byte unchanged.
+            # APK ZIP-WRAP mode (default ON, isolated). A raw .apk is dropped by
+            # Eitaa's content filter on this build, so we wrap it in the exact
+            # malformed-but-Android-valid zip that Eitaa delivers while a phone
+            # still one-tap installs the inner .apk (name kept). The delivered
+            # file becomes a .zip. Defensive: ANY failure (and the round-trip
+            # check inside) sends the apk unchanged; non-apk sends are untouched.
+            try:
+                from direct import apk_mode as _apk
+                _d2, _n2, _m2 = _apk.wrap_apk_for_send(data, filename, mime)
+                if _n2 != filename:
+                    print(f"[apk-zip] {filename} ({len(data)}B) -> '{_n2}' "
+                          f"({len(_d2)}B, inner stays .apk for one-tap install)",
+                          flush=True)
+                data, filename, mime = _d2, _n2, _m2
+            except Exception:  # noqa: BLE001
+                pass
+            # Legacy APK octet-MIME trick: only still relevant if zip-wrap is OFF
+            # and the file is therefore still an apk. A no-op once wrapped (the
+            # name is now .zip). Defensive: ANY failure keeps the current MIME.
             try:
                 from direct import apk_mode as _apk
                 _eff = _apk.effective_mime(filename, mime)
@@ -1003,6 +1014,7 @@ class EitaaDriver:
                 mime = _eff
             except Exception:  # noqa: BLE001
                 pass
+            b64 = _b64.b64encode(data).decode("ascii")
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "code": f"read error: {exc}"}
         if locate_timeout is None:

@@ -411,6 +411,92 @@ def test_apk_mode():
             os.environ[A.APK_OCTET_ENV] = saved
 
 
+def test_apk_zip_wrap():
+    # The real Eitaa-bypass: an apk wrapped in the deliberately-malformed zip
+    # (streaming data descriptor + 1-entry central dir + EOCD on-disk=0/total=1)
+    # that Eitaa delivers while a phone one-tap installs the inner .apk. Default
+    # ON. Must round-trip to the EXACT apk, and never touch a non-apk.
+    import io as _io
+    import struct as _st
+    import zipfile as _zip
+    from direct import apk_mode as A
+
+    saved = {k: os.environ.get(k) for k in
+             (A.APK_ZIP_ENV, A.APK_INNER_NAME_ENV, A.APK_OUTER_NAME_ENV)}
+    apk = b"PK\x03\x04" + os.urandom(20000) + b"classes.dex" + os.urandom(5000)
+    try:
+        for k in saved:
+            os.environ.pop(k, None)
+
+        # ---- default ON ----
+        _check("zip: default enabled", A.zip_enabled() is True)
+        data, name, mime = A.wrap_apk_for_send(
+            apk, "myapp.apk", "application/vnd.android.package-archive")
+        _check("zip: name becomes .zip", name == "myapp.zip")
+        _check("zip: mime becomes application/zip", mime == "application/zip")
+        _check("zip: wrapped differs from raw", data != apk)
+
+        # ---- it still extracts to the EXACT original apk ----
+        zf = _zip.ZipFile(_io.BytesIO(data))
+        names = zf.namelist()
+        _check("zip: exactly one entry", len(names) == 1)
+        _check("zip: inner entry keeps .apk name", names[0].lower().endswith(".apk"))
+        _check("zip: inner extracts to the original apk bytes",
+               zf.read(names[0]) == apk)
+
+        # ---- structure fingerprint matches the proven template ----
+        lh_flags = _st.unpack_from("<H", data, 6)[0]
+        lh_crc = _st.unpack_from("<I", data, 14)[0]
+        lh_csize = _st.unpack_from("<I", data, 18)[0]
+        _check("zip: local header has data descriptor bit", bool(lh_flags & 0x8))
+        _check("zip: local header crc zeroed", lh_crc == 0)
+        _check("zip: local header compressed-size zeroed", lh_csize == 0)
+        j = data.rfind(b"PK\x05\x06")
+        on_disk, total = _st.unpack_from("<HH", data, j + 8)
+        _check("zip: EOCD entries-on-this-disk = 0", on_disk == 0)
+        _check("zip: EOCD total entries = 1", total == 1)
+
+        # ---- a non-apk is byte-for-byte untouched ----
+        d2, n2, m2 = A.wrap_apk_for_send(b"hello", "notes.txt", "text/plain")
+        _check("zip: non-apk untouched",
+               (d2, n2, m2) == (b"hello", "notes.txt", "text/plain"))
+
+        # ---- explicit OFF returns the raw apk ----
+        A.set_zip_env(False)
+        _check("zip: MKWL_APK_ZIP=0 disables", A.zip_enabled() is False)
+        d3, n3, m3 = A.wrap_apk_for_send(apk, "myapp.apk", "application/zip")
+        _check("zip: OFF sends raw apk unchanged",
+               d3 == apk and n3 == "myapp.apk")
+        for v in ("0", "false", "no", "off"):
+            os.environ[A.APK_ZIP_ENV] = v
+            _check(f"zip: env '{v}' disables", A.zip_enabled() is False)
+        for v in ("1", "true", "on", ""):
+            os.environ[A.APK_ZIP_ENV] = v
+            _check(f"zip: env '{v}' enables (default-on)", A.zip_enabled() is True)
+
+        # ---- name overrides ----
+        os.environ[A.APK_ZIP_ENV] = "1"
+        os.environ[A.APK_INNER_NAME_ENV] = "برنامه"
+        os.environ[A.APK_OUTER_NAME_ENV] = "عکس‌ها"
+        d4, n4, _ = A.wrap_apk_for_send(apk, "myapp.apk", "x")
+        # names are stored as raw UTF-8 (no UTF-8 flag, matching the template;
+        # Android reads them as UTF-8). zipfile would mis-decode as CP437, so
+        # assert the UTF-8 bytes are present rather than the decoded string.
+        _check("zip: inner override gets .apk suffix (utf-8 bytes present)",
+               "برنامه.apk".encode("utf-8") in d4)
+        _check("zip: outer override gets .zip suffix", n4 == "عکس‌ها.zip")
+
+        # ---- defensive: odd input never raises, returns original ----
+        d5 = A.wrap_apk_for_send(None, None, "application/pdf")
+        _check("zip: defensive on odd input", d5 == (None, None, "application/pdf"))
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
 def test_transport_cookiejar():
     # The cookie jar pins the load-balanced backend node: it sends preloaded
     # cookies AND absorbs Set-Cookie from responses so upload+sendMedia stick.
@@ -443,7 +529,7 @@ def main():
                test_mtproto_envelope, test_tl_roundtrip, test_session_loader,
                test_service_parser, test_schema_wrap, test_transport_url,
                test_eitaa_envelope, test_eitaa_methods, test_apk_mode,
-               test_transport_cookiejar):
+               test_apk_zip_wrap, test_transport_cookiejar):
         print(f"[{fn.__name__}]")
         fn()
     print("\nALL DIRECT TESTS PASSED")
