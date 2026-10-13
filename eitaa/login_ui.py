@@ -91,6 +91,33 @@ PAGE_CODE = ".page-authCode"
 PAGE_PASSWORD = ".page-password"
 PAGE_SIGNUP = ".page-signUp"
 
+# tweb has shipped the phone step under BOTH `.page-sign` and `.page-signIn`
+# across builds (login_diag keys on the same pair). Keying current_step on only
+# `.page-sign` made the bot report "no login form" on a build using `.page-signIn`
+# even though the form was on screen - it then retried and burned codes into a
+# FLOOD_WAIT. So each step accepts every wrapper class tweb is known to use.
+_STEP_WRAPPERS = (
+    ("code", [PAGE_CODE, ".page-code"]),
+    ("password", [PAGE_PASSWORD]),
+    ("signup", [PAGE_SIGNUP, ".page-signup"]),
+    ("phone", [PAGE_PHONE, ".page-signIn"]),
+)
+
+# Last-resort step detection by the step's OWN field, for when a build renames
+# the wrapper entirely or reports it not-visible while the field is on screen.
+# Each selector is step-SPECIFIC (never a generic catch-all), so a visible phone
+# field cannot be mistaken for the code step and vice-versa. Priority order
+# matters: code before phone.
+_STEP_FIELD_FALLBACK = (
+    ("code", [".page-authCode [contenteditable='true']",
+              ".page-authCode input.input-field-input",
+              ".page-authCode input"]),
+    ("password", ["input[type='password']"]),
+    ("phone", [".input-field-phone [contenteditable='true']",
+               ".input-field-phone input",
+               "input[type='tel']"]),
+)
+
 # Error/toast text the page shows for a refused phone or code.
 _ERROR_SELECTORS = [
     ".input-field.error .input-field-name",
@@ -127,18 +154,60 @@ async def _has(page: Any, selector: str) -> bool:
         return False
 
 
-async def current_step(page: Any) -> str:
-    """Which login step is on screen: phone / code / password / signup / none."""
-    for name, sel in (("code", PAGE_CODE), ("password", PAGE_PASSWORD),
-                      ("signup", PAGE_SIGNUP), ("phone", PAGE_PHONE)):
-        if not await _has(page, sel):
-            continue
-        # tweb keeps every step in the DOM and shows one, so visibility decides.
+async def _first_visible(page: Any, selectors: list[str]):
+    """One pass: first visible locator among candidates, or (None, None)."""
+    for sel in selectors:
         try:
-            if await page.locator(sel).first.is_visible():
-                return name
+            loc = page.locator(sel).first
+            if await loc.is_visible():
+                return loc, sel
         except Exception:  # noqa: BLE001
             continue
+    return None, None
+
+
+async def _login_dom_snapshot(page: Any):
+    """Read-only snapshot for diagnosing a 'no form' timeout: which .page-*
+    wrappers exist (with display/visibility/size) and whether a phone/code field
+    is present. So the next time a build renames something, the log says exactly
+    what to add instead of us guessing. Never raises."""
+    try:
+        return await page.evaluate(
+            "() => { const o={pages:[],fields:{}};"
+            "document.querySelectorAll('[class*=\"page-\"]').forEach(e=>{"
+            "const r=e.getBoundingClientRect(),c=getComputedStyle(e);"
+            "o.pages.push(e.className+' ['+c.display+'/'+c.visibility+' '"
+            "+Math.round(r.width)+'x'+Math.round(r.height)+']');});"
+            "const q=s=>{try{return !!document.querySelector(s);}catch(e){return false;}};"
+            "o.fields={phone:q('.input-field-phone [contenteditable]')||q(\"input[type='tel']\"),"
+            "code:q('.page-authCode [contenteditable]'),authPages:q('#auth-pages'),"
+            "anyInput:q('input.input-field-input')||q('[contenteditable=\"true\"]')};"
+            "return o; }")
+    except Exception:  # noqa: BLE001
+        return None
+
+
+async def current_step(page: Any) -> str:
+    """Which login step is on screen: phone / code / password / signup / none."""
+    # 1) The wrapper class, trying every name tweb has used for the step. tweb
+    #    keeps every step mounted and shows one, so visibility decides.
+    for name, candidates in _STEP_WRAPPERS:
+        for sel in candidates:
+            if not await _has(page, sel):
+                continue
+            try:
+                if await page.locator(sel).first.is_visible():
+                    return name
+            except Exception:  # noqa: BLE001
+                continue
+    # 2) Fallback: the wrapper may be renamed on a newer build, or reported
+    #    not-visible while the field itself is clearly on screen (login_diag saw
+    #    the form; current_step returned "none" and the retry burned a code).
+    #    Decide by whichever step-specific field is visible, code before phone.
+    for name, fields in _STEP_FIELD_FALLBACK:
+        loc, _sel = await _first_visible(page, fields)
+        if loc is not None:
+            return name
     return "none"
 
 
@@ -269,6 +338,11 @@ async def wait_for_login_form(page: Any, timeout_s: float = 45.0) -> str:
             if await looks_logged_in(page):
                 return "logged_in"
         await page.wait_for_timeout(500)
+    snap = await _login_dom_snapshot(page)
+    if snap:
+        print(f"[login-ui] giving up after {timeout_s:.0f}s: no step detected. "
+              f"DOM page-* = {snap.get('pages')}  fields = {snap.get('fields')}",
+              flush=True)
     return "none"
 
 

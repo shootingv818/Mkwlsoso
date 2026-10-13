@@ -254,6 +254,31 @@ def test_current_step():
           run(login_ui.current_step(p5)) == "none",
           "tweb keeps all steps in the DOM and shows one")
 
+    # THE LIVE BREAK (2026-10-13): this build drew the phone step under
+    # `.page-signIn`, but current_step keyed only on `.page-sign`, returned
+    # "none", and the retry burned a code into FLOOD_WAIT. Both wrapper names
+    # must count as the phone step.
+    p6 = FakePage(elements={".page-signIn": {"visible": True}},
+                  present={".page-signIn"})
+    check("step is 'phone' when the wrapper is .page-signIn (the build that broke)",
+          run(login_ui.current_step(p6)) == "phone")
+
+    # And if a build renames the wrapper entirely, the visible phone FIELD still
+    # identifies the step (login_diag saw the form while current_step did not).
+    p7 = FakePage(elements={".input-field-phone [contenteditable='true']":
+                            {"visible": True, "text": "+98"}},
+                  present=set())
+    check("step is 'phone' by its field when the wrapper class is unknown",
+          run(login_ui.current_step(p7)) == "phone")
+
+    # The fallback must not mistake the code step for phone: a visible code
+    # field with no phone field is still 'code'.
+    p8 = FakePage(elements={".page-authCode [contenteditable='true']":
+                            {"visible": True}},
+                  present=set())
+    check("step is 'code' by its field when the wrapper class is unknown",
+          run(login_ui.current_step(p8)) == "code")
+
 
 # ---------------------------------------------------------------------------
 # requesting a code
