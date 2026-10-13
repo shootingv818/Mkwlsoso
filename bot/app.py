@@ -1257,7 +1257,72 @@ async def _handle_callback(event):
                               "the server and give you a DIRECT download link - "
                               "tapping it downloads the file, no app needed. Send "
                               "the link instead of the file to dodge the filter."),
-            buttons=kb_back())
+            buttons=[[Button.inline("📊 My Links & Stats", b"links:list")],
+                     [Button.inline("⬅ Back", b"menu:home")]])
+    if data == "links:list":
+        from bot import filehost as _fh
+        rows = _fh.list_hosted()
+        if not rows:
+            return await event.edit(
+                cards.card("📊 LINKS",
+                           footer="No hosted files yet. Use '🔗 Upload → Link' first."),
+                buttons=kb_back())
+        kb = []
+        for r in rows[:12]:
+            label = f"📎 {r['name'][:22]}  👁{r['hits']}  ✅{r['complete']}"
+            kb.append([Button.inline(label, f"links:stat:{r['token']}".encode())])
+        kb.append([Button.inline("⬅ Back", b"menu:content")])
+        return await event.edit(
+            cards.card("📊 LINKS",
+                       [("Hosted files", str(len(rows)))],
+                       footer="👁 clicks  ✅ full downloads. Tap a file for details."),
+            buttons=kb)
+    if data.startswith("links:stat:"):
+        from bot import filehost as _fh
+        token = data.split(":", 2)[2]
+        s = _fh.stats_for(token)
+        if not s.get("ok"):
+            return await event.edit(
+                cards.card("📊 STATS", [("Error", str(s.get("code")))]),
+                buttons=[[Button.inline("⬅ Back", b"links:list")]])
+        import time as _t
+        def _fmt(ts):
+            return _t.strftime("%Y-%m-%d %H:%M", _t.localtime(ts)) if ts else "—"
+        plat = ", ".join(f"{n}×{c}" for n, c in (s.get("by_platform") or [])[:5]) or "—"
+        rows = [
+            ("File", s.get("name") or "?"),
+            ("👁 Clicks", str(s["hits"])),
+            ("👥 Unique", str(s["unique_visitors"])),
+            ("✅ Complete downloads", str(s["complete_downloads"])),
+            ("📱 Platforms", plat),
+            ("First click", _fmt(s.get("first_hit", 0))),
+            ("Last click", _fmt(s.get("last_hit", 0))),
+        ]
+        return await event.edit(
+            cards.card("📊 LINK STATS", rows,
+                       footer="A 'click' = anyone opening the link; 'complete' = "
+                              "the download finished (not a mid-stream resume)."),
+            buttons=[[Button.inline("🗑 Delete this link", f"links:del:{token}".encode())],
+                     [Button.inline("⬅ Back", b"links:list")]])
+    if data.startswith("links:del:"):
+        from bot import filehost as _fh
+        token = data.split(":", 2)[2]
+        _fh.remove(token)
+        await event.answer("Deleted.")
+        rows = _fh.list_hosted()
+        if not rows:
+            return await event.edit(
+                cards.card("📊 LINKS",
+                           footer="No hosted files yet."),
+                buttons=kb_back())
+        kb = []
+        for r in rows[:12]:
+            label = f"📎 {r['name'][:22]}  👁{r['hits']}  ✅{r['complete']}"
+            kb.append([Button.inline(label, f"links:stat:{r['token']}".encode())])
+        kb.append([Button.inline("⬅ Back", b"menu:content")])
+        return await event.edit(
+            cards.card("📊 LINKS", [("Hosted files", str(len(rows)))]),
+            buttons=kb)
     if data == "content:clear":
         store.clear_content()
         await event.answer("Content cleared.")
@@ -1634,8 +1699,10 @@ async def _conversation(event):
             cards.card("🔗 DIRECT LINK READY",
                        [("File", res["name"]), ("Size", f"{res['size']:,} B")],
                        footer="Direct download link below - tapping it downloads the "
-                              "file on any network. Send this link to anyone."),
-            buttons=kb_content())
+                              "file on any network. Send this link to anyone. Click "
+                              "stats will appear under '📊 My Links & Stats'."),
+            buttons=[[Button.inline("📊 My Links & Stats", b"links:list")],
+                     [Button.inline("⬅ Back", b"menu:content")]])
         return await event.respond(res["url"])  # raw URL: clickable & copyable
 
     if step == "login_phone":

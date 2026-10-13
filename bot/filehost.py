@@ -25,12 +25,15 @@ Config (env):
 """
 from __future__ import annotations
 
+import hashlib
 import http.server
+import json
 import os
 import secrets
 import shutil
 import socket
 import threading
+import time
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -42,6 +45,7 @@ _HOST_OVERRIDE = (os.environ.get("MKWL_FILEHOST_HOST", "") or "").strip()
 
 _server = None
 _lock = threading.Lock()
+_stats_lock = threading.Lock()
 _public_ip_cache: str | None = None
 
 _MIME = {
@@ -97,6 +101,14 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             self.send_error(404, "Not found")
             return
         self._serve(fp, head=False)
+        # record the hit AFTER the body has been (attempted to be) sent, so the
+        # 'bytes' field reflects what the client actually got
+        try:
+            _record_hit(fp, self.headers, self.client_address,
+                        bytes_sent=getattr(self, "_sent", 0),
+                        total_size=fp.stat().st_size)
+        except Exception:  # noqa: BLE001 - stats must never break a download
+            pass
 
     def do_HEAD(self):
         fp = self._resolve()
@@ -152,6 +164,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         if head:
             return
+        sent = 0
         with open(fp, "rb") as f:
             f.seek(start)
             remaining = length
@@ -164,6 +177,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 except (BrokenPipeError, ConnectionResetError):
                     break
                 remaining -= len(chunk)
+                sent += len(chunk)
+        self._sent = sent
 
 
 def start(port: int | None = None) -> dict:
@@ -259,14 +274,128 @@ def list_hosted() -> list:
             if not d.is_dir():
                 continue
             for f in d.iterdir():
-                if f.is_file():
+                if f.is_file() and f.name != "_hits.jsonl":
+                    hits = _read_hits(d)
                     out.append({"token": d.name, "name": f.name,
                                 "size": f.stat().st_size, "mtime": f.stat().st_mtime,
-                                "url": link_for(d.name, f.name)})
+                                "url": link_for(d.name, f.name),
+                                "hits": len(hits),
+                                "unique": len({h.get("ipid") for h in hits
+                                               if h.get("ipid")}),
+                                "complete": sum(1 for h in hits if h.get("full"))})
     except Exception:  # noqa: BLE001
         pass
     out.sort(key=lambda x: x["mtime"], reverse=True)
     return out
+
+
+def _ua_short(ua: str) -> str:
+    """A short, human label for a User-Agent so stats are readable at a glance."""
+    u = (ua or "").lower()
+    if not u:
+        return "?"
+    if "android" in u:
+        if "chrome" in u or "crmo" in u:
+            return "Android Chrome"
+        if "firefox" in u:
+            return "Android Firefox"
+        return "Android"
+    if "iphone" in u or "ipad" in u or "ios" in u:
+        return "iOS Safari" if "safari" in u else "iOS"
+    if "windows" in u:
+        return "Windows " + ("Chrome" if "chrome" in u else "Firefox" if "firefox" in u else "browser")
+    if "mac os" in u or "macintosh" in u:
+        return "macOS " + ("Safari" if "safari" in u and "chrome" not in u else "Chrome")
+    if "linux" in u:
+        return "Linux " + ("Chrome" if "chrome" in u else "Firefox" if "firefox" in u else "browser")
+    if "curl" in u:
+        return "curl"
+    if "wget" in u:
+        return "wget"
+    if "bot" in u or "spider" in u or "crawler" in u:
+        return "bot"
+    return ua[:40]
+
+
+def _hits_path(token_dir: Path) -> Path:
+    return token_dir / "_hits.jsonl"
+
+
+def _record_hit(fp: Path, headers, client_addr, bytes_sent: int, total_size: int) -> None:
+    """Append a hit line next to the file it was served from. JSONL so appends
+    are atomic enough across threads and the file never gets corrupted."""
+    token_dir = fp.parent
+    try:
+        ip = client_addr[0] if client_addr else ""
+    except Exception:  # noqa: BLE001
+        ip = ""
+    # one-way identifier so repeat downloaders are counted without storing IPs
+    ipid = hashlib.sha1((ip or "").encode("utf-8")).hexdigest()[:12]
+    ua = headers.get("User-Agent", "") or ""
+    ref = headers.get("Referer", "") or ""
+    rng = headers.get("Range", "") or ""
+    # "complete" if the client got (near-)all the bytes in a NON-ranged GET; a
+    # Range request is a resume piece and is counted as a hit, not a completion
+    full = (not rng) and total_size > 0 and bytes_sent >= int(total_size * 0.95)
+    row = {"t": int(time.time()), "ipid": ipid, "ua": _ua_short(ua),
+           "bytes": int(bytes_sent), "total": int(total_size),
+           "ranged": bool(rng), "full": bool(full),
+           "ref": ref[:80] if ref else ""}
+    try:
+        with _stats_lock:
+            with open(_hits_path(token_dir), "a", encoding="utf-8") as f:
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _read_hits(token_dir: Path) -> list:
+    try:
+        with open(_hits_path(token_dir), "r", encoding="utf-8") as f:
+            out = []
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    out.append(json.loads(line))
+                except Exception:  # noqa: BLE001
+                    continue
+            return out
+    except FileNotFoundError:
+        return []
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def stats_for(token: str) -> dict:
+    """Click / download stats for one hosted file. Never raises."""
+    try:
+        d = (_root() / token).resolve()
+        if _root().resolve() not in d.parents or not d.is_dir():
+            return {"ok": False, "code": "unknown token"}
+        hits = _read_hits(d)
+        uniq_ips = {h.get("ipid") for h in hits if h.get("ipid")}
+        completions = sum(1 for h in hits if h.get("full"))
+        ua_counts: dict = {}
+        for h in hits:
+            u = h.get("ua") or "?"
+            ua_counts[u] = ua_counts.get(u, 0) + 1
+        last = max((h.get("t") or 0) for h in hits) if hits else 0
+        first = min((h.get("t") or 0) for h in hits) if hits else 0
+        name = ""
+        for f in d.iterdir():
+            if f.is_file() and f.name != "_hits.jsonl":
+                name = f.name
+                break
+        return {"ok": True, "token": token, "name": name,
+                "hits": len(hits), "unique_visitors": len(uniq_ips),
+                "complete_downloads": completions,
+                "by_platform": sorted(ua_counts.items(), key=lambda x: -x[1]),
+                "first_hit": first, "last_hit": last,
+                "recent": hits[-10:][::-1]}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "code": f"{type(exc).__name__}: {exc}"}
 
 
 def remove(token: str) -> bool:
