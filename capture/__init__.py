@@ -1,0 +1,1 @@
+"""Eitaa web capture package."""

@@ -1,0 +1,7 @@
+playwright>=1.47.0
+
+
+# ---- Telegram control bot (panel) ----
+# Telethon drives the owner-only Telegram control panel. Matches the stack used
+# in the sibling projects. Needs API_ID/API_HASH + BOT_TOKEN (see .env.example).
+telethon>=1.36.0

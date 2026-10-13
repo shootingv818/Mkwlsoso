@@ -1,0 +1,12 @@
+[Unit]
+Description=Xvfb virtual display :99 (Mkwlsoso headed browser)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/Xvfb :99 -screen 0 1280x800x24 -nolisten tcp
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
