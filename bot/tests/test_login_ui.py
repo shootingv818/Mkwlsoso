@@ -599,6 +599,23 @@ def test_submit_code_2fa():
           and res.get("code") == "SESSION_PASSWORD_NEEDED", str(res))
 
 
+def test_submit_code_detects_app_login_even_if_dom_lingers():
+    """THE live FLOOD cause. After a correct code the app is authenticated but
+    the login DOM lingers for a few seconds. submit_code keyed success only on
+    the login pages being gone, so a sign-in that ACTUALLY SUCCEEDED reported
+    'the code step did not clear'; the owner thought it failed, tapped Add
+    Account again, and the repeated code requests tripped FLOOD_WAIT. It must
+    ask the app (getMyId / authState) and see the success immediately."""
+    p = FakePage(elements={CODE_SEL: {"visible": True, "text": ""},
+                           login_ui.PAGE_CODE: {"visible": True}},
+                 present={login_ui.PAGE_CODE},
+                 app_logged_in=True, my_id=55667788)
+    res = run(login_ui.submit_code(FakeDriver(p), "12345", wait_s=2.0))
+    check("a successful sign-in is seen via the app even while the code DOM "
+          "lingers", res.get("ok") is True, str(res))
+    check("the code was still typed", p.typed == [(CODE_SEL, "12345")], str(p.typed))
+
+
 def test_submit_code_rejects_empty():
     p = FakePage()
     res = run(login_ui.submit_code(FakeDriver(p), "   "))
@@ -685,6 +702,7 @@ def main() -> int:
         test_submit_code_happy_path()
         test_submit_code_wrong_code()
         test_submit_code_2fa()
+        test_submit_code_detects_app_login_even_if_dom_lingers()
         test_submit_code_rejects_empty()
         print("\n-- routing --")
         test_login_flow_routes_to_the_form_by_default()

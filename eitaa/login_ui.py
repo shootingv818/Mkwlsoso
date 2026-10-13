@@ -494,6 +494,17 @@ async def submit_code(driver: Any, code: str, wait_s: float = 60.0) -> dict:
     deadline = time.time() + wait_s
     pressed = False
     while time.time() < deadline:
+        # Ask the APP first, not just the DOM. The decisive "did it work" signal
+        # is the account being authenticated (rootScope.getMyId / authState).
+        # The login DOM can LINGER for a few seconds after a successful sign-in,
+        # so keying success only on "the login pages are gone" made a sign-in
+        # that ACTUALLY SUCCEEDED report "the code step did not clear" - which
+        # looked like a failure and invited another code request, and THAT is
+        # what tripped FLOOD_WAIT even though the user had just logged in.
+        if await looks_logged_in(page):
+            print("[login-ui] app reports authenticated; the code was accepted",
+                  flush=True)
+            return {"ok": True, "step": "done", "typed_len": len(digits)}
         step = await current_step(page)
         if step == "password":
             return {"ok": False, "needs_password": True,
@@ -519,5 +530,10 @@ async def submit_code(driver: Any, code: str, wait_s: float = 60.0) -> dict:
                     pass
         await page.wait_for_timeout(500)
 
+    # One last authoritative check: a sign-in that completed right at the
+    # deadline must not be reported as a failure (a false failure here is what
+    # drives a retry into FLOOD_WAIT).
+    if await looks_logged_in(page):
+        return {"ok": True, "step": "done", "typed_len": len(digits)}
     return {"ok": False, "step": await current_step(page),
             "code": f"the code step did not clear within {wait_s:.0f}s"}
