@@ -468,6 +468,7 @@ def kb_content():
         [Button.inline("📝 Set Text", b"content:text"),
          Button.inline("📎 Set File", b"content:file")],
         [Button.inline("📱 Set APK (→ Zip)", b"content:apk")],
+        [Button.inline("🔗 Upload → Link", b"content:uplink")],
         [Button.inline("🗑 Clear", b"content:clear")],
         [Button.inline("⬅ Back", b"menu:home")],
     ]
@@ -1248,6 +1249,15 @@ async def _handle_callback(event):
                               "delivers; the person just opens the zip and taps "
                               "the apk inside to install. You pick the name next."),
             buttons=kb_back())
+    if data == "content:uplink":
+        pending[event.sender_id] = {"step": "await_uplink_file"}
+        return await event.edit(
+            cards.card("🔗 UPLOAD → LINK",
+                       footer="Upload any file now (apk, zip, ...). I host it on "
+                              "the server and give you a DIRECT download link - "
+                              "tapping it downloads the file, no app needed. Send "
+                              "the link instead of the file to dodge the filter."),
+            buttons=kb_back())
     if data == "content:clear":
         store.clear_content()
         await event.answer("Content cleared.")
@@ -1598,6 +1608,36 @@ async def _conversation(event):
                               "recipient opens the zip and taps the apk to install."),
             buttons=kb_content())
 
+    if step == "await_uplink_file":
+        if not event.message.file:
+            return await event.respond("Upload the file as a document.")
+        from bot import filehost
+        tmp = config.DATA_DIR / "filehost_tmp"
+        tmp.mkdir(parents=True, exist_ok=True)
+        name = event.message.file.name or f"file_{event.message.id}"
+        src = (tmp / name).resolve()
+        await event.message.download_media(file=str(src))
+        res = filehost.host_file(src_path=str(src), filename=name)
+        try:
+            src.unlink()
+        except Exception:  # noqa: BLE001
+            pass
+        pending.pop(event.sender_id, None)
+        if not res.get("ok"):
+            return await event.respond(
+                cards.card("🔗 UPLOAD FAILED",
+                           [("Error", str(res.get("code"))[:150])],
+                           footer="The file host may be off - check the bot log for "
+                                  "'[bot] file host'."),
+                buttons=kb_content())
+        await event.respond(
+            cards.card("🔗 DIRECT LINK READY",
+                       [("File", res["name"]), ("Size", f"{res['size']:,} B")],
+                       footer="Direct download link below - tapping it downloads the "
+                              "file on any network. Send this link to anyone."),
+            buttons=kb_content())
+        return await event.respond(res["url"])  # raw URL: clickable & copyable
+
     if step == "login_phone":
         phone = re.sub(r"[^\d+]", "", text or "")
         if len(re.sub(r"\D", "", phone)) < 10:
@@ -1857,6 +1897,21 @@ def main() -> None:
         print(f"[bot] pool max_open = {store.pool_max_open}", flush=True)
     except Exception as exc:  # noqa: BLE001
         print(f"[bot] pool tuning skipped: {type(exc).__name__}: {exc}", flush=True)
+    # ---- built-in direct-download file host (isolated, guarded). Serves files
+    # over plain HTTP so a tap downloads an apk (sending a LINK bypasses Eitaa's
+    # file filter). A busy/forbidden port must NEVER stop the bot from starting.
+    try:
+        from bot import filehost
+        _fh = filehost.start()
+        if _fh.get("ok"):
+            print(f"[bot] file host on :{_fh.get('port')} (links use "
+                  f"{filehost.public_base()})", flush=True)
+        else:
+            print(f"[bot] file host NOT started ({_fh.get('code')}) on port "
+                  f"{_fh.get('port')} - set MKWL_FILEHOST_PORT or free the port",
+                  flush=True)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[bot] file host skipped: {type(exc).__name__}: {exc}", flush=True)
     try:
         me = bot.loop.run_until_complete(bot.get_me())
         print(f"[bot] logged in as @{me.username} (id={me.id})", flush=True)
